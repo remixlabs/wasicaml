@@ -1,0 +1,32 @@
+#! /bin/bash
+
+set -e
+
+major="12"
+minor="0"
+
+case "$(uname)" in
+     Darwin)
+         variant="macos" ;;
+     Linux)
+         variant="linux" ;;
+     MinGW)
+         variant="mingw" ;;
+     *)
+         echo "Error: Unknown OS" >&2
+         exit 2
+         ;;
+esac
+
+base="wasi-sdk-${major}.${minor}"
+file="${base}-${variant}.tar.gz"
+url="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${major}/$file"
+
+if [ ! -f "$file" ]; then
+    curl -o "$file" -L "$url"
+fi
+if [ ! -f "$base" ]; then
+    tar xzf "$file"
+fi
+rm -f wasi-sdk
+ln -s "$base" wasi-sdk

@@ -1,0 +1,59 @@
+#! /bin/sh
+
+set -e
+
+root='%ROOT%'
+
+# -flto: add meta data for link-time optimizations
+
+init=""
+
+# figure out whether we create an executable
+out=""
+noexe=0
+nextout=0
+for arg in "$@"; do
+    if [ $nextout -gt 0 ]; then
+        out="$arg"
+        nextout=0
+        case "$arg" in
+            *.a | *.so | *.o)
+                noexe=1 ;;
+        esac
+        break
+    fi
+    case "$arg" in
+        -c | -E | -S | -fsyntax-only | --version | -v | -V)
+            noexe=1 ;;
+        -o)
+            nextout=1 ;;
+        -shared)
+            echo "Shared libs not supported" >&2
+            exit 1 ;;
+    esac
+done
+
+genwrapper=0
+if [ $noexe -eq 0 ]; then
+    genwrapper=1
+    init="$root/lib/initwasi.o"
+    case "$out" in
+        *.wasm)
+            genwrapper=0
+            ;;
+    esac
+fi
+
+"$root"/wasi-sdk/bin/clang --sysroot="$root"/wasi-sdk/share/wasi-sysroot -flto $init "$@"
+
+if [ $genwrapper -gt 0 -a -f "$out" ]; then
+    wasm=`mktemp tmp.XXXXXX`
+    mv "$out" "$wasm"
+    cat >"$out" <<EOF
+#! /bin/sh
+exec %ROOT%/bin/run "\$0" "\$0" "\$@"
+EOF
+    cat "$wasm" >>"$out"
+    chmod a+x "$out"
+    rm "$wasm"
+fi

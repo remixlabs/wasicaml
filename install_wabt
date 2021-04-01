@@ -1,0 +1,40 @@
+#! /bin/bash
+
+set -e
+
+version="1.0.23"
+
+case "$(uname)" in
+     Darwin)
+         variant="macos"; suffix=tar.gz ;;
+     Linux)
+         variant="ubuntu"; suffix=tar.gz ;;
+     MinGW)
+         variant="windows"; suffix=tar.gz ;;
+     *)
+         echo "Error: Unknown OS" >&2
+         exit 2
+         ;;
+esac
+
+base="wabt-${version}"
+file="${base}-${variant}.${suffix}"
+url="https://github.com/WebAssembly/wabt/releases/download/${version}/$file"
+
+if [ ! -f "$file" ]; then
+    curl -o "$file" -L "$url"
+fi
+if [ ! -f "$base" ]; then
+    case "$suffix" in
+        tar.gz)
+            tar -xzf "$file" ;;
+        tar.xz)
+            tar -xJf "$file" ;;
+        zip)
+            unzip "$file" ;;
+        *)
+            echo "Unknown file suffix: $suffix" >&2; exit 2 ;;
+    esac
+fi
+rm -f wabt
+ln -s "$base" wabt

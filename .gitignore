@@ -1,0 +1,12 @@
+*~
+*.o
+*.a
+*.d
+*.wasm
+*.wat
+wabt
+wabt-*
+wasi-sdk
+wasi-sdk-*
+wasmtime
+wasmtime-*
