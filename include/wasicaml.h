@@ -22,4 +22,18 @@ extern void wasicaml_throw();
 __attribute__((export_name("wasicaml_call")))
 extern void wasicaml_call(void (*f)(void *), void *ctx);
 
+__attribute__((import_module("wasicaml")))
+__attribute__((import_name("system")))
+extern int wasicaml_system(const char *command);
+// support for system()
+
+__attribute__((import_module("wasicaml")))
+__attribute__((import_name("rename")))
+extern int wasicaml_rename(const char *old, const char *new);
+// rename() is broken in wasi-sdk-12
+
+
+char *mktemp (char *);
+// an mktemp emulation
+
 #endif

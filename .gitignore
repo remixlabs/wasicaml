@@ -10,3 +10,8 @@ wasi-sdk
 wasi-sdk-*
 wasmtime
 wasmtime-*
+js/package-lock.json
+js/node_modules
+wasi_preamble
+Makefile.config
+

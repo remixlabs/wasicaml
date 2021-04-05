@@ -44,15 +44,14 @@ if [ $noexe -eq 0 ]; then
     esac
 fi
 
-"$root"/wasi-sdk/bin/clang --sysroot="$root"/wasi-sdk/share/wasi-sysroot -flto $init "$@"
+"$root"/lib/wasicaml/wasi-sdk/bin/clang --sysroot="$root"/lib/wasicaml/wasi-sdk/share/wasi-sysroot -flto $init "$@"
 
 if [ $genwrapper -gt 0 -a -f "$out" ]; then
     wasm=`mktemp tmp.XXXXXX`
     mv "$out" "$wasm"
-    cat >"$out" <<EOF
-#! /bin/sh
-exec %ROOT%/bin/run "\$0" "\$0" "\$@"
-EOF
+    len=`cat "$wasm" | wc -c`
+    cat %PREFIX%/bin/wasi_preamble > "$out"
+    printf '\0LEN%d\n' $len >>"$out"
     cat "$wasm" >>"$out"
     chmod a+x "$out"
     rm "$wasm"

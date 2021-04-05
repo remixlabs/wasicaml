@@ -1,0 +1,36 @@
+#! /bin/sh
+
+usage() {
+    cat <<EOF
+Usage: ./configure ...
+Options:
+ --prefix=<dir>
+EOF
+    exit 2
+}
+
+
+prefix=~/.wasicaml
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -prefix)
+            if [ -z "$2" ]; then
+                usage
+            fi
+            prefix="$2"
+            shift 2
+            ;;
+        --prefix=*)
+            prefix="$(printf '%s' "$1" | sed -e 's/^--prefix=//')"
+            shift
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+
+echo "prefix=$prefix" > Makefile.config
+
+echo "Installing to: $prefix" >&2

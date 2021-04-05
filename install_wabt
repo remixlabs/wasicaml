@@ -24,14 +24,16 @@ url="https://github.com/WebAssembly/wabt/releases/download/${version}/$file"
 if [ ! -f "$file" ]; then
     curl -o "$file" -L "$url"
 fi
+mkdir -p lib/wasicaml
+cd lib/wasicaml
 if [ ! -f "$base" ]; then
     case "$suffix" in
         tar.gz)
-            tar -xzf "$file" ;;
+            tar -xzf "../../$file" ;;
         tar.xz)
-            tar -xJf "$file" ;;
+            tar -xJf "../../$file" ;;
         zip)
-            unzip "$file" ;;
+            unzip "../../$file" ;;
         *)
             echo "Unknown file suffix: $suffix" >&2; exit 2 ;;
     esac

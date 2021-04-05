@@ -1,0 +1,5 @@
+#! /bin/sh
+
+export WASICAML='%ROOT%'
+export WASICAML_CWD=`pwd`
+exec node --no-warnings --experimental-wasm-bigint -- "$WASICAML/js/main.js" "$@"

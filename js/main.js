@@ -1,9 +1,14 @@
 'use strict';
 
-const { WASI } = require('wasi');
+const { WASI } = require("@wasmer/wasi");
+const wasiBindings = require("@wasmer/wasi/lib/bindings/node");
 const fs = require('fs');
+const util = require("util");
 const process = require("process")
+const { execSync } = require("child_process");
 
+if (process.stdin._handle)
+    process.stdin._handle.setBlocking(true);
 if (process.stdout._handle)
     process.stdout._handle.setBlocking(true);
 if (process.stderr._handle)
@@ -15,12 +20,9 @@ class OCamlExn extends Error {
 function wasicaml_try(session) {
     return function(f, ctx) {
         try {
-            console.log("try");
             session.instance.exports.wasicaml_call(f, ctx);
-            console.log("try ok");
             return 0;
         } catch (e) {
-            console.log("catch");
             if (e instanceof OCamlExn) {
                 return 1;
             } else
@@ -31,10 +33,61 @@ function wasicaml_try(session) {
 
 function wasicaml_throw(session) {
     return function() {
-        console.log("throw");
         throw new OCamlExn("An OCaml exception")
     }
 }
+
+function get_string(session, ptr) {
+    let mem = new Uint8Array(session.instance.exports.memory.buffer);
+    let n = 0;
+    while (mem[ptr+n] != 0) n++;
+    let buf = new Uint8Array(n);
+    buf.set(mem.subarray(ptr, ptr+n));
+    // this is not quite correct, but node does not give us anything else:
+    return new TextDecoder().decode(buf);
+}
+
+function wasicaml_system(session) {
+    return function(cmd_ptr) {
+        let cmd = get_string(session, cmd_ptr);
+        try {
+            execSync(cmd, { stdio: "inherit" });
+            return 0;
+        } catch (e) {
+            console.error("SYSTEM: ", cmd);
+            console.error(e);
+            return 1;  // FIXME
+        }
+    }
+}
+
+function wasicaml_rename(session) {
+    return function(old_ptr, new_ptr) {
+        let old_name = get_string(session, old_ptr);
+        let new_name = get_string(session, new_ptr);
+        try {
+            fs.renameSync(old_name, new_name);
+            return 0;
+        } catch (e) {
+            // the most important codes:
+            let code = util.getSystemErrorName(e.errno);
+            console.error("RENAME ", old_name, "->", new_name, ": ", code);
+            switch (code) {
+            case "EACCES": return 2;
+            case "EEXIST": return 20;
+            case "EINVAL": return 28;
+            case "EISDIR": return 31;
+            case "ELOOP": return 32;
+            case "ENOENT": return 44;
+            case "ENOTDIR": return 54;
+            case "ENOTEMPTY": return 55;
+            case "EPERM": return 63;
+            default: return 63;  // also EPERM for anything else
+            }
+        }
+    }
+}
+
 
 let syscalls =
     [ "args_get",
@@ -86,37 +139,62 @@ let syscalls =
 
 async function instantiate(wasm_mod, args) {
     const wasi = new WASI({
+        ...wasiBindings,
         args: args,
         env: process.env,
-        preopens: { "/": "/" },
+        preopenDirectories: { "/": "/" },
     });
+    let wasi_imports = wasi.getImports(wasm_mod).wasi_snapshot_preview1;
     let session =
         { instance: null };
     let realimport = {};
     for (let n of syscalls) {
-        let f = wasi.wasiImport[n];
+        let f = wasi_imports[n];
         realimport[n] = ((...args) => {
-            console.log("WASI syscall: " + n);
-            if (n == "fd_readdir") {
-                let r = f.apply(undefined, args);
-                let [ fd, buf, buf_len, cookie, bufused ] = args;
-                let mem32 = new Uint32Array(session.instance.exports.memory.buffer);
-                console.log("errno=", r);
-                console.log("args=", args);
-                console.log("bufused=", mem32[bufused >> 2]);
-                return r;
+            //console.error("WASI syscall: " + n);
+            switch (n) {
+            case "path_open":
+                let open_path = get_string(session, args[2]);
+                // console.error("  ", open_path);
+                break;
+            case "path_rename":
+                let old_path = get_string(session, args[1]);
+                let new_path = get_string(session, args[4]);
+                // console.error("  ", old_path, "->", new_path);
+                break;
+            case "path_filestat_get":
+                let stat_path = get_string(session, args[2]);
+                // console.error("  ", stat_path);
+                break;
             };
-            return f.apply(undefined, args)
+            let r = f.apply(undefined, args);
+            //if (r != 0)
+            //    console.error("  code: ", r);
+            return r;
         });
     };
     const importObject =
           { wasi_snapshot_preview1: realimport,
             wasicaml: { "try": wasicaml_try(session),
-                        "throw": wasicaml_throw(session)
+                        "throw": wasicaml_throw(session),
+                        "system": wasicaml_system(session),
+                        "rename": wasicaml_rename(session)
                       }
           };
     session.instance = await WebAssembly.instantiate(wasm_mod, importObject);
     wasi.start(session.instance);
+}
+
+function bufferFindElements(buf, start, elements) {
+    outer:
+    for (let k = start; k < buf.length; k++) {
+        if (buf[k] == elements[0]) {
+            for (let j = 0; j < elements.length; j++) {
+                if (buf[k+j] != elements[j]) continue outer;
+            }
+            return k;
+        }
+    }
 }
 
 (async () => {
@@ -129,11 +207,25 @@ async function instantiate(wasm_mod, args) {
         const args = process.argv.slice(3);
         const wasm_code_buf = fs.readFileSync(wasm_code_filename);
         const wasm_code_u8 = new Uint8Array(wasm_code_buf);
-        const start = wasm_code_u8.indexOf(0);
-        if (wasm_code_u8[start+1] != 0x61 || wasm_code_u8[start+2] != 0x73 || wasm_code_u8[start+3] != 0x6d) {
+        let search = 0;
+        let idx = bufferFindElements(wasm_code_u8, search, [ 0, 0x4c, 0x45, 0x4e ]);
+        let len = 0;
+        if (idx >= 0) {
+            const eol = wasm_code_u8.subarray(idx+4).indexOf(10) + idx+4;
+            const len_buf = wasm_code_u8.subarray(idx+4, eol);
+            const len_str = new TextDecoder().decode(len_buf);
+            len = parseInt(len_str);
+            search = eol+1;
+        };
+        idx = bufferFindElements(wasm_code_u8, search, [ 0, 0x61, 0x73, 0x6d ]);
+        if (idx < 0) {
             throw new Error("cannot find wasm start in file " + wasm_code_filename);
         };
-        const wasm_code = wasm_code_u8.subarray(start);
+        let wasm_code;
+        if (len > 0)
+            wasm_code = wasm_code_u8.subarray(idx, idx+len);
+        else
+            wasm_code = wasm_code_u8.subarray(idx);
         const wasm_mod = await WebAssembly.compile(wasm_code);
         await instantiate(wasm_mod, args);
     } catch (e) {

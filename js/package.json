@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@wasmer/wasi": "^0.12.0"
+  }
+}
