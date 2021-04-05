@@ -6,7 +6,6 @@ generate WebAssembly code that can be run in a WASI environment.
 ## Status - **This is work in progess**
 
  - Can build an OCaml bytecode compiler against almost-WASI (see below)
- - `make install` not yet there
 
 # Build
 
@@ -18,7 +17,7 @@ make
 By default, the prefix is `~/.wasicaml`, but you can also specify a different
 one: `./configure --prefix=/wherever`.
 
-It is so far not recommneded to use a shared prefix like `/usr/local`.
+It is so far not recommended to use a shared prefix like `/usr/local`.
 
 Note that `make` installs files from the very beginning.
 
@@ -26,7 +25,7 @@ Note that `make` installs files from the very beginning.
 
 ## A special OCaml branch is needed
 
-See `https://github.com/gerdstolpmann/ocaml.git`, branch `gerd/wasi`.
+See https://github.com/gerdstolpmann/ocaml.git, branch `gerd/wasi`.
 
 ## The C toolchain in `bin`
 
@@ -38,14 +37,16 @@ This toolchain is a wrapper around `wasi-sdk`. You get:
  - `wasi_objdump`
  - `wasi_ranlib`
  - `wasi_strip`
- - `run`
+ - `wasi_run`
 
 Here, `wasi_cc` is a specially configured Clang compiler that uses
 a special version of Musl as `libc`. The .o files and the final executables
 are WebAssembly modules.
 
-Our wrapper also prepends a little Shell script to the executables so that
-the files can be directly run on the host system:
+Our wrapper also prepends a preamble to the executables so that
+the files can be directly run on the host system. This preamble is
+equivalent to these two lines of Shell code (but actually a real
+executable):
 
 ```
 #! /bin/sh
@@ -56,7 +57,7 @@ These two lines are then followed by the "wasm" code. If the name of the
 executable has the suffix ".wasm", however, this starter is omitted, and
 the file consists ONLY of the WebAssembly module.
 
-The `run` script is written in Javascript (see the `js/` folder).
+The `wasi_run` script is written in Javascript (see the `js/` folder).
 
 ## Additions to WASI
 
@@ -81,14 +82,15 @@ Note that adding try/catch is kind of problematic, as it exploits the
 way WebAssembly is implemented in Javascript (where you can use JS
 exceptions to jump out of WebAssembly context), and the same trick might
 not be available in other WebAssembly implementations (in particular,
-I don't see how to do the saem in the Rust-based ones). This can first be
+I don't see how to do the same in the Rust-based ones). This can first be
 improved when WebAssembly-level exceptions become widely available.
 
 We also link `initwasi.o` into every executable. Besides some functions that
 are missing in `libc` there is an initializer that sets the current working
 directory to the contents of the environment variable `WASICAML_CWD`.
 Without this initializer, the working directory would be set to `/` inside
-the WASI sandbox. This trick ensures that the working directory inside the
+the WASI sandbox when the executable is started. This trick ensures that
+the working directory inside the
 sandbox is the same as outside.
 
 So far, we do not support to restrict the filesystem in the sandbox,
@@ -101,9 +103,14 @@ So far, the bytecode interpreter can be built, and we can do a bootstrap
 cycle of the compiler.
 
 This is supported:
+ - Complete language
+ - Standard library, with a few exceptions in `Sys`
  - The library `str`
  - The library `unix` (but many functions are mssing)
+ - `ocamlc -custom`
 
 This does not work:
  - Dynamic loading of C libraries ( - there is no `dlopen` in WASI)
- - many functions in `Sys`
+ - No threads
+ - No debugger
+ - No ocamldoc
