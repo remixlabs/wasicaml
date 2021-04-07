@@ -4,6 +4,13 @@
 *.d
 *.wasm
 *.wat
+*.cmi
+*.cmo
+*.cma
+*.cmt
+*.cmti
+*.cmx
+*.cmxa
 wabt
 wabt-*
 wasi-sdk

@@ -1,4 +1,5 @@
 open Printf
+open Wc_types
 
 type executable =
   { dll_paths : string list;
@@ -58,9 +59,6 @@ let read_executable name =
     data;
     symbols
   }
-
-module O = Opcodes
-module I = Instruct
 
 type format =
   | C    (* int constant *)
@@ -278,6 +276,22 @@ let instructions exec =
     O.opGETSTRINGCHAR, [], (fun args -> [I.Kgetstringchar]);
   ]
 
+let map_label_in_instr f instr =
+  match instr with
+    | I.Klabel _ -> assert false
+    | I.Kpush_retaddr lab -> I.Kpush_retaddr (f lab)
+    | I.Kclosure (lab, k) -> I.Kclosure (f lab, k)
+    | I.Kclosurerec (labl, k) -> I.Kclosurerec (List.map f labl, k)
+    | I.Kbranch lab -> I.Kbranch (f lab)
+    | I.Kbranchif lab -> I.Kbranchif (f lab)
+    | I.Kbranchifnot lab -> I.Kbranchifnot (f lab)
+    | I.Kstrictbranchif _ -> assert false
+    | I.Kstrictbranchifnot _ -> assert false
+    | I.Kswitch (laba1, laba2) ->
+        I.Kswitch (Array.map f laba1, Array.map f laba2)
+    | I.Kpushtrap lab -> I.Kpushtrap (f lab)
+    | _ -> instr
+
 let decode exec =
   let instrs_l = instructions exec in
   let num = List.fold_left (fun acc (n,_,_) -> max acc n) (-1) instrs_l + 1 in
@@ -362,28 +376,33 @@ let decode exec =
         labels.(bytepos / 4) <- i
     )
     decoded_a;
+  let all_labels = ref ISet.empty in
   let map_label lab =
     if lab < 0 || lab >= Array.length labels then failwith "bad label";
     let lab' = labels.(lab) in
     if lab' < 0 then failwith "bad label";
+    all_labels := ISet.add lab' !all_labels;
     lab' in
-  decoded_a
-  |> Array.mapi
-       (fun i (_, instr) ->
-         match instr with
-           | I.Klabel _ -> assert false
-           | I.Kpush_retaddr lab -> I.Kpush_retaddr (map_label lab)
-           | I.Kclosure (lab, k) -> I.Kclosure (map_label lab, k)
-           | I.Kclosurerec (labl, k) -> I.Kclosurerec (List.map map_label labl, k)
-           | I.Kbranch lab -> I.Kbranch (map_label lab)
-           | I.Kbranchif lab -> I.Kbranchif (map_label lab)
-           | I.Kbranchifnot lab -> I.Kbranchifnot (map_label lab)
-           | I.Kstrictbranchif _ -> assert false
-           | I.Kstrictbranchifnot _ -> assert false
-           | I.Kswitch (laba1, laba2) ->
-               I.Kswitch (Array.map map_label laba1, Array.map map_label laba2)
-           | I.Kpushtrap lab -> I.Kpushtrap (map_label lab)
-           | _ -> instr
-       )
+  let all_instrs =
+    decoded_a
+    |> Array.mapi
+         (fun i (_, instr) ->
+           match instr with
+             | I.Klabel _ -> assert false
+             | I.Kpush_retaddr lab -> I.Kpush_retaddr (map_label lab)
+             | I.Kclosure (lab, k) -> I.Kclosure (map_label lab, k)
+             | I.Kclosurerec (labl, k) -> I.Kclosurerec (List.map map_label labl, k)
+             | I.Kbranch lab -> I.Kbranch (map_label lab)
+             | I.Kbranchif lab -> I.Kbranchif (map_label lab)
+             | I.Kbranchifnot lab -> I.Kbranchifnot (map_label lab)
+             | I.Kstrictbranchif _ -> assert false
+             | I.Kstrictbranchifnot _ -> assert false
+             | I.Kswitch (laba1, laba2) ->
+                 I.Kswitch (Array.map map_label laba1, Array.map map_label laba2)
+             | I.Kpushtrap lab -> I.Kpushtrap (map_label lab)
+             | _ -> instr
+         ) in
+  (all_instrs, !all_labels)
+
 
 

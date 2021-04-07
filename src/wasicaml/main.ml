@@ -1,12 +1,13 @@
-open Wc_reader
-
 let _ =
   Printexc.record_backtrace true;;
 
 let _ =
   try
-    let exec = read_executable "t" in
-    let c = decode exec in
+    let exec = Wc_reader.read_executable "t" in
+    let code, labels = Wc_reader.decode exec in
+    let ctx = Wc_control.create_context code labels in
+    Wc_control.detect_loops ctx;
+    let _ = Wc_control.recover_structure ctx in
     print_endline "Done"
   with
     | error ->
