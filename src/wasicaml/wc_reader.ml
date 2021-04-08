@@ -292,6 +292,21 @@ let map_label_in_instr f instr =
     | I.Kpushtrap lab -> I.Kpushtrap (f lab)
     | _ -> instr
 
+let get_labels_in_instr instr =
+  match instr with
+    | I.Klabel _ -> assert false
+    | I.Kpush_retaddr lab ->[lab]
+    | I.Kclosure (lab, k) -> [lab]
+    | I.Kclosurerec (labl, k) -> labl
+    | I.Kbranch lab -> [lab]
+    | I.Kbranchif lab -> [lab]
+    | I.Kbranchifnot lab -> [lab]
+    | I.Kstrictbranchif _ -> assert false
+    | I.Kstrictbranchifnot _ -> assert false
+    | I.Kswitch (laba1, laba2) -> Array.append laba1 laba2 |> Array.to_list
+    | I.Kpushtrap lab -> [lab]
+    | _ -> []
+
 let decode exec =
   let instrs_l = instructions exec in
   let num = List.fold_left (fun acc (n,_,_) -> max acc n) (-1) instrs_l + 1 in

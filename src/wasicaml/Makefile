@@ -1,4 +1,6 @@
-ML = wc_types.ml wc_reader.ml wc_control.ml
+ML = wc_types.ml \
+     wc_reader.mli wc_reader.ml \
+     wc_control.mli wc_control.ml
 PKG = compiler-libs.common compiler-libs.bytecomp
 
 all: wc.cma

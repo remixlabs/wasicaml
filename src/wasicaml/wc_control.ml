@@ -1,7 +1,8 @@
 open Wc_types
+open Printf
 
 type structured_code =
-  { functions : func_block IMap.t;  (* by cfg_func_label *)
+  { functions : func_block IMap.t;
   }
 
  and func_block =
@@ -11,12 +12,8 @@ type structured_code =
 
  and block =
    { loop_label : int option;
-     (* a label pointing to the beginning of this block, for jumping back *)
      instructions : instruction array;
-     (* what to execute *)
      break_label : int option;
-     (* a label pointing to the end of this block, for jumping out *)
-     (* there cannot be both a loop_label and a break_label *)
    }
 
  and instruction =
@@ -25,12 +22,8 @@ type structured_code =
 
  and cfg_scope =
   { cfg_letrec_label : int option;
-    (* label of first function in "let rec" phrase to which this function
-       belongs *)
     cfg_func_label : int;
-    (* label of current function or "try" section, or 0 for the init block *)
     cfg_try_labels : int list;
-    (* surrounding "try" sections, inner to outer *)
   }
 
 type trap_info =
@@ -41,48 +34,94 @@ type try_info =
   | Try_entry of int
   | Try_exit
 
-(* try/catch:
-
-   outer_1_label:
-     Kpushtrap catch_label;
-     cfg_trap = Trap_push try_label;
-     cfg_succ = [ outer_2_label; catch_label ]
-   try_label:
-     cfg_try = Try_entry exit_label
-     ... finally any jump to outer_2_label is replaced by new exit_label
-   exit_label:
-     cfg_try = Try_exit
-     no instructions (symbolic node)
-   outer_2_label:
-     Kpoptrap;
-     cfg_trap = Trap_pop(try_label, exit_label)
- *)
-
 type cfg_node =
   { cfg_scope : cfg_scope;
     cfg_node_label : int;
-    (* label of this sequence of non-jumping instructions *)
-    (* if cfg_node_label = cfg_func_label, this node is the beginning of
-       a function/init block *)
     cfg_try : try_info option;
     cfg_trap : trap_info option;
-    (* whether this is the start of a "try" section *)
     mutable cfg_loops : int list;
-    (* this node is member if these loops (inner to outer). Loops are
-       identified by the node label of the first node of the loop, which
-       is also the node to which it is allowed to jump back *)
     cfg_succ : int list;
-    (* Successor nodes *)
     cfg_length : int;
-    (* Number of Instruct.instructions (can be 0) *)
     cfg_final : I.instruction option;
   }
 
-type cfg_context =
-  { mutable nodes : cfg_node IMap.t;  (* by cfg_node_label *)
+type cfg =
+  { mutable nodes : cfg_node IMap.t;
     mutable code : I.instruction array;
-    mutable labels : ISet.t;          (* all labels *)
+    mutable labels : ISet.t;
   }
+
+let string_of_scope s =
+  sprintf "[letrec=%s,func=%d,try=%s]"
+          ( match s.cfg_letrec_label with
+              | None -> "none"
+              | Some l -> string_of_int l
+          )
+          s.cfg_func_label
+          (List.map string_of_int s.cfg_try_labels |> String.concat ",")
+
+let detect_loops ctx =
+  let visited = ref ISet.empty in
+  let trails = ref IMap.empty in
+  let rec recurse exectrail label =
+    let node =
+      try IMap.find label ctx.nodes
+      with Not_found -> assert false in
+    if not (ISet.mem label !visited) then (
+      (* first-time visit *)
+      visited := ISet.add label !visited;
+      trails := IMap.add label exectrail !trails;
+      let exectrail' = ISet.add label exectrail in
+      List.iter (recurse exectrail') node.cfg_succ
+    ) else (
+      let loop_label_opt =
+        if ISet.mem label exectrail then
+          (* already visited, and the node is in the execution trail => loop *)
+          Some label
+        else
+          (* already visited => alternate execution paths *)
+          ( match node.cfg_loops with
+              | [] -> None
+              | l :: _ ->
+                  (* if the following assertion fails, we found a
+                     jump into the loop body *)
+                  assert(ISet.mem l exectrail);
+                  Some l   (* hitting another loop *)
+          ) in
+      match loop_label_opt with
+        | Some loop_label ->
+            let old_trail =
+              try IMap.find loop_label !trails
+              with Not_found -> assert false in
+            let loops =
+              if node.cfg_loops = [] || List.hd node.cfg_loops <> loop_label then
+                loop_label :: node.cfg_loops
+              else
+                node.cfg_loops in
+            ISet.iter
+              (fun lab ->
+                let n =
+                  try IMap.find lab ctx.nodes
+                  with Not_found -> assert false in
+                if not(List.mem loop_label n.cfg_loops) then
+                  n.cfg_loops <- loops
+              )
+              (ISet.diff exectrail old_trail)
+        | None ->
+            ()
+    )
+    in
+  IMap.iter
+    (fun label node ->
+        let is_entry =
+          label = node.cfg_scope.cfg_func_label ||
+            match node.cfg_try with
+              | Some (Try_entry _) -> true
+              | _ -> false in
+      if is_entry then
+        recurse ISet.empty label
+    )
+    ctx.nodes
 
 let func_labels instr =
   match instr with
@@ -114,7 +153,7 @@ let is_trapping instr =
     | I.Kpushtrap _ -> true
     | _ -> false
 
-let create_context code labels =
+let create_cfg code labels =
   let labels = ref labels in
   let max_label = ref (Array.length code - 1) in
   let new_label () =
@@ -123,22 +162,34 @@ let create_context code labels =
     max_label := label;
     label in
   let nodes = ref IMap.empty in
+  let pushtraps = ref IMap.empty in
   let todo = Queue.create() in
+  let m = ref 0 in
   let init_scope =
     { cfg_letrec_label = None;
       cfg_func_label = 0;
       cfg_try_labels = []
     } in
   Queue.add (init_scope, None, 0) todo;
-  let add scope popfrom start =
+  let add where scope popfrom start =
     try
       let node = IMap.find start !nodes in
-      if node.cfg_scope <> scope then
+      if node.cfg_scope <> scope then (
+        eprintf "[DEBUG] where=%d start=%d ex_scope=%s new_scope=%s\n%!"
+                where
+                start
+                (string_of_scope node.cfg_scope)
+                (string_of_scope scope);
         failwith "bad scoping";
+      )
     with Not_found ->
       Queue.add (scope, popfrom, start) todo in
   while not (Queue.is_empty todo) do
     let (cfg_scope, popfrom, start) = Queue.take todo in
+    if start > !m then (
+      printf "start=%d\n%!" start;
+      m := start;
+    );
     let n = ref 0 in
     let eon = ref false in
     while not !eon do
@@ -157,7 +208,7 @@ let create_context code labels =
               cfg_func_label = flab;
               cfg_try_labels = []
             } in
-          add scope None flab
+          add (start + !n - 1) scope None flab
         )
         flabs
     done;
@@ -189,23 +240,21 @@ let create_context code labels =
             nodes := IMap.add exit_label exit_node !nodes;
             Some (Try_entry exit_label)
         | _ -> None in
+    if is_pushtrap then
+      pushtraps := IMap.add (start + !n) start !pushtraps;
     let cfg_trap =
       if is_pushtrap then
         Some (Trap_push (start + !n))
       else if is_poptrap then
         match popfrom with
-          | None -> assert false
+          | None ->
+              eprintf "[DEBUG] start=%d n=%d\n%!" start !n;
+              assert false
           | Some lab ->
               (* Fix up cfg_succ in the corresponding Trap_push node: *)
-              (* FIXME: this is crazy code *)
               let push_label =
-                IMap.fold
-                  (fun l n acc ->
-                    if acc < 0 && n.cfg_trap = Some(Trap_push lab) then l else acc
-                  )
-                  !nodes
-                  (-1) in
-              assert(push_label >= 0);
+                try IMap.find lab !pushtraps
+                with Not_found -> assert false in
               let push_node = IMap.find push_label !nodes in
               let push_node' =
                 { push_node with
@@ -246,11 +295,17 @@ let create_context code labels =
           Some (List.hd cfg_scope.cfg_try_labels)
         else
           None in
-      add scope popfrom next
+      add next scope popfrom next
     );
     List.iter
       (fun lab ->
-        add cfg_scope None lab
+        let scope, popfrom =
+          if code.(lab) = Kpoptrap then
+            { cfg_scope with cfg_try_labels = List.tl cfg_scope.cfg_try_labels },
+            Some (List.hd cfg_scope.cfg_try_labels)
+          else
+            cfg_scope, None in
+        add (start + !n - 1) scope popfrom lab
       )
       last_jlabs
   done;
@@ -258,14 +313,14 @@ let create_context code labels =
      (except in the Trap_push node)
    *)
   let map_label lab =
-    let n =
-      try IMap.find lab !nodes
-      with Not_found -> assert false in
-    match n.cfg_trap with
-      | Some (Trap_pop(_, exit_label)) ->
-          exit_label
-      | _ ->
-          lab in
+    try
+      let n = IMap.find lab !nodes in
+      match n.cfg_trap with
+        | Some (Trap_pop(_, exit_label)) ->
+            exit_label
+        | _ ->
+            lab
+    with Not_found -> lab in
   nodes :=
     IMap.mapi
       (fun label node ->
@@ -286,59 +341,13 @@ let create_context code labels =
       )
       !nodes;
   let code = Array.map (Wc_reader.map_label_in_instr map_label) code in
-  { nodes = !nodes;
-    code;
-    labels = !labels;
-  }
-
-let detect_loops ctx =
-  let visited = ref ISet.empty in
-  let trails = ref IMap.empty in
-  let rec recurse exectrail label =
-    let node =
-      try IMap.find label ctx.nodes
-      with Not_found -> assert false in
-    if not (ISet.mem label !visited) then (
-      (* first-time visit *)
-      visited := ISet.add label !visited;
-      trails := IMap.add label exectrail !trails;
-      let exectrail' = ISet.add label exectrail in
-      List.iter (recurse exectrail') node.cfg_succ
-    ) else if ISet.mem label exectrail then (
-      (* already visited, and the node is in the execution trail => loop *)
-      let old_trail =
-        try IMap.find label !trails
-        with Not_found -> assert false in
-      ISet.iter
-        (fun lab ->
-          let n =
-            try IMap.find lab ctx.nodes
-            with Not_found -> assert false in
-          if n.cfg_loops = [] || List.hd n.cfg_loops <> label then
-            n.cfg_loops <- label :: n.cfg_loops
-        )
-        (ISet.diff exectrail old_trail)
-    ) (* else: already visited => joining execution paths *)
-    in
-  IMap.iter
-    (fun label node ->
-        let is_entry =
-          label = node.cfg_scope.cfg_func_label ||
-            match node.cfg_try with
-              | Some (Try_entry _) -> true
-              | _ -> false in
-      if is_entry then
-        recurse ISet.empty label
-    )
-    ctx.nodes
-
-    (*
-let starts_try_section ctx label =
-  let node =
-    try IMap.find label ctx.nodes
-    with Not_found -> assert false in
-  node.cfg_try
-     *)
+  let cfg =
+    { nodes = !nodes;
+      code;
+      labels = !labels;
+    } in
+  detect_loops cfg;
+  cfg
 
 let is_node_in_loop ctx loop_label label =
   let node =
@@ -347,28 +356,26 @@ let is_node_in_loop ctx loop_label label =
   List.mem loop_label node.cfg_loops
 
 let recover_structure ctx =
-  let visited = ref ISet.empty in
   let in_degree = ref IMap.empty in
-  let rec inc_degree label =
-    visited := ISet.add label !visited;
+  let rec inc_degree trail label =
     let deg =
       try IMap.find label !in_degree
       with Not_found -> 0 in
-    in_degree := IMap.add label (deg+1) !in_degree;
+   in_degree := IMap.add label (deg+1) !in_degree;
     if deg = 0 then (
       let node =
         try IMap.find label ctx.nodes
         with Not_found -> assert false in
+      let trail' = ISet.add label trail in
       let eff_succ =
         List.filter
           (fun lab ->
-            not (ISet.mem lab !visited)
+            not (ISet.mem lab trail')
           )
           node.cfg_succ in
-      List.iter inc_degree eff_succ
+      List.iter (inc_degree trail') eff_succ
     ) in
-  let rec dec_degree label =
-    visited := ISet.add label !visited;
+  let rec dec_degree trail label =
     let deg =
       try IMap.find label !in_degree
       with Not_found -> assert false in
@@ -377,18 +384,19 @@ let recover_structure ctx =
       let node =
         try IMap.find label ctx.nodes
         with Not_found -> assert false in
+      let trail' = ISet.add label trail in
       let eff_succ =
         List.filter
           (fun lab ->
-            not (ISet.mem lab !visited)
+            not (ISet.mem lab trail')
           )
           node.cfg_succ in
-      ( [label] :: List.map dec_degree eff_succ )
+      ( [label] :: List.map (dec_degree trail') eff_succ )
       |> List.flatten
     ) else
       [] in
 
-  let rec build_block loop_opt inner labels =
+  let rec build_block prev_loop loops_started inner labels =
     match labels with
       | label1 :: labels' ->
           let node =
@@ -414,32 +422,20 @@ let recover_structure ctx =
                 | Some instr -> Array.append a1 [| Simple instr |]
             )
           in
-          if loop_opt = node_loop || node_loop = None then
+          if prev_loop = node_loop || List.mem node_loop loops_started then
             let instructions =
               Array.append inner_instructions node_instructions in
             let break_label =
               match labels' with
                 | [] -> None
-                | lab :: _ ->
-                    (* no break label when a loop follows *)
-                    let n =
-                      try IMap.find lab ctx.nodes
-                      with Not_found -> assert false in
-                    let n_loop =
-                      match n.cfg_loops with
-                        | [] -> None
-                        | l :: _ -> Some l in
-                    if node_loop = n_loop || n_loop = None then
-                      Some lab
-                    else
-                      None in
+                | lab :: _ -> Some lab in
             let inner' =
               [ { loop_label = None;
                   break_label;
                   instructions
                 }
               ] in
-            build_block node_loop inner' labels'
+            build_block node_loop loops_started inner' labels'
           else
             let loop_start_label =
               match node_loop with
@@ -450,7 +446,7 @@ let recover_structure ctx =
                 (is_node_in_loop ctx loop_start_label)
                 labels in
             let loop_body =
-              build_block node_loop [] loop_labels in
+              build_block node_loop (node_loop :: loops_started) [] loop_labels in
             let loop_block =
               { loop_label = node_loop;
                 break_label = None;
@@ -470,7 +466,7 @@ let recover_structure ctx =
                   instructions;
                 }
               ] in
-            build_block None inner' other_labels
+            build_block None loops_started inner' other_labels
       | [] ->
           ( match inner with
               | [ b ] -> b
@@ -492,11 +488,9 @@ let recover_structure ctx =
               | Some (Try_entry _) -> true
               | _ -> false in
         if is_entry then (
-          visited := ISet.empty;
-          inc_degree label;
-          visited := ISet.empty;
-          let sorted_block_labels = dec_degree label in
-          let block = build_block None [] sorted_block_labels in
+          inc_degree ISet.empty label;
+          let sorted_block_labels = dec_degree ISet.empty label in
+          let block = build_block None [None] [] sorted_block_labels in
           Some { scope = node.cfg_scope;
                  block
                }
@@ -506,4 +500,69 @@ let recover_structure ctx =
       ctx.nodes in
   { functions }
 
+let validate scode =
+  let error func_label last_label message =
+    failwith
+      (sprintf "validation error function %d near %d: %s"
+               func_label last_label message) in
+
+  let rec validate_block labels_in_scope func_label last_label block =
+    if block.loop_label <> None && block.break_label <> None then
+      error func_label last_label "both loop_label and break_label";
+    let last_label' =
+      match block.loop_label, block.break_label with
+        | Some lab, _ -> lab
+        | _, Some lab -> lab
+        | _ -> last_label in
+    let labels_in_scope' =
+      match block.loop_label with
+        | None -> labels_in_scope
+        | Some lab ->
+            if ISet.mem lab labels_in_scope then
+              error func_label last_label' "loop_label not new";
+            ISet.add lab labels_in_scope in
+    let labels_in_scope'' =
+      match block.break_label with
+        | None -> labels_in_scope'
+        | Some lab ->
+            if ISet.mem lab labels_in_scope' then
+              error func_label last_label' "break_label not new";
+            ISet.add lab labels_in_scope' in
+    Array.iter
+      (validate_instruction labels_in_scope'' func_label last_label')
+      block.instructions
+
+  and validate_instruction labels_in_scope func_label last_label instruction =
+    match instruction with
+      | Block block ->
+          validate_block labels_in_scope func_label last_label block
+      | Simple instr ->
+          ( match instr with
+              | I.Kclosure (lab, _) ->
+                  validate_function_label func_label last_label lab
+              | I.Kclosurerec (labl, _) ->
+                  List.iter
+                    (validate_function_label func_label last_label)
+                    labl
+              | _ ->
+                  let labels = Wc_reader.get_labels_in_instr instr in
+                  List.iter (validate_label labels_in_scope func_label last_label) labels
+          )
+
+  and validate_label labels_in_scope func_label last_label label =
+    if not (ISet.mem label labels_in_scope) then
+      error func_label last_label (sprintf "label not defined: %d" label)
+
+  and validate_function_label func_label last_label label =
+    if not (IMap.mem label scode.functions) then
+      error func_label last_label (sprintf "function not defined: %d" label)
+  in
+
+  let validate_fblock label fblock =
+    validate_block ISet.empty label (-1) fblock.block
+  in
+
+  IMap.iter
+    validate_fblock
+    scode.functions
 
