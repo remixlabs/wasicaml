@@ -127,23 +127,23 @@ let instructions exec =
     O.opPUSHOFFSETCLOSURE3, [], (fun args -> [I.Kpush; I.Koffsetclosure (-3)]);
     O.opPUSHOFFSETCLOSURE, [C], (fun args -> [I.Kpush; I.Koffsetclosure args.(0)]);
     O.opGETGLOBAL, [C], (fun args ->
-      let ident = Ident.create_persistent (sprintf "global_%d" args.(0)) in
+      let ident = Ident.create_persistent (sprintf "%d" args.(0)) in
       [I.Kgetglobal ident]
     );
     O.opPUSHGETGLOBAL, [C], (fun args ->
-      let ident = Ident.create_persistent (sprintf "global_%d" args.(0)) in
+      let ident = Ident.create_persistent (sprintf "%d" args.(0)) in
       [I.Kpush; I.Kgetglobal ident]
     );
     O.opGETGLOBALFIELD, [C;C], (fun args ->
-      let ident = Ident.create_persistent (sprintf "global_%d" args.(0)) in
+      let ident = Ident.create_persistent (sprintf "%d" args.(0)) in
       [I.Kgetglobal ident; I.Kgetfield args.(1)]
     );
     O.opPUSHGETGLOBALFIELD, [C;C], (fun args ->
-      let ident = Ident.create_persistent (sprintf "global_%d" args.(0)) in
+      let ident = Ident.create_persistent (sprintf "%d" args.(0)) in
       [I.Kpush; I.Kgetglobal ident; I.Kgetfield args.(1)]
     );
     O.opSETGLOBAL, [C], (fun args ->
-      let ident = Ident.create_persistent (sprintf "global_%d" args.(0)) in
+      let ident = Ident.create_persistent (sprintf "%d" args.(0)) in
       [I.Ksetglobal ident]
     );
     O.opATOM0, [], (fun args -> [I.Kmakeblock(0, 0)]);
