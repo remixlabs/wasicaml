@@ -116,3 +116,5 @@ val create_cfg : Instruct.instruction array -> ISet.t -> cfg
  
 val recover_structure : cfg -> structured_code
   (* Analyze the loop/jump structure of the code *)
+
+val validate : structured_code -> unit

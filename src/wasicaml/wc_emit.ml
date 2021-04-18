@@ -13,7 +13,7 @@ open Wc_sexp
 
 (* OCaml functions are translated to Wasm functions with parameters:
    param 1: env
-   param 2: closure
+   param 2: extra_args
    param 3: code pointer (overriding the one in the closure)
  *)
 
@@ -25,10 +25,15 @@ type wasm_func_type =
   | TFunc of { args: wasm_value_type list; results: wasm_value_type list }
 
 type gpad =  (* global pad *)
-  { functypes : (wasm_func_type, int) Hashtbl.t;
-    functions : (string, func) Hashtbl.t;
-    globals : (string, global) Hashtbl.t;
+  { (* functypes : (wasm_func_type, int) Hashtbl.t;
+       functions : (string, func) Hashtbl.t;
+       globals : (string, global) Hashtbl.t;
+     *)
     primitives : (string, int) Hashtbl.t;
+    funcmapping : (int, int * int) Hashtbl.t;
+    (* maps function label to (letec_label, subfunction_id) *)
+    subfunctions : (int, int list) Hashtbl.t;
+    (* maps letrec_label to list of subfunction labels *)
   }
 
  and func =
@@ -126,6 +131,7 @@ let code_pointer_shift = 11
       - Bit 1 - code_pointer_shift-1: subfunction of the letrec
       - Bit code_pointer_shift-31: the Wasm function index
    *)
+let code_pointer_mask = 0x7fe
 
 (* TODO: grab the following values from C: *)
 let max_young_wosize = 256
@@ -1407,40 +1413,205 @@ let emit_instr gpad lpad state instr =
     | Kswitch (labls_ints, labls_blocks) ->
         (state, switch gpad lpad state labls_ints labls_blocks)
     | Kpush_retaddr lab ->
-        XXX
+        let d = state.camldepth in
+        let state = { state with camlstack = RealStack(-d-3) :: RealStack(-d-2) :: RealStack(-d-1) :: state.camlstack;
+                                 camldepth = state.camldepth + 3 } in
+        (state, [])   (* TODO *)
     | Kapply num ->
-        XXX
+        (* Careful: for num < 4 this includes PUSH_RETADDR and the pushes
+           of the args, but for higher num these pushes are not done.
+           RETURN will pop the args and the return address triple.
+         *)
+        if num < 4 then
+          (state, [])   (* TODO *)
+        else
+          (popn_camlstack state (num+3), [])   (* TODO *)
     | Kappterm(num, slots) ->
-        XXX
+        (state, [])   (* TODO *)
     | Kreturn slots ->
-        XXX
+        (state, [])   (* TODO *)
     | Krestart ->
-        XXX
+        (state, [])   (* TODO *)
     | Kgrab num ->
-        XXX
+        (state, [])   (* TODO *)
     | Kclosure(lab, num) ->
-        XXX
-    | Kclosurerec(labs, num) ->
-        XXX
+        let k = if num > 0 then num-1 else 0 in
+        (popn_camlstack state k, [])   (* TODO *)
+    | Kclosurerec(funcs, num_args) ->
+        let num_funcs = List.length funcs in
+        let k = if num_args > 0 then num_args-1 else 0 in
+        let state = popn_camlstack state k in
+        let d = state.camldepth in
+        let nstack =
+          enum (-d-num_funcs) num_funcs
+          |> List.map (fun pos -> RealStack pos) in
+        let state = { state with camlstack = nstack @ state.camlstack;
+                                 camldepth = state.camldepth + num_funcs
+                    } in
+        (state, [])   (* TODO *)
     | Koffsetclosure index ->
-        XXX
+        (state, [])   (* TODO *)
     | Kpushtrap lab ->
-        XXX
+        (state, [])   (* TODO *)
     | Kpoptrap ->
-        XXX
+        (state, [])   (* TODO *)
     | Kraise kind ->
-        XXX
+        (state, [])   (* TODO *)
     | Kcheck_signals ->
-        XXX
+        (state, [])   (* TODO *)
     | Kgetmethod ->
-        XXX
+        (state, [])   (* TODO *)
     | Kgetpubmet k ->
-        XXX
+        let state = push_camlstack state.accu state in
+        (state, [])   (* TODO *)
     | Kgetdynmet ->
-        XXX
+        (state, [])   (* TODO *)
     | Kevent _ ->
-        XXX
+        (state, [])
     | Kstop ->
-        XXX
+        (state, [])   (* TODO *)
     | Kstrictbranchif _ -> assert false
     | Kstrictbranchifnot _ -> assert false
+
+let get_funcmapping scode =
+  let open Wc_control in
+  let funcmapping = Hashtbl.create 7 in
+  let subfunction_num = Hashtbl.create 7 in
+  let subfunctions = Hashtbl.create 7 in
+  IMap.iter
+    (fun func_label fblock ->
+      match fblock.scope.cfg_letrec_label with
+        | None -> ()
+        | Some letrec_label ->
+            let subfunc_num =
+              try Hashtbl.find subfunction_num letrec_label
+              with Not_found -> 0 in
+            Hashtbl.replace subfunction_num letrec_label (subfunc_num+1);
+            Hashtbl.add funcmapping func_label (letrec_label, subfunc_num);
+            let subfunc_list =
+              try Hashtbl.find subfunctions letrec_label
+              with Not_found -> [] in
+            Hashtbl.replace subfunctions letrec_label (func_label :: subfunc_list)
+    )
+    scode.functions;
+  let subfunctions_rev = Hashtbl.create 7 in
+  Hashtbl.iter
+    (fun letrec_label subfunc_labels ->
+      Hashtbl.add subfunctions_rev letrec_label (List.rev subfunc_labels)
+    )
+    subfunctions;
+  ( funcmapping,
+    subfunctions_rev
+  )
+
+
+let get_primitives exe =
+  let open Wc_reader in
+  let primitives = Hashtbl.create 7 in
+  Array.iteri
+    (fun k name ->
+      Hashtbl.add primitives name k
+    )
+    exe.primitives;
+  primitives
+
+let block_cascade start_sexpl label_sexpl_pairs =
+  let rec shift prev_sexpl pairs =
+    match pairs with
+      | (label, lsexpl) :: pairs' ->
+          (prev_sexpl, Some label) :: shift lsexpl pairs'
+      | [] ->
+          [ prev_sexpl, None ] in
+  let rec arrange inner_sexpl shifted =
+    match shifted with
+      | (sexpl, label_opt) :: shifted' ->
+          let inner_sexpl' =
+            [ L ( [ K "block" ]
+                  @ ( match label_opt with
+                        | None -> []
+                        | Some lab -> [ ID lab ]
+                    )
+                  @ inner_sexpl
+                  @ sexpl
+                  @ [ L [ K "unreachable" ]]
+                )
+            ] in
+          arrange inner_sexpl' shifted'
+      | [] ->
+          inner_sexpl in
+  arrange [] (shift start_sexpl label_sexpl_pairs)
+
+let generate_subfunction gpad letrec_label func_label fblock =
+  [ L [ K "unreachable" ]]
+
+let generate_letrec scode gpad letrec_label =
+  let subfunc_labels =
+    try Hashtbl.find gpad.subfunctions letrec_label
+    with Not_found -> assert false in
+  assert(subfunc_labels <> []);
+
+  let subfunc_pairs =
+    List.map
+      (fun func_label ->
+        let fblock = IMap.find func_label Wc_control.(scode.functions) in
+        let label = sprintf "func%d" func_label in
+        let sexpl = generate_subfunction gpad letrec_label func_label fblock in
+        (label, sexpl)
+      )
+      subfunc_labels
+    @ [ "panic", [] ] in
+
+  let letrec_body =
+    [ L [ K "local.get";
+          ID "codeptr"
+        ];
+      L [ K "i32.const";
+          N (I32 (Int32.of_int code_pointer_mask));
+        ];
+      L [ K "i32.and" ];
+      L [ K "i32.const";
+          N (I32 1l);
+        ];
+      L [ K "i32.shr_u" ];
+      L ( [ K "br_table" ]
+          @ ( List.map (fun (label, _) -> ID label) subfunc_pairs )
+        )
+    ] in
+  let cascade = block_cascade letrec_body subfunc_pairs in
+  let letrec =
+    [ L ( [ K "func";
+            ID (sprintf "letrec%d" letrec_label);
+            L [ K "param";
+                ID "env";
+                K "i32";
+              ];
+            L [ K "param";
+                ID "extra_args";
+                K "i32";
+              ];
+            L [ K "param";
+                ID "codeptr";
+                K "i32";
+              ];
+          ]
+          @ cascade
+        )
+    ] in
+  letrec
+
+let generate scode exe =
+  let (funcmapping, subfunctions) = get_funcmapping scode in
+  let primitives = get_primitives exe in
+  let gpad =
+    { funcmapping;
+      subfunctions;
+      primitives;
+    } in
+
+  Hashtbl.fold
+    (fun letrec_label _ acc ->
+      let sexpl = generate_letrec scode gpad letrec_label in
+      sexpl @ acc
+    )
+    gpad.subfunctions
+    []
