@@ -41,7 +41,10 @@ let fits_onto_line width sexp =
       | K _ | ID _ | S _ | N _ | C _ | BR ->
           string_of_sexp sexp |> String.length
       | L l ->
-          list (width-2) l + 2
+          if width >= 2 then
+            list (width-2) l + 2
+          else
+            width+1
   and list width l =
     match l with
       | BR :: l' ->
@@ -73,7 +76,7 @@ let rec print_indented f indent width sexp =
     | K _ | ID _ | S _ | N _ | C _ | BR ->
         fprintf f "%s%s" (indentation indent) (string_of_sexp sexp)
     | L l ->
-        if fits_onto_line (width - indent) sexp then
+        if width > indent && fits_onto_line (width - indent) sexp then
           fprintf f "%s%s" (indentation indent) (string_of_sexp sexp)
         else
           let l_nobreak, l_break = break l in

@@ -9,6 +9,23 @@ open Wc_sexp
      code to set the global)
    - wasicaml_domain_state = caml_domain_state
    - wasicaml_builtin_cprim = caml_builtin_cprim
+   - wasicaml_atom_table = caml_atom_table
+
+   - init code
+   - debug print per block
+   - initialize fp, accu
+   - declare local variables from lpad
+   - generate wrapper for caml_alloc_small_dispatch:
+     pass args: accu, env, fp, framesize, blocksize
+     return: new ptr
+     pass back via special global: accu, env
+   - recognize backward jumps and use loop label
+   - exceptions
+   - return codes:
+      0 = function return
+      1 = try return
+      2 = exception return
+      3 = stop
  *)
 
 (* OCaml functions are translated to Wasm functions with parameters:
@@ -99,11 +116,6 @@ type store =
      *)
   | Invalid
 
-type log_place =
-  | CamlStack of repr * int
-  | LogAccu of repr
-  | Unused
-
 type state =
   { camlstack : store list;
     (* where the contents are stored that are supposed to be on the
@@ -115,14 +127,15 @@ type state =
      *)
     camldepth : int;
     (* = List.length camlstack *)
-    realstack : log_place IMap.t;
-    (* the reverse mapping: which logical value is stored in which position
-       of the real OCaml stack. The key of the map is the position.
-       Any real stack positions not occurring here are still uninitialized
-     *)
+    realstack : ISet.t;
+    (* which real stack positions have been initialized *)
     accu : store;
     (* where the accu is stored *)
-    realaccu : log_place;
+    realaccu : ISet.t;
+    (* in which stack positions the "accu" variable must be saved on flush.
+       If additionally accu=RealAccu, the "accu" variable also keeps the
+       logical accu value.
+     *)
   }
 
 let code_pointer_shift = 11
@@ -164,7 +177,7 @@ let repr_of_store =
   | Const _ -> RInt
   | Local(repr, _) -> repr
   | RealAccu -> RValue
-  | Invalid -> assert false
+  | Invalid -> RValue (* FIXME: assert false *)
 
 let vtype repr =
   match repr with
@@ -183,16 +196,12 @@ let new_local lpad vtype =
 
 let realdepth state =
   (* how many stack positions are really used, counted from the bottom? *)
-  let rec recurse k =
-    if k > 0 then
-      let pos = -k in
-      match IMap.find pos state.realstack with
-        | Unused -> recurse (k-1)
-        | _ -> k
-        | exception Not_found -> recurse (k-1)
-    else
-      k in
-  recurse state.camldepth
+  match ISet.min_elt_opt state.realstack with
+    | None ->
+        0
+    | Some pos ->
+        assert(pos < 0);
+        -pos
 
 let push_const n =
   [ L [ K "i32.const";
@@ -297,13 +306,9 @@ let load_double =
 let stack_init gpad lpad state realdepth =
   (* put zeros into the uninitialized stack positions *)
   let rec gen_init k =
-    if k >= 0 then
-      let pos = -k-1 in
-      let is_used =
-        match IMap.find pos state.realstack with
-          | Unused -> false
-          | _ -> true
-          | exception Not_found -> false in
+    if k >= 1 then
+      let pos = -k in
+      let is_used = ISet.mem pos state.realstack in
       ( if not is_used then
           push_const 1l @ pop_to_stack pos
         else
@@ -314,10 +319,7 @@ let stack_init gpad lpad state realdepth =
   gen_init realdepth
 
 let whether_accu_contains_value state =
-  match state.realaccu with
-    | CamlStack(RValue, _) -> true
-    | LogAccu RValue -> true
-    | _ -> false
+  state.realaccu <> ISet.empty || state.accu = RealAccu
 
 let setup_for_gc gpad lpad state realdepth =
   let accu_contains_value = whether_accu_contains_value state in
@@ -337,7 +339,7 @@ let setup_for_gc gpad lpad state realdepth =
           ID "fp";
         ];
       L [ K "i32.const";
-          N (I32 (Int32.of_int (realdepth + sp_decr)));
+          N (I32 (Int32.of_int ( 4 * (realdepth + sp_decr))));
         ];
       L [ K "i32.sub" ];
     ]
@@ -367,7 +369,7 @@ let setup_for_c_call gpad lpad state extra realdepth =
           ID "fp";
         ];
       L [ K "i32.const";
-          N (I32 (Int32.of_int (realdepth + extra)));
+          N (I32 (Int32.of_int ( 4 * (realdepth + extra + 1))));
         ];
       L [ K "i32.sub" ];
     ]
@@ -375,9 +377,25 @@ let setup_for_c_call gpad lpad state extra realdepth =
   sexpl_stack @ sexpl_env @ sexpl_extern_sp
 
 let restore_after_c_call gpad lpad state extra realdepth =
-  push_stack (-realdepth-extra) @ pop_to_local "env"
+  push_stack (-realdepth-1-extra) @ pop_to_local "env"
 
-let alloc gpad lpad state size tag =
+let alloc_atom gpad lpad state tag =
+  let ptr = new_local lpad TI32 in
+  let code =
+    [ L [ K "global.get";
+          ID "wasicaml_atom_table";
+        ];
+      L [ K "i32.const";
+          N (I32 (Int32.of_int (4 * tag)));
+        ];
+      L [ K "i32.add" ];
+      L [ K "local.set";
+          ID ptr
+        ]
+    ] in
+  (code, ptr, false)
+
+let alloc_non_atom gpad lpad state size tag =
   (* TODO: use new push/pop functions *)
   let ptr = new_local lpad TI32 in
   let young = size <= max_young_wosize in
@@ -401,17 +419,16 @@ let alloc gpad lpad state size tag =
             ID ptr;
           ];
 
+        (* if (ptr < Caml_state_field(young_limit)) *)
+        L [ K "global.get";
+            ID "wasicaml_domain_state";
+          ];
+        L [ K "i32.load";
+            K (sprintf "offset=0x%lx" (Int32.of_int (4 * domain_field_young_limit)));
+            K "align=2"
+          ];
+        L [ K "i32.lt_u" ];
         L [ K "if";
-            (* if (ptr < Caml_state_field(young_limit)) *)
-            L [ K "global.get";
-                ID "wasicaml_domain_state";
-              ];
-            L [ K "i32.load";
-                K (sprintf "offset=0x%lx" (Int32.of_int (4 * domain_field_young_limit)));
-                K "align=2"
-              ];
-            L [ K "i32.lt_u" ];
-
             L ( [ [
                     K "then";
                   ];
@@ -475,7 +492,7 @@ let alloc gpad lpad state size tag =
                       (Int32.of_int tag)));
           ];
         L [ K "i32.store";
-            K "offset=-4";
+            K (sprintf "offset=0x%lx" (-4l));
             K "align=2"
           ];
       ]
@@ -491,6 +508,12 @@ let alloc gpad lpad state size tag =
           ]
       ] in
   (code, ptr, young)
+
+let alloc gpad lpad state size tag =
+  if size = 0 then
+    alloc_atom gpad lpad state tag
+  else
+    alloc_non_atom gpad lpad state size tag
 
 let tovalue repr =
   (* transform the value of the Wasm stack to a proper OCaml value,
@@ -548,16 +571,20 @@ let set_camlstack pos store state =
 
 let pop_camlstack state =
   let cd = state.camldepth in
+  let cpos = (-cd) in
   match state.camlstack with
     | RealStack pos :: tl ->
-        { state with camlstack = tl;
-                     camldepth = cd - 1;
-                     realstack = IMap.add pos Unused state.realstack
+        { state with
+          camlstack = tl;
+          camldepth = cd - 1;
+          realstack = ISet.remove pos state.realstack;
+          realaccu = ISet.remove cpos state.realaccu;
         }
     | RealAccu :: tl ->
-        { state with camlstack = tl;
-                     camldepth = cd - 1;
-                     realaccu = Unused;
+        { state with
+          camlstack = tl;
+          camldepth = cd - 1;
+          realaccu = ISet.remove cpos state.realaccu;
         }
     | (Const _ | Local _ | Invalid) :: tl ->
         { state with camlstack = tl; camldepth = cd - 1 }
@@ -572,19 +599,19 @@ let rec popn_camlstack state number =
 
 let push_camlstack store state =
   let cd = state.camldepth in
-  let cpos = -cd-1 in
+  let cpos = (-cd-1) in
   match store with
     | RealStack pos ->
         { state with
           camlstack = store :: state.camlstack;
           camldepth = cd + 1;
-          realstack = IMap.add pos (CamlStack(RValue, cpos)) state.realstack
+          realstack = ISet.add pos state.realstack;
         }
     | RealAccu ->
         { state with
           camlstack = store :: state.camlstack;
           camldepth = cd + 1;
-          realaccu = CamlStack(RValue,cpos);
+          realaccu = ISet.add cpos state.realaccu;
         }
     | (Const _ | Local _ | Invalid) ->
         { state with
@@ -595,22 +622,33 @@ let push_camlstack store state =
 let flush_accu gpad lpad state =
   (* If the accu is not yet saved, do this now. This function needs to be called
      before setting the accu to a new value. *)
-  match state.realaccu with
-    | CamlStack(repr, pos) as place ->
-        assert(repr = RValue);
-        let state =
-          { state with
-            realaccu = Unused;
-            camlstack = set_camlstack pos (RealStack pos) state;
-            realstack = IMap.add pos place state.realstack
-          } in
-        let sexpl =
-          push_local "accu" @ pop_to_stack pos in
-        (state, sexpl)
-    | LogAccu _ ->
-        ( { state with realaccu = Unused; accu = Invalid }, [] )
-    | Unused ->
-        (state, [])
+  let sexpll =
+    ISet.fold
+      (fun pos sexpl_acc ->
+        let sexpl = push_local "accu" @ pop_to_stack pos in
+        sexpl :: sexpl_acc
+      )
+      state.realaccu
+      [] in
+  let sexpl =
+    List.rev sexpll |> List.flatten in
+  let camlstack =
+    List.mapi
+      (fun i old ->
+        let pos = (-state.camldepth+i) in
+        if ISet.mem pos state.realaccu then
+          RealStack pos
+        else
+          old
+      )
+      state.camlstack in
+  let state =
+    { state with
+      camlstack;
+      realaccu = ISet.empty;
+      realstack = ISet.union state.realstack state.realaccu;
+    } in
+  (state, sexpl)
 
 let push gpad lpad state store =
   (* put the value in store onto the wasm stack *)
@@ -624,12 +662,17 @@ let push gpad lpad state store =
     | RealStack pos ->
         push_stack pos
     | Invalid ->
-        assert false
+        (* FIXME: assert false *)
+        push_local "invalid"
 
 let push_as gpad lpad state store req_repr =
-  let sexpl_push = push gpad lpad state store in
-  let repr = repr_of_store store in
-  sexpl_push @ convert repr req_repr
+  match store, req_repr with
+    | Const x, RValue ->
+        push_const (Int32.logor (Int32.shift_left (Int32.of_int x) 1) 1l)
+    | _ ->
+        let sexpl_push = push gpad lpad state store in
+        let repr = repr_of_store store in
+        sexpl_push @ convert repr req_repr
 
 let straighten_accu gpad lpad state =
   (* if the accu is stored elsewhere, load it now into "accu". This function
@@ -640,21 +683,18 @@ let straighten_accu gpad lpad state =
     | RealAccu ->
         (state, [])
     | Local _ | Const _ ->
-        let state = { state with accu = RealAccu; realaccu = LogAccu RValue } in
         let sexpl_push = push_as gpad lpad state state.accu RValue in
+        let state = { state with accu = RealAccu } in
         let sexpl_pop = pop_to_local "accu" in
         (state, sexpl_flush @ sexpl_push @ sexpl_pop)
     | RealStack pos ->
-        let state = { state with
-                      accu = RealAccu;
-                      realaccu = LogAccu RValue;
-                      realstack = IMap.add pos Unused state.realstack;
-                    } in
         let sexpl_push = push_as gpad lpad state state.accu RValue in
+        let state = { state with accu = RealAccu } in
         let sexpl_pop = pop_to_local "accu" in
         (state, sexpl_flush @ sexpl_push @ sexpl_pop)
     | Invalid ->
-        assert false
+        (* FIXME: assert false *)
+        (state, [])
 
 let straighten_accu_when_on_stack gpad lpad state =
   (* Load the accu if it is stored in the real stack. This is needed before
@@ -686,16 +726,32 @@ let straighten_stack_at gpad lpad state pos =
   let state, sexpl_flush = flush_real_stack gpad lpad state pos pos in
   let k = pos + state.camldepth in
   let store = List.nth state.camlstack k in
-  let sexpl_push = push gpad lpad state store in
+  let sexpl_push = push_as gpad lpad state store RValue in
   let sexpl_pop = pop_to_stack pos in
   let state =
     { state with
       camlstack = set_camlstack pos (RealStack pos) state;
-      realstack = IMap.add pos (CamlStack(RValue, pos)) state.realstack
+      realstack = ISet.add pos state.realstack;
     } in
   let sexpl =
     sexpl_flush @ sexpl_push @ sexpl_pop in
   (state, sexpl)
+
+let straighten_all gpad lpad state =
+  let rec recurse state camlstack pos =
+    match camlstack with
+      | RealStack p :: camlstack' ->
+          assert(p = pos);
+          recurse state camlstack' (pos+1)
+      | store :: camlstack' ->
+          let state, sexpl1 = straighten_stack_at gpad lpad state pos in
+          let state, sexpl2 = recurse state camlstack' (pos+1) in
+          (state, sexpl1 @ sexpl2)
+      | [] ->
+          (state, []) in
+  let state, sexpl_accu = straighten_accu gpad lpad state in
+  let state, sexpl_stack = recurse state state.camlstack (-state.camldepth) in
+  (state, sexpl_accu @ sexpl_stack)
 
 let rec drop n l =
   if n > 0 then
@@ -709,9 +765,7 @@ let nullary_operation gpad lpad state op_repr op_sexpl =
   match op_repr with
     | RValue ->
         let state, sexpl_flush = flush_accu gpad lpad state in
-        let state = { state with accu = RealAccu;
-                                 realaccu = LogAccu RValue;
-                    } in
+        let state = { state with accu = RealAccu } in
         let sexpl =
           sexpl_flush @ op_sexpl @ pop_to_local "accu" in
         (state, sexpl)
@@ -731,19 +785,18 @@ let unary_operation_norvalue gpad lpad state op_repr op_sexpl =
   (state, sexpl_push @ op_sexpl @ sexpl_pop)
 
 let unary_operation_rvalue gpad lpad state op_sexpl =
-  let state, sexpl1 = straighten_accu gpad lpad state in
-  let sexpl =
-    sexpl1 @ push_local "accu" @ op_sexpl @ pop_to_local "accu" in
+  let state, flush_sexpl = flush_accu gpad lpad state in
+  let push_sexpl = push_as gpad lpad state state.accu RValue in
+  let sexpl = flush_sexpl @ push_sexpl @ op_sexpl @ pop_to_local "accu" in
+  let state = { state with accu = RealAccu; } in
   (state, sexpl)
 
 let unary_operation_rvalue_unit gpad lpad state op_sexpl =
   (* takes an RValue arg, and returns Const 0 *)
-  let state, sexpl1 = straighten_accu gpad lpad state in
-  let state = { state with accu = Const 0;
-                           realaccu = Unused;
-              } in
-  let sexpl =
-    sexpl1 @ push_local "accu" @ op_sexpl in
+  let state, flush_sexpl = flush_accu gpad lpad state in
+  let push_sexpl = push_as gpad lpad state state.accu RValue in
+  let sexpl = flush_sexpl @ push_sexpl @ op_sexpl in
+  let state = { state with accu = Const 0 } in
   (state, sexpl)
   
 let unary_operation gpad lpad state op_repr op_sexpl =
@@ -758,6 +811,7 @@ let binary_operation_norvalue gpad lpad state op_repr op_sexpl =
   let second = List.hd state.camlstack in
   let sexpl_push2 = push_as gpad lpad state second op_repr in
   let result = new_local lpad (vtype op_repr) in
+  let state = pop_camlstack state in
   let state = { state with accu = Local(op_repr, result) } in
   let sexpl_pop = pop_to_local result in
   (state, sexpl_push1 @ sexpl_push2 @ op_sexpl @ sexpl_pop)
@@ -767,20 +821,14 @@ let binary_operation_rvalue gpad lpad state op_sexpl =
      For running it, put first operand first on wasm stack, then the
      second operand on top.
    *)
-  let second_pos = -state.camldepth in
-  let state, sexpl1 = straighten_accu gpad lpad state in
-  let state, sexpl2 = straighten_stack_at gpad lpad state second_pos in
-  let sexpl3 = push_local "accu" in
-  let sexpl4 = push_stack second_pos in
-  let result = new_local lpad (vtype RValue) in
-  let state =
-    { state with
-      accu = Local(RValue, result);
-      camlstack = List.tl state.camlstack;
-      camldepth = state.camldepth - 1
-    } in
+  let second = List.hd state.camlstack in
+  let state, sexpl1 = flush_accu gpad lpad state in
+  let sexpl3 = push_as gpad lpad state state.accu RValue in
+  let sexpl4 = push_as gpad lpad state second RValue in
+  let state = pop_camlstack state in
+  let state = { state with accu = RealAccu } in
   let sexpl =
-    sexpl1 @ sexpl2 @ sexpl3 @ sexpl4 @ op_sexpl @ pop_to_local result in
+    sexpl1 @ sexpl3 @ sexpl4 @ op_sexpl @ pop_to_local "accu" in
   (state, sexpl)
 
 let binary_operation gpad lpad state op_repr op_sexpl =
@@ -793,24 +841,16 @@ let ternary_operation_rvalue gpad lpad state op_sexpl =
   (* Logically: 1. accu, 2. stack top, 3. stack top - 1.
      Wasm: put the args in this order on the wasm stack
    *)
-  let second_pos = -state.camldepth in
-  let third_pos = -state.camldepth+1 in
-  let state, sexpl1 = straighten_accu gpad lpad state in
-  let state, sexpl2 = straighten_stack_at gpad lpad state second_pos in
-  let state, sexpl3 = straighten_stack_at gpad lpad state third_pos in
-  let sexpl4 = push_local "accu" in
-  let sexpl5 = push_stack second_pos in
-  let sexpl6 = push_stack third_pos in
-  let result = new_local lpad (vtype RValue) in
-  let state =
-    { state with
-      accu = Local(RValue, result);
-      camlstack = List.tl (List.tl state.camlstack);
-      camldepth = state.camldepth - 2
-    } in
+  let second = List.hd state.camlstack in
+  let third = List.hd (List.tl state.camlstack) in
+  let state, sexpl1 = flush_accu gpad lpad state in
+  let sexpl4 = push_as gpad lpad state state.accu RValue in
+  let sexpl5 = push_as gpad lpad state second RValue in
+  let sexpl6 = push_as gpad lpad state third RValue in
+  let state = popn_camlstack state 2 in
+  let state = { state with accu = RealAccu } in
   let sexpl =
-    sexpl1 @ sexpl2 @ sexpl3 @ sexpl4 @ sexpl5 @ sexpl6 @
-      op_sexpl @ pop_to_local result in
+    sexpl1 @ sexpl4 @ sexpl5 @ sexpl6 @ op_sexpl @ pop_to_local "accu" in
   (state, sexpl)
 
 let makeblock gpad lpad state size tag =
@@ -842,14 +882,10 @@ let makeblock gpad lpad state size tag =
         )
         fields
       |> List.flatten in
-  let state = popn_camlstack state (size-1) in
+  let state = if size > 0 then popn_camlstack state (size-1) else state in
   let state, sexpl_flush = flush_accu gpad lpad state in
-  let state =
-    { state with accu = RealAccu;
-                 realaccu = LogAccu RValue
-    } in
-  let sexpl_set =
-    push_local ptr @ pop_to_local "accu" in
+  let state = { state with accu = RealAccu } in
+  let sexpl_set = push_local ptr @ pop_to_local "accu" in
   (state, sexpl_alloc @ sexpl_init @ sexpl_flush @ sexpl_set)
 
 let makefloatblock gpad lpad state size =
@@ -871,10 +907,7 @@ let makefloatblock gpad lpad state size =
     |> List.flatten in
   let state = popn_camlstack state (size-1) in
   let state, sexpl_flush = flush_accu gpad lpad state in
-  let state =
-    { state with accu = RealAccu;
-                 realaccu = LogAccu RValue
-    } in
+  let state = { state with accu = RealAccu } in
   let sexpl_set =
     push_local ptr @ pop_to_local "accu" in
   (state, sexpl_alloc @ sexpl_init @ sexpl_flush @ sexpl_set)
@@ -885,8 +918,8 @@ let c_call gpad lpad state name num_args =
     with Not_found -> assert false in
   let state, sexpl =
     if num_args <= 5 then
-      let rdepth = realdepth state in
       let state, sexpl_flush = flush_accu gpad lpad state in
+      let rdepth = realdepth state in
       let sexpl_setup = setup_for_c_call gpad lpad state 0 rdepth in
       let sexpl_restore = restore_after_c_call gpad lpad state 0 rdepth in
       let args = enum 0 num_args in
@@ -949,10 +982,7 @@ let c_call gpad lpad state name num_args =
         @ sexpl_restore
       ) in
   let state = popn_camlstack state (num_args-1) in
-  let state =
-    { state with accu = RealAccu;
-                 realaccu = LogAccu RValue
-    } in
+  let state = { state with accu = RealAccu } in
   (state, sexpl)
 
 let switch gpad lpad state labls_ints labls_blocks =
@@ -960,16 +990,14 @@ let switch gpad lpad state labls_ints labls_blocks =
   push gpad lpad state state.accu
   @ pop_to_local value
   @ [ (* if (!Is_block(value)) *)
+      L [ K "local.get";
+          ID value;
+        ];
+      L [ K "i32.const";
+          N (I32 1l);
+        ];
+      L [ K "i32.and" ];
       L [ K "if";
-
-          L [ K "local.get";
-              ID value;
-            ];
-          L [ K "i32.const";
-              N (I32 1l);
-            ];
-          L [ K "i32.and" ];
-
           L [ K "then";
 
               L [ K "local.get";
@@ -978,7 +1006,7 @@ let switch gpad lpad state labls_ints labls_blocks =
               L [ K "i32.const";
                   N (I32 1l);
                 ];
-              L [ K "shr_s" ];
+              L [ K "i32.shr_s" ];
 
               L ( [  K "br_table" ]
                   @ ( Array.map
@@ -996,7 +1024,7 @@ let switch gpad lpad state labls_ints labls_blocks =
                   ID value
                 ];
               L [ K "i32.load";
-                  K "offset=-4";
+                  K (sprintf "offset=0x%lx" (-4l));
                   K "align=2"
                 ];
               L [ K "i32.const";
@@ -1030,12 +1058,15 @@ let emit_instr gpad lpad state instr =
     | Kconst _ ->
         assert false
     | Kacc sp ->
-        let state = { state with accu = RealStack (-state.camldepth + sp) } in
+        let state =
+          if sp < state.camldepth then
+            { state with accu = List.nth state.camlstack sp }
+          else
+            { state with accu = RealStack (-state.camldepth + sp) } in
         (state, [])
     | Kpush ->
         let state, sexpl = straighten_accu_when_on_stack gpad lpad state in
-        let state = { state with camlstack = state.accu :: state.camlstack;
-                                 camldepth = state.camldepth + 1 } in
+        let state = push_camlstack state.accu state in
         (state, sexpl)
     | Kpop num ->
         let cd = state.camldepth in
@@ -1058,7 +1089,9 @@ let emit_instr gpad lpad state instr =
                 store
             )
             state.camlstack in
-        let state = { state with camlstack } in
+        let state = { state with camlstack;
+                                 realaccu = ISet.add (-cd+sp) state.realaccu
+                    } in
         (state, sexpl)
     | Kenvacc field ->
         let sexpl = push_field "env" field in
@@ -1398,20 +1431,28 @@ let emit_instr gpad lpad state instr =
     | Kccall (name, num) ->
         c_call gpad lpad state name num
     | Kbranch lab ->
-        ( state, [ L [ K "br"; ID (sprintf "label%d" lab) ] ] )
+        (* TODO opt: if the branch target immediately loads the accu,
+           we don't need to straighten it up. *)
+        let state, sexpl_str = straighten_all gpad lpad state in
+        ( state, sexpl_str @ [ L [ K "br"; ID (sprintf "label%d" lab) ] ] )
     | Kbranchif lab ->
+        let state, sexpl_str = straighten_all gpad lpad state in
         let sexpl =
-          push_as gpad lpad state state.accu RInt
+          sexpl_str
+          @ push_as gpad lpad state state.accu RInt
           @ [ L [ K "br_if"; ID (sprintf "label%d" lab) ] ] in
         (state, sexpl)
     | Kbranchifnot lab ->
+        let state, sexpl_str = straighten_all gpad lpad state in
         let sexpl =
-          push_as gpad lpad state state.accu RInt
+          sexpl_str
+          @ push_as gpad lpad state state.accu RInt
           @ [ L [ K "i32.eqz" ];
               L [ K "br_if"; ID (sprintf "label%d" lab) ] ] in
         (state, sexpl)
     | Kswitch (labls_ints, labls_blocks) ->
-        (state, switch gpad lpad state labls_ints labls_blocks)
+        let state, sexpl_str = straighten_all gpad lpad state in
+        (state, sexpl_str @ switch gpad lpad state labls_ints labls_blocks)
     | Kpush_retaddr lab ->
         let d = state.camldepth in
         let state = { state with camlstack = RealStack(-d-3) :: RealStack(-d-2) :: RealStack(-d-1) :: state.camlstack;
@@ -1423,7 +1464,7 @@ let emit_instr gpad lpad state instr =
            RETURN will pop the args and the return address triple.
          *)
         if num < 4 then
-          (state, [])   (* TODO *)
+          (popn_camlstack state num, [])   (* TODO *)
         else
           (popn_camlstack state (num+3), [])   (* TODO *)
     | Kappterm(num, slots) ->
@@ -1472,6 +1513,111 @@ let emit_instr gpad lpad state instr =
         (state, [])   (* TODO *)
     | Kstrictbranchif _ -> assert false
     | Kstrictbranchifnot _ -> assert false
+
+let local_branch_labels =
+  function
+  | I.Kbranch l -> [l]
+  | Kbranchif l -> [l]
+  | Kbranchifnot l -> [l]
+  | Kswitch (la1,la2) -> Array.to_list la1 @ Array.to_list la2
+  | _ -> []
+
+let emit_fblock gpad fblock =
+  let open Wc_control in
+  let depth_table = Hashtbl.create 7 in
+  (* maps label to depth of camlstack *)
+
+  let lpad =
+    { locals = Hashtbl.create 7 } in
+
+  let get_state label =
+    let camldepth =
+      try Hashtbl.find depth_table label
+      with Not_found -> 0 in
+    let camlstack =
+      enum (-camldepth) camldepth
+      |> List.map (fun pos -> RealStack pos) in
+    let realstack =
+      enum (-camldepth) camldepth
+      |> List.fold_left
+           (fun acc pos -> ISet.add pos acc)
+           ISet.empty in
+    { camlstack;
+      camldepth;
+      realstack;
+      accu = RealAccu;
+      realaccu = ISet.empty
+    } in
+
+  let rec emit_block block =
+    let state =
+      { camlstack = [];
+        camldepth = 0;
+        realstack = ISet.empty;
+        accu = RealAccu;
+        realaccu = ISet.empty;
+      } in
+    (* eprintf "BLOCK\n%!";*)
+    let state, acc =
+      Array.fold_left
+        (fun (state, acc) instr ->
+          match instr with
+            | Label label ->
+                (* eprintf "LABEL %d\n" label; *)
+                (get_state label, acc)
+            | Simple i ->
+                let labels = local_branch_labels i in
+                List.iter
+                  (fun label ->
+                    try
+                      let d = Hashtbl.find depth_table label in
+                      assert(d = state.camldepth)
+                    with
+                      | Not_found ->
+                          Hashtbl.add depth_table label state.camldepth
+                  )
+                  labels;
+                let (next_state, sexpl) =
+                  emit_instr gpad lpad state i in
+                (*
+                eprintf "%s predepth=%d postdepth=%d\n%!"
+                        (Wc_util.string_of_instruction i)
+                        (state.camldepth)
+                        (next_state.camldepth);
+                 *)
+                let comment =
+                  C (Wc_util.string_of_instruction i) in
+                (next_state, (comment :: sexpl) :: acc)
+            | Block inner ->
+                let sexpl = emit_block inner in
+                (state, sexpl :: acc)
+        )
+        (state, [])
+        block.instructions in
+    let inner_sexpl =
+      List.rev acc |> List.flatten in
+    match block.loop_label, block.break_label with
+      | Some _, Some _ -> assert false
+      | Some label, None ->
+          [ L ( [ K "loop";
+                  ID (sprintf "loop%d" label);
+                  BR
+                ]
+                @ inner_sexpl
+              )
+          ]
+      | None, Some label ->
+          [ L ( [ K "block";
+                  ID (sprintf "label%d" label);
+                  BR
+                ]
+                @ inner_sexpl
+              )
+          ]
+      | None, None ->
+          inner_sexpl in
+
+  emit_block fblock.block
 
 let get_funcmapping scode =
   let open Wc_control in
@@ -1529,7 +1675,7 @@ let block_cascade start_sexpl label_sexpl_pairs =
             [ L ( [ K "block" ]
                   @ ( match label_opt with
                         | None -> []
-                        | Some lab -> [ ID lab ]
+                        | Some lab -> [ ID lab; BR ]
                     )
                   @ inner_sexpl
                   @ sexpl
@@ -1542,7 +1688,7 @@ let block_cascade start_sexpl label_sexpl_pairs =
   arrange [] (shift start_sexpl label_sexpl_pairs)
 
 let generate_subfunction gpad letrec_label func_label fblock =
-  [ L [ K "unreachable" ]]
+  emit_fblock gpad fblock
 
 let generate_letrec scode gpad letrec_label =
   let subfunc_labels =
@@ -1593,6 +1739,7 @@ let generate_letrec scode gpad letrec_label =
                 ID "codeptr";
                 K "i32";
               ];
+            BR;
           ]
           @ cascade
         )

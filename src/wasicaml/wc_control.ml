@@ -18,6 +18,7 @@ type structured_code =
 
  and instruction =
    | Block of block
+   | Label of int
    | Simple of I.instruction
 
  and cfg_scope =
@@ -421,6 +422,8 @@ let recover_structure ctx =
                 | None -> a1
                 | Some instr -> Array.append a1 [| Simple instr |]
             )
+            |> (fun a ->
+              Array.append [| Label label1 |] a)
           in
           if prev_loop = node_loop || List.mem node_loop loops_started then
             let instructions =
@@ -548,6 +551,8 @@ let validate scode =
                   let labels = Wc_reader.get_labels_in_instr instr in
                   List.iter (validate_label labels_in_scope func_label last_label) labels
           )
+      | Label _ ->
+          ()
 
   and validate_label labels_in_scope func_label last_label label =
     if not (ISet.mem label labels_in_scope) then

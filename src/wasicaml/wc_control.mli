@@ -46,6 +46,7 @@ type structured_code =
 
  and instruction =
    | Block of block
+   | Label of int   (* precedes a sequence of Simple instructions *)
    | Simple of I.instruction
 
  and cfg_scope =

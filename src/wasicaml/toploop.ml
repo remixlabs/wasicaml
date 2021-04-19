@@ -19,4 +19,7 @@ let s = recover_structure cfg;;
 eprintf "Number functions: %d\n%!" (IMap.cardinal s.functions);;
 validate s;;
 let sexpl = generate s exec;;
-let print() = print_indented stdout 0 80 (L sexpl); flush stdout;;
+let print() =
+  let f = open_out "t.wat" in
+  print_indented f 0 80 (L (K "module" :: sexpl)); flush stdout;
+  close_out f;;
