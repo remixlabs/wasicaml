@@ -10,6 +10,7 @@ open Wc_sexp
    - wasicaml_domain_state = caml_domain_state
    - wasicaml_builtin_cprim = caml_builtin_cprim
    - wasicaml_atom_table = caml_atom_table
+   - wasicaml_functions
 
    - init code
    - debug print per block
@@ -21,17 +22,15 @@ open Wc_sexp
      pass back via special global: accu, env
    - recognize backward jumps and use loop label
    - exceptions
-   - return codes:
-      0 = function return
-      1 = try return
-      2 = exception return
-      3 = stop
+   - do a stack check at the beginning of a function (but no realloc)
+   - use helper functions for Kapply?
  *)
 
 (* OCaml functions are translated to Wasm functions with parameters:
    param 1: env
    param 2: extra_args
    param 3: code pointer (overriding the one in the closure)
+   param 4: fp
  *)
 
 
@@ -60,7 +59,7 @@ type gpad =  (* global pad *)
      *)
     primitives : (string, int) Hashtbl.t;
     funcmapping : (int, int * int) Hashtbl.t;
-    (* maps function label to (letec_label, subfunction_id) *)
+    (* maps function label to (letrec_label, subfunction_id) *)
     subfunctions : (int, int list) Hashtbl.t;
     (* maps letrec_label to list of subfunction labels *)
   }
@@ -151,6 +150,9 @@ type state =
      *)
   }
 
+let enable_multireturn = ref false
+(* whether Wasm code can use multivalue returns *)
+
 let code_pointer_shift = 11
   (* OCaml code pointers:
       - Bit 0: whether to run RESTART
@@ -175,6 +177,8 @@ let domain_field_exn_bucket = 24
 let double_size = 2
 let double_tag = 253
 let double_array_tag = 254
+
+let closure_tag = 247
 
 let caml_from_c = 0
 
@@ -206,6 +210,19 @@ let new_local lpad vtype =
   let s = sprintf "x%d" k in
   Hashtbl.add lpad.locals s vtype;
   s
+
+let empty_state =
+  { camlstack = [];
+    camldepth = 0;
+    realstack = ISet.empty;
+    accu = RealAccu;
+    realaccu = ISet.empty;
+  }
+
+let empty_lpad() =
+  { locals = Hashtbl.create 7;
+    loops = ISet.empty;
+  }
 
 let realdepth state =
   (* how many stack positions are really used, counted from the bottom? *)
@@ -527,6 +544,186 @@ let alloc gpad lpad state size tag =
     alloc_atom gpad lpad state tag
   else
     alloc_non_atom gpad lpad state size tag
+
+let grab_helper gpad =
+  (* generates a helper function:
+     $grab_helper(env, extra_args, codeptr, fp)
+   *)
+  let state = { empty_state with accu = Invalid } in
+  let lpad = empty_lpad() in
+
+  [ L ( [ [ K "func";
+            ID "grab_helper";
+            L [ K "param"; ID "env"; K "i32" ];
+            L [ K "param"; ID "extra_args"; K "i32" ];
+            L [ K "param"; ID "codeptr"; K "i32" ];
+            L [ K "param"; ID "fp"; K "i32" ];
+            BR;
+            L [ K "result"; K "i32" ];
+            L [ K "local"; ID "accu"; K "i32" ];
+            L [ K "local"; ID "i"; K "i32" ];
+          ];
+
+          setup_for_gc gpad lpad state 0;
+          [ L [ K "local.get"; ID "extra_args" ];
+            L [ K "i32.const"; N (I32 4l) ];
+            L [ K "i32.add" ];
+            L [ K "i32.const"; N (I32 (Int32.of_int closure_tag))];
+            L [ K "call"; ID "caml_alloc_small" ];
+            L [ K "local.set"; ID "accu" ];
+          ];
+          restore_after_gc gpad lpad state 0;  (* won't overwrite accu *)
+
+          push_local "env";
+          pop_to_field "accu" 2;
+
+          push_const 0l;
+          pop_to_local "i";
+
+          [ L [ K "loop"; ID "fields"; BR;
+                (* fp[i] *)
+                L [ K "local.get"; ID "fp" ];
+                L [ K "local.get"; ID "i" ];
+                L [ K "i32.const"; N (I32 2l) ];
+                L [ K "i32.shl" ];
+                L [ K "i32.add" ];
+                L [ K "i32.load"; K "align=2" ];
+
+                (* Field(accu, i+3) = ... *)
+                L [ K "local.get"; ID "accu" ];
+                L [ K "local.get"; ID "i" ];
+                L [ K "i32.const"; N (I32 3l) ];
+                L [ K "i32.add" ];
+                L [ K "i32.const"; N (I32 2l) ];
+                L [ K "i32.shl" ];
+                L [ K "i32.add" ];
+                L [ K "i32.store"; K "align=2" ];
+
+                (* i++, and jump back if i <= extra_args *)
+                L [ K "local.get"; ID "i" ];
+                L [ K "i32.const"; N (I32 1l) ];
+                L [ K "i32.add" ];
+                L [ K "local.tee"; ID "i" ];
+                L [ K "local.get"; ID "extra_args" ];
+                L [ K "i32.le_u" ];
+                L [ K "br_if"; ID "fields" ];
+              ]
+          ];
+
+          push_local "codeptr";
+          pop_to_field "accu" 0;
+
+          push_const 5l;
+          pop_to_field "accu" 1;
+
+          push_local "accu";
+          [  L [ K "return" ] ]
+
+        ] |> List.flatten
+      )
+  ]
+
+let restart_helper gpad =
+  [ L ( [ [ K "func";
+            ID "restart_helper";
+            L [ K "param"; ID "env"; K "i32" ];
+            L [ K "param"; ID "extra_args"; K "i32" ];
+            L [ K "param"; ID "fp"; K "i32" ];
+            BR;
+            L [ K "result"; C "out_env"; K "i32" ];
+          ];
+          if !enable_multireturn then [
+            L [ K "result"; C "out_extra_args"; K "i32" ];
+            L [ K "result"; C "out_fp"; K "i32" ];
+          ] else [];
+
+          [ L [ K "local"; ID "i"; K "i32" ];
+            L [ K "local"; ID "num_args"; K "i32" ];
+          ];
+
+          [ (* num_args = Wosize_val(env) - 3 *)
+            L [ K "local.get"; ID "env" ];
+            L [ K "i32.load"; K (sprintf "offset=0x%lx" (-4l)); K "align=2" ];
+            L [ K "i32.const"; N (I32 10l) ];
+            L [ K "i32.shr_u" ];
+            L [ K "i32.const"; N (I32 3l) ];
+            L [ K "i32.sub" ];
+            L [ K "local.set"; ID "num_args" ];
+          ];
+
+          [ (* fp -= num_args *)
+            L [ K "local.get"; ID "fp" ];
+            L [ K "local.get"; ID "num_args" ];
+            L [ K "i32.const"; N (I32 2l)];
+            L [ K "i32.shl" ];
+            L [ K "i32.sub" ];
+            L [ K "local.set"; ID "fp" ];
+          ];
+
+          [ L [ K "i32.const"; N (I32 0l)];
+            L [ K "local.set"; ID "i" ];
+            L [ K "loop"; ID "args"; BR;
+                (* Field(env, i+3) *)
+                L [ K "local.get"; ID "env" ];
+                L [ K "local.get"; ID "i" ];
+                L [ K "i32.const"; N (I32 3l) ];
+                L [ K "i32.add" ];
+                L [ K "i32.const"; N (I32 2l) ];
+                L [ K "i32.shl" ];
+                L [ K "i32.add" ];
+                L [ K "i32.load"; K "align=2" ];
+
+                (* fp[i[ = ... *)
+                L [ K "local.get"; ID "fp" ];
+                L [ K "local.get"; ID "i" ];
+                L [ K "i32.const"; N (I32 2l) ];
+                L [ K "i32.shl" ];
+                L [ K "i32.add" ];
+                L [ K "i32.store"; K "align=2" ];
+
+                (* i++, and jump back if i < num_args *)
+                L [ K "local.get"; ID "i" ];
+                L [ K "i32.const"; N (I32 1l) ];
+                L [ K "i32.add" ];
+                L [ K "local.tee"; ID "i" ];
+                L [ K "local.get"; ID "num_args" ];
+                L [ K "i32.lt_u" ];
+                L [ K "br_if"; ID "args" ];
+              ]
+          ];
+
+          (* env = Field(env, 2) *)
+          push_field "env" 2;
+          pop_to_local "env";
+
+          (* extra_args += num_args *)
+          [ L [ K "local.get"; ID "extra_args" ];
+            L [ K "local.get"; ID "num_args" ];
+            L [ K "i32.add" ];
+            L [ K "local.set"; ID "extra_args" ];
+          ];
+
+          (* return env *)
+          push_local "env";
+          push_local "extra_args";
+          push_local "fp";
+
+          if !enable_multireturn then [] else
+            [ L [ K "global.set"; ID "retval3" ];
+              L [ K "global.set"; ID "retval2" ];
+            ];
+
+          [ L [ K "return" ] ];
+        ] |> List.flatten
+      )
+  ]
+
+let call_restart_helper =
+  [ L [ K "call"; ID "restart_helper" ]]
+  @ if !enable_multireturn then [] else
+      [ L [ K "global.get"; ID "retval2" ];
+        L [ K "global.get"; ID "retval3" ];
+      ]
 
 let tovalue repr =
   (* transform the value of the Wasm stack to a proper OCaml value,
@@ -1063,6 +1260,144 @@ let switch gpad lpad state labls_ints labls_blocks =
         ]
     ]
 
+let grab gpad lpad state num =
+  let sexpl =
+    [ (* if (codeptr & 1) *)
+      L [ K "local.get"; ID "codeptr" ];
+      L [ K "i32.const"; N (I32 1l) ];
+      L [ K "i32.and" ];
+      L [ K "if";
+          L ( [ K "then";
+                (* RESTART *)
+                (* (env, extra_args, fp) = restart_helper(env, extra_args, fp) *)
+                L [ K "local.get"; ID "env" ];
+                L [ K "local.get"; ID "extra_args" ];
+                L [ K "local.get"; ID "fp" ];
+              ]
+              @ call_restart_helper
+              @ [ L [ K "local.set"; ID "fp" ];
+                  L [ K "local.set"; ID "extra_args" ];
+                  L [ K "local.set"; ID "env" ];
+
+                  (* codeptr &= ~1 *)
+                  L [ K "local.get"; ID "codeptr" ];
+                  L [ K "i32.const"; N (I32 0xffff_fffel) ];
+                  L [ K "i32.and" ];
+                  L [ K "local.set"; ID "codeptr" ];
+                ]
+            )
+        ];
+
+      (* regular GRAB *)
+      L [ K "local.get"; ID "extra_args" ];
+      L [ K "i32.const"; N (I32 (Int32.of_int num)) ];
+      L [ K "i32.ge_u" ];
+      L [ K "if";
+          L [ K "then";
+              L [ K "local.get"; ID "extra_args" ];
+              L [ K "i32.const"; N (I32 (Int32.of_int num)) ];
+              L [ K "i32.sub" ];
+              L [ K "local.set"; ID "extra_args" ];
+            ];
+          L [ K "else";
+              L [ K "local.get"; ID "env" ];
+              L [ K "local.get"; ID "extra_args" ];
+              L [ K "local.get"; ID "codeptr" ];
+              L [ K "i32.const"; N (I32 1l) ];
+              L [ K "i32.or" ];  (* codeptr of RESTART *)
+              L [ K "local.get"; ID "fp" ];
+              L [ K "call"; ID "grab_helper" ];
+              L [ K "return" ];
+            ]
+        ];
+    ] in
+  (state, sexpl)
+
+let return =
+  [ L [ K "local.get"; ID "extra_args" ];
+    L [ K "if";
+        L ( [ K "then";
+              L [ K "local.get"; ID "accu" ];
+              L [ K "local.get"; ID "extra_args" ];
+              L [ K "i32.const"; N (I32 1l) ];
+              L [ K "i32.sub" ];
+            ]
+            @ push_field "accu" 0
+            @ [ L [ K "local.tee"; ID "codeptr" ];
+                L [ K "local.get"; ID "fp" ];
+                L [ K "local.get"; ID "codeptr" ];
+                L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
+                L [ K "i32.shr_u" ];
+                L [ K "call_indirect";
+                    N (I32 0l);    (* table *)
+                    L [ K "param"; K "i32" ];
+                    L [ K "param"; K "i32" ];
+                    L [ K "param"; K "i32" ];
+                    L [ K "param"; K "i32" ];
+                    L [ K "result"; K "i32" ];
+                  ];
+                L [ K "local.set"; ID "accu" ];
+              ]
+          )
+      ];
+    L [ K "local.get"; ID "accu" ];
+    L [ K "return" ];
+  ]
+
+let apply_code extra_args sp_decr env_pos =
+  [ L [ K "local.get"; ID "accu" ];
+    L [ K "i32.const"; N (I32 (Int32.of_int extra_args)) ];
+  ]
+  @ push_field "accu" 0
+  @ [ L [ K "local.tee"; ID "accu" ];
+      L [ K "local.get"; ID "fp" ];
+      L [ K "i32.const"; N (I32 (Int32.of_int (4 * sp_decr))) ];
+      L [ K "i32.sub" ];
+      L [ K "local.get"; ID "accu" ];
+      L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
+      L [ K "i32.shr_u" ];
+      L [ K "call_indirect";
+          N (I32 0l);     (* table index *)
+          L [ K "param"; K "i32" ];
+          L [ K "param"; K "i32" ];
+          L [ K "param"; K "i32" ];
+          L [ K "param"; K "i32" ];
+          L [ K "result"; K "i32" ];
+        ];
+      L [ K "local.set"; ID "accu" ];
+    ]
+  @ push_stack env_pos   (* env might have been moved by GC *)
+  @ pop_to_local "env"
+
+let apply123 gpad lpad state num =
+  let state, sexpl_str = straighten_all gpad lpad state in
+  let sexpl_move =
+    enum 0 num
+    |> List.map
+         (fun k ->
+           push_stack (-state.camldepth+k)
+           @ pop_to_stack (-state.camldepth+k-3)
+         )
+    |> List.flatten in
+  let sexpl_frame =
+    push_const 1l   (* instead of pc *)
+    @ pop_to_stack (-state.camldepth+num-3)
+    @ push_local "env"
+    @ pop_to_stack (-state.camldepth+num-2)
+    @ push_const 1l  (* instead of extra_args *)
+    @ pop_to_stack (-state.camldepth+num-1) in
+  let sexpl_call =
+    apply_code (num-1) (state.camldepth+3) (-state.camldepth+num-2) in
+  let sexpl = sexpl_move @ sexpl_frame @ sexpl_call in
+  let state = popn_camlstack state num in
+  (state, sexpl)
+
+let apply4plus gpad lpad state num =
+  let state, sexpl_str = straighten_all gpad lpad state in
+  let sexpl =
+    apply_code (num-1) state.camldepth (-state.camldepth + num + 1) in
+  let state = popn_camlstack state (num+3) in
+  (state, sexpl)
 
 let global_offset ident =
   assert(Ident.global ident);
@@ -1483,20 +1818,28 @@ let emit_instr gpad lpad state instr =
            RETURN will pop the args and the return address triple.
          *)
         if num < 4 then
-          (popn_camlstack state num, [])   (* TODO *)
+          apply123 gpad lpad state num
         else
-          (popn_camlstack state (num+3), [])   (* TODO *)
+          apply4plus gpad lpad state num
     | Kappterm(num, slots) ->
         (state, [])   (* TODO *)
     | Kreturn slots ->
-        (state, [])   (* TODO *)
-    | Krestart ->
-        (state, [])   (* TODO *)
+        (state, [ L [ K "br"; ID "return" ] ])
+    | Krestart -> assert false
     | Kgrab num ->
-        (state, [])   (* TODO *)
+        grab gpad lpad state num
     | Kclosure(lab, num) ->
         let k = if num > 0 then num-1 else 0 in
-        (popn_camlstack state k, [])   (* TODO *)
+        let letrec_label, subfunc =
+          try Hashtbl.find gpad.funcmapping lab
+          with Not_found -> assert false in
+        let sexpl = [] in
+(*
+          [ L [ K "i32.const"; ID (sprintf "letrec%d" letrec_label) ];
+            L [ K "drop" ];
+          ] in
+ *)
+        (popn_camlstack state k, sexpl)   (* TODO *)
     | Kclosurerec(funcs, num_args) ->
         let num_funcs = List.length funcs in
         let k = if num_args > 0 then num_args-1 else 0 in
@@ -1566,13 +1909,7 @@ let emit_fblock gpad lpad fblock =
     } in
 
   let rec emit_block block loops =
-    let state =
-      { camlstack = [];
-        camldepth = 0;
-        realstack = ISet.empty;
-        accu = RealAccu;
-        realaccu = ISet.empty;
-      } in
+    let state = { empty_state with accu = Invalid } in
     (* eprintf "BLOCK\n%!";*)
     let upd_loops =
       match block.loop_label with
@@ -1692,17 +2029,18 @@ let block_cascade start_sexpl label_sexpl_pairs =
   let rec arrange inner_sexpl shifted =
     match shifted with
       | (sexpl, label_opt) :: shifted' ->
+          let body =
+            inner_sexpl @ sexpl @ [ L [ K "unreachable" ]] in
           let inner_sexpl' =
-            [ L ( [ K "block" ]
-                  @ ( match label_opt with
-                        | None -> []
-                        | Some lab -> [ ID lab; BR ]
-                    )
-                  @ inner_sexpl
-                  @ sexpl
-                  @ [ L [ K "unreachable" ]]
-                )
-            ] in
+            match label_opt with
+              | None -> body
+              | Some lab ->
+                  [ L ( [ K "block";
+                          ID lab;
+                          BR;
+                        ] @ body
+                      )
+                  ] in
           arrange inner_sexpl' shifted'
       | [] ->
           inner_sexpl in
@@ -1717,7 +2055,6 @@ let generate_letrec scode gpad letrec_label =
       loops = ISet.empty;
     } in
   Hashtbl.add lpad.locals "accu" TI32;
-  Hashtbl.add lpad.locals "fp" TI32;
 
   let subfunc_labels =
     try Hashtbl.find gpad.subfunctions letrec_label
@@ -1753,25 +2090,25 @@ let generate_letrec scode gpad letrec_label =
         )
     ] in
   let cascade = block_cascade letrec_body subfunc_pairs in
+  let outer =
+    [ L [ K "block"; ID "return"; BR;
+          L ( [ K "loop"; ID "startover"; BR ] @ cascade);
+        ]
+    ] @ return in
+  (* TODO: only generate the "return" label when it is used *)
+
   let locals =
     Hashtbl.fold (fun name vtype acc -> (name,vtype) :: acc) lpad.locals [] in
 
   let letrec =
     [ L ( [ K "func";
             ID (sprintf "letrec%d" letrec_label);
-            L [ K "param";
-                ID "env";
-                K "i32";
-              ];
-            L [ K "param";
-                ID "extra_args";
-                K "i32";
-              ];
-            L [ K "param";
-                ID "codeptr";
-                K "i32";
-              ];
+            L [ K "param"; ID "env"; K "i32" ];
+            L [ K "param"; ID "extra_args"; K "i32" ];
+            L [ K "param"; ID "codeptr"; K "i32" ];
+            L [ K "param"; ID "fp"; K "i32" ];
             BR;
+            L [ K "result"; K "i32" ];
           ]
           @ (List.map
                (fun (name,vtype) ->
@@ -1782,7 +2119,8 @@ let generate_letrec scode gpad letrec_label =
                )
                locals
             )
-          @ cascade
+          @ outer
+          @ [ L [ K "unreachable" ]]
         )
     ] in
   letrec
@@ -1791,8 +2129,12 @@ let globals =
   [ "wasicaml_global_data", TI32;
     "wasicaml_domain_state", TI32;
     "wasicaml_builtin_cprim", TI32;
-    "wasicaml_atom_table", TI32
+    "wasicaml_atom_table", TI32;
   ]
+  @ if !enable_multireturn then [] else
+      [ "retval2", TI32;
+        "retval3", TI32;
+      ]
 
 let imp_functions =
   [ "caml_alloc_small_dispatch",
@@ -1800,6 +2142,11 @@ let imp_functions =
       L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
+    ];
+    "caml_alloc_small",
+    [ L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "result"; K "i32" ]
     ];
     "caml_alloc_shr",
     [ L [ K "param"; K "i32" ];
@@ -1842,7 +2189,7 @@ let generate scode exe =
           S "table";
           L [ K "table";
               ID "table";
-              N (I32 65536l);
+              N (I32 (Int32.of_int (Hashtbl.length subfunctions)));
               K "funcref"
             ]
         ]
@@ -1878,6 +2225,8 @@ let generate scode exe =
   @ sexpl_table
   @ sexpl_functions
   @ sexpl_globals
+  @ grab_helper gpad
+  @ restart_helper gpad
   @ Hashtbl.fold
       (fun letrec_label _ acc ->
         let sexpl = generate_letrec scode gpad letrec_label in
@@ -1885,3 +2234,16 @@ let generate scode exe =
       )
       gpad.subfunctions
       []
+  @ [ L ( [ K "elem";
+            L [ K "i32.const"; N (I32 0l) ];
+            K "func";
+          ]
+          @ Hashtbl.fold
+              (fun letrec_label _ acc ->
+                (ID (sprintf "letrec%d" letrec_label)) :: acc
+              )
+              gpad.subfunctions
+              []
+        )
+    ]
+

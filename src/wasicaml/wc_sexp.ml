@@ -17,7 +17,7 @@ let indentation k =
     Hashtbl.find itable k
   with
     | Not_found ->
-        let s = String.make k ' ' in
+        let s = String.make (k/8) '\t' ^ String.make (k mod 8) ' '  in
         Hashtbl.add itable k s;
         s
 
