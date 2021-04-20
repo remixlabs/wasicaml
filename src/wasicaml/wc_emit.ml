@@ -38,6 +38,18 @@ open Wc_sexp
 type wasm_value_type =
   | TI32 | TI64 | TF64
 
+let string_of_vtype =
+  function
+  | TI32 -> "i32"
+  | TI64 -> "i64"
+  | TF64 -> "f64"
+
+let zero_expr_of_vtype =
+  function
+  | TI32 -> [ L [ K "i32.const"; N (I32 0l) ] ]
+  | TI64 -> [ L [ K "i64.const"; N (I64 0L) ] ]
+  | TF64 -> [ L [ K "f64.const"; N (F64 0.0) ] ]
+
 type wasm_func_type =
   | TFunc of { args: wasm_value_type list; results: wasm_value_type list }
 
@@ -70,6 +82,7 @@ type gpad =  (* global pad *)
 
 type lpad =  (* local pad *)
   { locals : (string, wasm_value_type) Hashtbl.t;
+    mutable loops : ISet.t;
   }
 
 type repr =
@@ -985,6 +998,12 @@ let c_call gpad lpad state name num_args =
   let state = { state with accu = RealAccu } in
   (state, sexpl)
 
+let string_label lpad label =
+  if ISet.mem label lpad.loops then
+    sprintf "loop%d" label
+  else
+    sprintf "label%d" label
+
 let switch gpad lpad state labls_ints labls_blocks =
   let value = new_local lpad TI32 in
   push gpad lpad state state.accu
@@ -1010,7 +1029,7 @@ let switch gpad lpad state labls_ints labls_blocks =
 
               L ( [  K "br_table" ]
                   @ ( Array.map
-                        (fun lab -> ID (sprintf "label%d" lab))
+                        (fun lab -> ID (string_label lpad lab))
                         labls_ints
                       |>  Array.to_list
                     )
@@ -1034,7 +1053,7 @@ let switch gpad lpad state labls_ints labls_blocks =
 
               L ( [  K "br_table" ]
                   @ ( Array.map
-                        (fun lab -> ID (sprintf "label%d" lab))
+                        (fun lab -> ID (string_label lpad lab))
                         labls_blocks
                       |>  Array.to_list
                     )
@@ -1434,13 +1453,13 @@ let emit_instr gpad lpad state instr =
         (* TODO opt: if the branch target immediately loads the accu,
            we don't need to straighten it up. *)
         let state, sexpl_str = straighten_all gpad lpad state in
-        ( state, sexpl_str @ [ L [ K "br"; ID (sprintf "label%d" lab) ] ] )
+        ( state, sexpl_str @ [ L [ K "br"; ID (string_label lpad lab) ] ] )
     | Kbranchif lab ->
         let state, sexpl_str = straighten_all gpad lpad state in
         let sexpl =
           sexpl_str
           @ push_as gpad lpad state state.accu RInt
-          @ [ L [ K "br_if"; ID (sprintf "label%d" lab) ] ] in
+          @ [ L [ K "br_if"; ID (string_label lpad lab) ] ] in
         (state, sexpl)
     | Kbranchifnot lab ->
         let state, sexpl_str = straighten_all gpad lpad state in
@@ -1448,7 +1467,7 @@ let emit_instr gpad lpad state instr =
           sexpl_str
           @ push_as gpad lpad state state.accu RInt
           @ [ L [ K "i32.eqz" ];
-              L [ K "br_if"; ID (sprintf "label%d" lab) ] ] in
+              L [ K "br_if"; ID (string_label lpad lab) ] ] in
         (state, sexpl)
     | Kswitch (labls_ints, labls_blocks) ->
         let state, sexpl_str = straighten_all gpad lpad state in
@@ -1522,13 +1541,10 @@ let local_branch_labels =
   | Kswitch (la1,la2) -> Array.to_list la1 @ Array.to_list la2
   | _ -> []
 
-let emit_fblock gpad fblock =
+let emit_fblock gpad lpad fblock =
   let open Wc_control in
   let depth_table = Hashtbl.create 7 in
   (* maps label to depth of camlstack *)
-
-  let lpad =
-    { locals = Hashtbl.create 7 } in
 
   let get_state label =
     let camldepth =
@@ -1549,7 +1565,7 @@ let emit_fblock gpad fblock =
       realaccu = ISet.empty
     } in
 
-  let rec emit_block block =
+  let rec emit_block block loops =
     let state =
       { camlstack = [];
         camldepth = 0;
@@ -1558,6 +1574,10 @@ let emit_fblock gpad fblock =
         realaccu = ISet.empty;
       } in
     (* eprintf "BLOCK\n%!";*)
+    let upd_loops =
+      match block.loop_label with
+        | Some lab -> ISet.add lab loops
+        | _ -> loops in
     let state, acc =
       Array.fold_left
         (fun (state, acc) instr ->
@@ -1577,6 +1597,7 @@ let emit_fblock gpad fblock =
                           Hashtbl.add depth_table label state.camldepth
                   )
                   labels;
+                lpad.loops <- upd_loops;
                 let (next_state, sexpl) =
                   emit_instr gpad lpad state i in
                 (*
@@ -1589,7 +1610,7 @@ let emit_fblock gpad fblock =
                   C (Wc_util.string_of_instruction i) in
                 (next_state, (comment :: sexpl) :: acc)
             | Block inner ->
-                let sexpl = emit_block inner in
+                let sexpl = emit_block inner upd_loops in
                 (state, sexpl :: acc)
         )
         (state, [])
@@ -1617,7 +1638,7 @@ let emit_fblock gpad fblock =
       | None, None ->
           inner_sexpl in
 
-  emit_block fblock.block
+  emit_block fblock.block ISet.empty
 
 let get_funcmapping scode =
   let open Wc_control in
@@ -1687,10 +1708,17 @@ let block_cascade start_sexpl label_sexpl_pairs =
           inner_sexpl in
   arrange [] (shift start_sexpl label_sexpl_pairs)
 
-let generate_subfunction gpad letrec_label func_label fblock =
-  emit_fblock gpad fblock
+let generate_subfunction gpad lpad letrec_label func_label fblock =
+  emit_fblock gpad lpad fblock
 
 let generate_letrec scode gpad letrec_label =
+  let lpad =
+    { locals = Hashtbl.create 7;
+      loops = ISet.empty;
+    } in
+  Hashtbl.add lpad.locals "accu" TI32;
+  Hashtbl.add lpad.locals "fp" TI32;
+
   let subfunc_labels =
     try Hashtbl.find gpad.subfunctions letrec_label
     with Not_found -> assert false in
@@ -1701,7 +1729,8 @@ let generate_letrec scode gpad letrec_label =
       (fun func_label ->
         let fblock = IMap.find func_label Wc_control.(scode.functions) in
         let label = sprintf "func%d" func_label in
-        let sexpl = generate_subfunction gpad letrec_label func_label fblock in
+        let sexpl =
+          generate_subfunction gpad lpad letrec_label func_label fblock in
         (label, sexpl)
       )
       subfunc_labels
@@ -1724,6 +1753,9 @@ let generate_letrec scode gpad letrec_label =
         )
     ] in
   let cascade = block_cascade letrec_body subfunc_pairs in
+  let locals =
+    Hashtbl.fold (fun name vtype acc -> (name,vtype) :: acc) lpad.locals [] in
+
   let letrec =
     [ L ( [ K "func";
             ID (sprintf "letrec%d" letrec_label);
@@ -1741,10 +1773,48 @@ let generate_letrec scode gpad letrec_label =
               ];
             BR;
           ]
+          @ (List.map
+               (fun (name,vtype) ->
+                 L [ K "local";
+                     ID name;
+                     K (string_of_vtype vtype)
+                   ];
+               )
+               locals
+            )
           @ cascade
         )
     ] in
   letrec
+
+let globals =
+  [ "wasicaml_global_data", TI32;
+    "wasicaml_domain_state", TI32;
+    "wasicaml_builtin_cprim", TI32;
+    "wasicaml_atom_table", TI32
+  ]
+
+let imp_functions =
+  [ "caml_alloc_small_dispatch",
+    [ L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+    ];
+    "caml_alloc_shr",
+    [ L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "result"; K "i32" ]
+    ];
+    "caml_initialize",
+    [ L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+    ];
+    "caml_modify",
+    [ L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+    ];
+  ]
 
 let generate scode exe =
   let (funcmapping, subfunctions) = get_funcmapping scode in
@@ -1755,10 +1825,63 @@ let generate scode exe =
       primitives;
     } in
 
-  Hashtbl.fold
-    (fun letrec_label _ acc ->
-      let sexpl = generate_letrec scode gpad letrec_label in
-      sexpl @ acc
-    )
-    gpad.subfunctions
-    []
+  let sexpl_memory =
+    [ L [ K "import";
+          S "env";
+          S "memory";
+          L [ K "memory";
+              ID "memory";
+              N (I32 65536l);
+            ]
+        ]
+    ] in
+
+  let sexpl_table =
+    [ L [ K "import";
+          S "env";
+          S "table";
+          L [ K "table";
+              ID "table";
+              N (I32 65536l);
+              K "funcref"
+            ]
+        ]
+    ] in
+  
+  let sexpl_functions =
+    List.map
+      (fun (name, typeuse) ->
+        L [ K "import";
+            S "ocaml";
+            S name;
+            L ( [ K "func";
+                  ID name;
+                ] @ typeuse
+              )
+          ]
+      )
+      imp_functions in
+
+  let sexpl_globals =
+    List.map
+      (fun (name, vtype) ->
+        L ( [ K "global";
+              ID name;
+              L [ K "mut"; K (string_of_vtype vtype) ];
+            ]
+            @ zero_expr_of_vtype vtype
+          )
+      )
+      globals in
+
+  sexpl_memory
+  @ sexpl_table
+  @ sexpl_functions
+  @ sexpl_globals
+  @ Hashtbl.fold
+      (fun letrec_label _ acc ->
+        let sexpl = generate_letrec scode gpad letrec_label in
+        sexpl @ acc
+      )
+      gpad.subfunctions
+      []
