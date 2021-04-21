@@ -14,6 +14,13 @@ extern bool wasicaml_try(void (*f)(void *), void *ctx);
 // normally.
 
 __attribute__((import_module("wasicaml")))
+__attribute__((import_name("try4")))
+extern bool wasicaml_try4(void (*f)(void *, void *, void *, void *),
+                          void *ctx1, void *ctx2, void *ctx3, void *ctx4);
+// Same but f is called with four context params:
+// f(ctx1,ctx2,ctx3,ctx4)
+
+__attribute__((import_module("wasicaml")))
 __attribute__((import_name("throw")))
 __attribute__((noreturn))
 extern void wasicaml_throw();

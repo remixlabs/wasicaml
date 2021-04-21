@@ -17,13 +17,10 @@ open Wc_sexp
    - init code
    - debug print per block
    - initialize fp, accu
-   - declare local variables from lpad
    - generate wrapper for caml_alloc_small_dispatch:
      pass args: accu, env, fp, framesize, blocksize
      return: new ptr
      pass back via special global: accu, env
-   - recognize backward jumps and use loop label
-   - exceptions
    - do a stack check at the beginning of a function (but no realloc)
    - use helper functions for Kapply?
    - check that subfunc fits into codeptr (10 bits)
@@ -1570,6 +1567,13 @@ let lookup_label gpad lab =
     with Not_found -> assert false in
   (wasmindex, subfunc)
 
+let push_wasmptr gpad lab =
+  let wasmindex, subfunc = lookup_label gpad lab in
+  [ L [ K "global.get"; ID "__table_base" ];
+    L [ K "i32.const"; N (I32 (Int32.of_int wasmindex)) ];
+    L [ K "i32.add" ];
+  ]
+
 let push_codeptr gpad lab =
   let wasmindex, subfunc = lookup_label gpad lab in
   [ L [ K "global.get"; ID "__table_base" ];
@@ -2064,11 +2068,24 @@ let emit_instr gpad lpad state instr =
         let state = { state with accu = RealAccu } in
         (state, sexpl_flush @ sexpl_offset)
     | Kpushtrap lab ->
-        (state, [])   (* TODO *)
+        assert false
     | Kpoptrap ->
-        (state, [])   (* TODO *)
+        (* this is a nop - all work done by emit_trap below *)
+        (state, [])
     | Kraise kind ->
-        (state, [])   (* TODO *)
+        (* set Caml_state->exn_bucket = accu *)
+        (* wasicaml_throw() *)
+        let sexpl =
+          push_as gpad lpad state state.accu RValue
+          @ [ L [ K "global.get"; ID "wasicaml_domain_state" ];
+              L [ K "i32.load";
+                  K (sprintf "offset=0x%lx" (Int32.of_int (4 * domain_field_exn_bucket)));
+                  K "align=2"
+                ];
+              L [ K "call"; ID "throw" ];
+              L [ K "unreachable" ]
+            ] in
+        (state, sexpl)
     | Kcheck_signals ->
         (state, [])   (* TODO *)
     | Kgetmethod ->
@@ -2081,9 +2098,74 @@ let emit_instr gpad lpad state instr =
     | Kevent _ ->
         (state, [])
     | Kstop ->
-        (state, [])   (* TODO *)
+        (* return NULL pointer *)
+        let sexpl =
+          [ L [ K "i32.const"; N (I32 0l) ];
+            L [ K "return" ]
+          ] in
+        (state, sexpl)
     | Kstrictbranchif _ -> assert false
     | Kstrictbranchifnot _ -> assert false
+
+let emit_trap gpad lpad state trylabel catchlabel =
+  (* push 4 values onto stack: 0, 0, env, extra_args *)
+  (* get function pointer and codeptr *)
+  (* caught = wasicaml_try4(f, env, extra_args, codeptr, fp - depth) *)
+  (* if (caught): accu = Caml_state->exn_bucket; jump lab *)
+  (* else: accu = global "exn_result" *)
+  (* at end of try function: global "exn_result" = accu *)
+  let local = new_local lpad TI32 in
+  let state, sexpl_str = straighten_all gpad lpad state in
+  let sexpl_stack =
+    push_const 0l
+    @ pop_to_stack (-state.camldepth-1)
+    @ push_const 0l
+    @ pop_to_stack (-state.camldepth-2)
+    @ push_local "env"
+    @ pop_to_stack (-state.camldepth-3)
+    @ push_local "extra_args"
+    @ pop_to_stack (-state.camldepth-4) in
+  let sexpl_try =
+    push_wasmptr gpad trylabel
+    @ push_local "env"
+    @ push_local "extra_args"
+    @ push_codeptr gpad trylabel
+    @ push_local "fp"
+    @ [ L [ K "i32.const"; N (I32 (Int32.of_int (4 * (state.camldepth + 4))))];
+        L [ K "i32.sub" ]
+      ]
+    @ [ L [ K "call"; ID "try4" ];
+        L [ K "local.set"; ID local ];
+      ]
+    @ push_stack (-state.camldepth-3)
+    @ pop_to_local "env"
+    @ [ L [ K "local.get"; ID local ];
+        L [ K "if";
+            L [ K "then";
+                L [ K "global.get"; ID "wasicaml_domain_state" ];
+                L [ K "i32.load";
+                    K (sprintf "offset=0x%lx" (Int32.of_int (4 * domain_field_exn_bucket)));
+                    K "align=2"
+                  ];
+                L [ K "local.set"; ID "accu" ];
+                L [ K "br"; ID (sprintf "label%d" catchlabel) ]
+              ]
+          ];
+        L [ K "global.get"; ID "exn_result" ];
+        L [ K "local.set"; ID "accu" ]
+      ] in
+  let state = { state with accu = RealAccu } in
+  (state, sexpl_str @ sexpl_stack @ sexpl_try)
+
+let emit_try_return gpad lpad state =
+  (* return from a "try" function *)
+  let sexpl =
+    push_as gpad lpad state state.accu RValue
+    @ [ L [ K "global.set"; ID "exn_result" ];
+        L [ K "i32.const"; N (I32 0l) ];
+        L [ K "return" ]
+      ] in
+  (state, sexpl)
 
 let local_branch_labels =
   function
@@ -2117,6 +2199,18 @@ let emit_fblock gpad lpad fblock =
       realaccu = ISet.empty
     } in
 
+  let update_depth_table state labels =
+    List.iter
+      (fun label ->
+        try
+          let d = Hashtbl.find depth_table label in
+          assert(d = state.camldepth)
+        with
+          | Not_found ->
+              Hashtbl.add depth_table label state.camldepth
+      )
+      labels in
+
   let rec emit_block block loops =
     let state = { empty_state with accu = Invalid } in
     (* eprintf "BLOCK\n%!";*)
@@ -2130,19 +2224,11 @@ let emit_fblock gpad lpad fblock =
           match instr with
             | Label label ->
                 (* eprintf "LABEL %d\n" label; *)
-                (get_state label, acc)
+                let comment = C (sprintf "Label %d" label) in
+                (get_state label, [comment] :: acc)
             | Simple i ->
                 let labels = local_branch_labels i in
-                List.iter
-                  (fun label ->
-                    try
-                      let d = Hashtbl.find depth_table label in
-                      assert(d = state.camldepth)
-                    with
-                      | Not_found ->
-                          Hashtbl.add depth_table label state.camldepth
-                  )
-                  labels;
+                update_depth_table state labels;
                 lpad.loops <- upd_loops;
                 let (next_state, sexpl) =
                   emit_instr gpad lpad state i in
@@ -2154,6 +2240,18 @@ let emit_fblock gpad lpad fblock =
                  *)
                 let comment =
                   C (Wc_util.string_of_instruction i) in
+                (next_state, (comment :: sexpl) :: acc)
+            | Trap { trylabel; catchlabel } ->
+                (* update_depth_table state [catchlabel]; *)
+                let (next_state, sexpl) =
+                  emit_trap gpad lpad state trylabel catchlabel in
+                let comment =
+                  C (sprintf "Kpushtrap(try=%d,catch=%d)" trylabel catchlabel) in
+                (next_state, (comment :: sexpl) :: acc)
+            | TryReturn ->
+                let (next_state, sexpl) =
+                  emit_try_return gpad lpad state in
+                let comment = C "tryreturn" in
                 (next_state, (comment :: sexpl) :: acc)
             | Block inner ->
                 let sexpl = emit_block inner upd_loops in
@@ -2361,6 +2459,7 @@ let globals =
     "wasicaml_builtin_cprim", true, TI32;
     "wasicaml_atom_table", true, TI32;
     "__table_base", false, TI32;
+    "exn_result", true, TI32;
   ]
   @ if !enable_multireturn then [] else
       [ "retval2", true, TI32;
@@ -2368,30 +2467,40 @@ let globals =
       ]
 
 let imp_functions =
-  [ "caml_alloc_small_dispatch",
+  [ "ocaml", "caml_alloc_small_dispatch",
     [ L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
     ];
-    "caml_alloc_small",
-    [ L [ K "param"; K "i32" ];
-      L [ K "param"; K "i32" ];
-      L [ K "result"; K "i32" ]
-    ];
-    "caml_alloc_shr",
+    "ocaml", "caml_alloc_small",
     [ L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
       L [ K "result"; K "i32" ]
     ];
-    "caml_initialize",
+    "ocaml", "caml_alloc_shr",
+    [ L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "result"; K "i32" ]
+    ];
+    "ocaml", "caml_initialize",
     [ L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
     ];
-    "caml_modify",
+    "ocaml", "caml_modify",
     [ L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
     ];
+    "wasicaml", "try4",
+    [ L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "result"; K "i32" ]
+    ];
+    "wasicaml", "throw",
+    [];
   ]
 
 let generate scode exe =
@@ -2441,9 +2550,9 @@ let generate scode exe =
   
   let sexpl_functions =
     List.map
-      (fun (name, typeuse) ->
+      (fun (modname, name, typeuse) ->
         L [ K "import";
-            S "ocaml";
+            S modname;
             S name;
             L ( [ K "func";
                   ID name;

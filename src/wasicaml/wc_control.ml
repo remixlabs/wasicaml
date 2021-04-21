@@ -20,6 +20,8 @@ type structured_code =
    | Block of block
    | Label of int
    | Simple of I.instruction
+   | Trap of { trylabel: int; catchlabel: int }
+   | TryReturn
 
  and cfg_scope =
   { cfg_letrec_label : int option;
@@ -416,7 +418,24 @@ let recover_structure ctx =
              else
                Array.sub ctx.code label1 node.cfg_length
             )
-            |> Array.map (fun instr -> Simple instr)
+            |> Array.map
+                 (fun instr ->
+                   match instr with
+                     | I.Kpushtrap catchlabel ->
+                         ( match node.cfg_trap with
+                             | Some(Trap_push trylabel) ->
+                                 Trap { trylabel; catchlabel }
+                             | _ ->
+                                 assert false
+                         )
+                     | _ -> Simple instr
+                 )
+            |> (fun a1 ->
+              match node.cfg_try with
+                | Some Try_exit ->
+                    Array.append a1 [| TryReturn |]
+                | _ -> a1
+            )
             |> (fun a1 ->
               match node.cfg_final with
                 | None -> a1
@@ -551,6 +570,10 @@ let validate scode =
                   let labels = Wc_reader.get_labels_in_instr instr in
                   List.iter (validate_label labels_in_scope func_label last_label) labels
           )
+      | Trap { catchlabel } ->
+          validate_label labels_in_scope func_label last_label catchlabel
+      | TryReturn ->
+          ()
       | Label _ ->
           ()
 

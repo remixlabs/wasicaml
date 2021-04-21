@@ -48,6 +48,8 @@ type structured_code =
    | Block of block
    | Label of int   (* precedes a sequence of Simple instructions *)
    | Simple of I.instruction
+   | Trap of { trylabel: int; catchlabel: int }
+   | TryReturn
 
  and cfg_scope =
   { cfg_letrec_label : int option;
