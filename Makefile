@@ -62,6 +62,31 @@ lib/initwasi.o: src/initwasi.c
 		-Iinclude \
 		-o lib/initwasi.o -c src/initwasi.c
 
+lib/initruntime.o: src/initruntime.c
+	mkdir -p lib
+	./wasi-sdk/bin/clang --sysroot=wasi-sdk/share/wasi-sysroot \
+		-Iocaml/runtime \
+		-o lib/initruntime.o -c src/initruntime.c
+
+src/prims.c:
+	~/.wasicaml/bin/ocamlrun -p > src/primitives
+	(echo '#define CAML_INTERNALS'; \
+	 echo '#include "caml/mlvalues.h"'; \
+	 echo '#include "caml/prims.h"'; \
+	 sed -e 's/.*/extern value &();/' src/primitives; \
+	 echo 'c_primitive caml_builtin_cprim[] = {'; \
+	 sed -e 's/.*/  &,/' src/primitives; \
+	 echo '  0 };'; \
+	 echo 'char * caml_names_of_builtin_cprim[] = {'; \
+	 sed -e 's/.*/  "&",/' src/primitives; \
+	 echo '  0 };') > src/prims.c
+
+lib/prims.o: src/prims.c
+	mkdir -p lib
+	./wasi-sdk/bin/clang --sysroot=wasi-sdk/share/wasi-sysroot \
+		-Iocaml/runtime -flto \
+		-o lib/prims.o -c src/prims.c
+
 build: build-ocaml
 
 build-ocaml:

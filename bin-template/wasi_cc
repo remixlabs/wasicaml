@@ -44,6 +44,15 @@ if [ $noexe -eq 0 ]; then
     esac
 fi
 
+# -flto (link-time optimizations): this switch is crucial for getting around
+# the problem that Wasm functions are typed. It enables the linker to fix up
+# any typing mistakes at link time. For example, caml_sys_open is defined
+# with type (i32,i32,i32)->i32 but prims.c references it with type
+# ()->i32. Without -flto you run into a link error.
+# Plus, the optimizations make the code run faster.
+# Downsie: -flto implies -emit-llvm so the .o files are LLVM IR, and the
+# wasm code is first generated when the executable is created.
+
 "$root"/lib/wasicaml/wasi-sdk/bin/clang --sysroot="$root"/lib/wasicaml/wasi-sdk/share/wasi-sysroot -flto $init "$@"
 
 if [ $genwrapper -gt 0 -a -f "$out" ]; then

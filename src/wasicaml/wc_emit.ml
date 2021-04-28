@@ -796,29 +796,33 @@ let reset_frame =
 let wasicaml_get_data =
   [ L [ K "func";
         ID "wasicaml_get_data";
-        L [ K "export"; S "wasicaml_get_data" ];
+        (*  L [ K "export"; S "wasicaml_get_data" ]; *)
         L [ K "result"; K "i32" ];
         BR;
-        L [ K "global.get"; ID "__memory_base" ];
+        (* PIC: L [ K "global.get"; ID "wc__memory_base" ]; *)
+        (* Extension: *)
+        L [ K "i32.const"; ID "data" ];
         L [ K "return" ]
       ]
   ]
 
+(*
 let wasicaml_get_data_size =
   [ L [ K "func";
         ID "wasicaml_get_data_size";
-        L [ K "export"; S "wasicaml_get_data_size" ];
+        (* L [ K "export"; S "wasicaml_get_data_size" ]; *)
         L [ K "result"; K "i32" ];
         BR;
-        L [ K "global.get"; ID "__memory_size" ];
+        L [ K "global.get"; ID "wc__memory_size" ];
         L [ K "return" ]
       ]
   ]
+ *)
 
 let wasicaml_init =
   [ L [ K "func";
         ID "wasicaml_init";
-        L [ K "export"; S "wasicaml_init" ];
+        (* L [ K "export"; S "wasicaml_init" ]; *)
         BR;
         L [ K "call"; ID "wasicaml_get_global_data" ];
         L [ K "global.set"; ID "wasicaml_global_data" ];
@@ -1606,25 +1610,31 @@ let lookup_label gpad lab =
   let wasmindex =
     try Hashtbl.find gpad.wasmindex letrec_label
     with Not_found -> assert false in
-  (wasmindex, subfunc)
+  (wasmindex, letrec_label, subfunc)
 
 let push_wasmptr gpad lab =
+  (* For PIC: *)
+  (*
   let wasmindex, subfunc = lookup_label gpad lab in
   [ L [ K "global.get"; ID "__table_base" ];
     L [ K "i32.const"; N (I32 (Int32.of_int wasmindex)) ];
     L [ K "i32.add" ];
   ]
+   *)
+  (* For statically linked WASM. Note that this way of taking the
+     address of a function is not officially supported in the wat file format.
+   *)
+  let wasmindex, letrec_label, subfunc = lookup_label gpad lab in
+  [ L [ K "i32.const"; ID (sprintf "letrec%d" letrec_label) ]]
 
 let push_codeptr gpad lab =
-  let wasmindex, subfunc = lookup_label gpad lab in
-  [ L [ K "global.get"; ID "__table_base" ];
-    L [ K "i32.const"; N (I32 (Int32.of_int wasmindex)) ];
-    L [ K "i32.add" ];
-    L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
-    L [ K "i32.shl" ];
-    L [ K "i32.const"; N (I32 (Int32.of_int (subfunc lsl 1))) ];
-    L [ K "i32.or" ];
-  ]
+  let wasmindex, letrec_label, subfunc = lookup_label gpad lab in
+  push_wasmptr gpad lab
+  @ [ L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
+      L [ K "i32.shl" ];
+      L [ K "i32.const"; N (I32 (Int32.of_int (subfunc lsl 1))) ];
+      L [ K "i32.or" ];
+    ]
 
 let closure gpad lpad state lab num =
   let (state, sexpl_alloc) =
@@ -2123,7 +2133,7 @@ let emit_instr gpad lpad state instr =
                   K (sprintf "offset=0x%lx" (Int32.of_int (8 * domain_field_exn_bucket)));
                   K "align=2"
                 ];
-              L [ K "call"; ID "throw" ];
+              L [ K "call"; ID "wasicaml_throw" ];
               L [ K "unreachable" ]
             ] in
         (state, sexpl)
@@ -2175,7 +2185,7 @@ let emit_trap gpad lpad state trylabel catchlabel =
     @ [ L [ K "i32.const"; N (I32 (Int32.of_int (4 * (state.camldepth + 4))))];
         L [ K "i32.sub" ]
       ]
-    @ [ L [ K "call"; ID "try4" ];
+    @ [ L [ K "call"; ID "wasicaml_try4" ];
         L [ K "local.set"; ID local ];
       ]
     @ push_stack (-state.camldepth-3)
@@ -2515,8 +2525,6 @@ let globals =
     "wasicaml_domain_state", true, TI32;
     "wasicaml_builtin_cprim", true, TI32;
     "wasicaml_atom_table", true, TI32;
-    "__table_base", false, TI32;
-    "__memory_base", false, TI32;
     "exn_result", true, TI32;
   ]
   @ if !enable_multireturn then [] else
@@ -2549,7 +2557,7 @@ let imp_functions =
     [ L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
     ];
-    "wasicaml", "try4",
+    "wasicaml", "wasicaml_try4",
     [ L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
@@ -2557,7 +2565,7 @@ let imp_functions =
       L [ K "param"; K "i32" ];
       L [ K "result"; K "i32" ]
     ];
-    "wasicaml", "throw",
+    "wasicaml", "wasicaml_throw",
     [];
     "wasicaml", "wasicaml_get_global_data",
     [ L [ K "result"; K "i32" ]];
@@ -2573,8 +2581,9 @@ let generate scode exe =
   let (funcmapping, subfunctions) = get_funcmapping scode in
   let primitives = get_primitives exe in
   let wasmindex = Hashtbl.create 7 in
+  (* Need 'elements' this only for PIC: *)
   let nextindex = ref 0 in
-  let elements =
+  let _elements =
     Hashtbl.fold
       (fun letrec_label _ acc ->
         Hashtbl.add wasmindex letrec_label !nextindex;
@@ -2586,7 +2595,6 @@ let generate scode exe =
       )
       subfunctions
       [] in
-
   let data = Marshal.to_string exe.data [] in
 
   let gpad =
@@ -2612,13 +2620,12 @@ let generate scode exe =
           S "env";
           S "table";
           L [ K "table";
-              ID "table";
+              (* ID "table"; *)
               N (I32 (Int32.of_int (Hashtbl.length subfunctions)));
               K "funcref"
             ]
         ]
     ] in
-  
   let sexpl_functions =
     List.map
       (fun (modname, name, typeuse) ->
@@ -2647,23 +2654,15 @@ let generate scode exe =
             @ zero_expr_of_vtype vtype
           )
       )
-      globals
-    @ [ L [ K "global";
-            ID "__memory_size";
-            K "i32";
-            L [ K "i32.const";
-                N (I32 (Int32.of_int (String.length data)))
-              ]
-          ]
-      ] in
+      globals in
 
   sexpl_memory
-  @ sexpl_table
   @ sexpl_functions
+  @ sexpl_table
   @ sexpl_globals
   @ wasicaml_init
   @ wasicaml_get_data
-  @ wasicaml_get_data_size
+  (* @ wasicaml_get_data_size *)
   @ grab_helper gpad
   @ restart_helper gpad
   @ reset_frame
@@ -2675,6 +2674,7 @@ let generate scode exe =
       gpad.subfunctions
       []
   @ generate_main scode gpad
+(* Only PIC:
   @ [ L ( [ K "elem";
             L [ K "global.get"; ID "__table_base" ];
             K "func";
@@ -2682,10 +2682,33 @@ let generate scode exe =
           @ elements
         )
     ]
+ *)
   @ [ L [ K "data";
           L [ K "memory"; N (I32 0l) ];
-          L [ K "offset"; K "global.get"; ID "__memory_base" ];
+          (* PIC: L [ K "offset"; K "global.get"; ID "__memory_base" ]; *)
+          (* WAT extension: *)
+          ID "data";
           S data
         ]
     ]
 
+  (*
+Notes:
+~/.wasicaml/bin/wasi_ld --relocatable -o caml.wasm lib/initruntime.o lib/prims.o ~/.wasicaml/lib/ocaml/libcamlrun.a
+~/.wasicaml/bin/wasi_ld -o final.wasm caml.wasm src/wasicaml/t.wasm
+
+wat syntax: https://webassembly.github.io/spec/core/text/index.html
+
+deficiencies of wat2wasm:
+https://github.com/WebAssembly/wabt/issues/1199
+https://github.com/WebAssembly/wabt/issues/1658
+
+Static linking: https://github.com/WebAssembly/tool-conventions/blob/master/Linking.md
+some llvm toolchain tricks: https://surma.dev/things/c-to-webassembly/
+wasm-ld: https://lld.llvm.org/WebAssembly.html
+
+LLVM MC: https://blog.llvm.org/2010/04/intro-to-llvm-mc-project.html
+LLVM wasm assembly parser: https://llvm.org/doxygen/WebAssemblyAsmParser_8cpp_source.html
+LLVM wasm assembly tests: https://github.com/llvm/llvm-project/tree/main/llvm/test/MC/WebAssembly
+
+   *)

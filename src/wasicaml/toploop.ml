@@ -20,6 +20,10 @@ eprintf "Number functions: %d\n%!" (IMap.cardinal s.functions);;
 validate s;;
 let sexpl = generate s exec;;
 let print() =
+  let full = K "module" :: sexpl in
   let f = open_out "t.wat" in
-  print_indented f 0 80 (L (K "module" :: sexpl)); flush stdout;
-  close_out f;;
+  print_indented f 0 80 (L full);
+  close_out f;
+  let f = open_out "t.s" in
+  Wc_sexp2s.write_file f "t.s" sexpl;
+  close_out f;

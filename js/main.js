@@ -31,6 +31,20 @@ function wasicaml_try(session) {
     }
 }
 
+function wasicaml_try4(session) {
+    return function(f, ctx1, ctx2, ctx3, ctx4) {
+        try {
+            session.instance.exports.wasicaml_call4(f, ctx1, ctx2, ctx3, ctx4);
+            return 0;
+        } catch (e) {
+            if (e instanceof OCamlExn) {
+                return 1;
+            } else
+                throw e;
+        }
+    }
+}
+
 function wasicaml_throw(session) {
     return function() {
         throw new OCamlExn("An OCaml exception")
@@ -175,10 +189,11 @@ async function instantiate(wasm_mod, args) {
     };
     const importObject =
           { wasi_snapshot_preview1: realimport,
-            wasicaml: { "try": wasicaml_try(session),
-                        "throw": wasicaml_throw(session),
-                        "system": wasicaml_system(session),
-                        "rename": wasicaml_rename(session)
+            wasicaml: { "wasicaml_try": wasicaml_try(session),
+                        "wasicaml_try4": wasicaml_try4(session),
+                        "wasicaml_throw": wasicaml_throw(session),
+                        "wasicaml_system": wasicaml_system(session),
+                        "wasicaml_rename": wasicaml_rename(session)
                       }
           };
     session.instance = await WebAssembly.instantiate(wasm_mod, importObject);

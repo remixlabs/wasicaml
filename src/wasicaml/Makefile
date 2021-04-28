@@ -3,7 +3,8 @@ ML = wc_types.ml wc_util.ml \
      wc_control.mli wc_control.ml \
      wc_number.ml \
      wc_sexp.ml \
-     wc_emit.ml
+     wc_emit.ml \
+     wc_sexp2s.ml
 PKG = compiler-libs.common compiler-libs.bytecomp
 
 all: wc.cma

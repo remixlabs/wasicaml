@@ -21,17 +21,14 @@ let indentation k =
         Hashtbl.add itable k s;
         s
 
-let hexdigits = [| '0'; '1'; '2'; '3'; '4'; '5'; '6'; '7';
-                   '8'; '9'; 'a'; 'b'; 'c'; 'd'; 'e'; 'f' |]
-
 let rec quote s =
   let b = Buffer.create 80 in
   String.iter
     (fun c ->
       if c = '"' || c = '\\' || Char.code c < 32 || Char.code c >= 127 then (
         Buffer.add_char b '\\';
-        Buffer.add_char b hexdigits.(Char.code c lsr 4);
-        Buffer.add_char b hexdigits.(Char.code c land 15);
+        Buffer.add_char b Wc_util.hexdigits.(Char.code c lsr 4);
+        Buffer.add_char b Wc_util.hexdigits.(Char.code c land 15);
       ) else
         Buffer.add_char b c
     )

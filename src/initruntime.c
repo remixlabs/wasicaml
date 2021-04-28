@@ -1,10 +1,12 @@
 #define CAML_INTERNALS
 #include "caml/mlvalues.h"
 #include "caml/instruct.h"
-#include "caml/prim.h"
+#include "caml/prims.h"
 #include "caml/domain.h"
+#include "caml/startup.h"
 
 #include <stdint.h>
+#include <stdbool.h>
 
 // The following functions are provided by the compiled executable:
 char *wasicaml_get_data(void);
@@ -12,14 +14,14 @@ asize_t wasicaml_get_data_size(void);
 void wasicaml_init(void);
 value mainfunc(value env, int extra_args, uint32_t codeptr, value *fp);
 
-code_t zerocode = { STOP };
+int zerocode[] = { STOP };
 asize_t zerocode_size = 1;
 
 value *wasicaml_get_global_data(void) {
     return &caml_global_data;
 }
 
-struct caml_domain_state *wasicaml_get_domain_state(void) {
+caml_domain_state *wasicaml_get_domain_state(void) {
     return Caml_state;
 }
 
@@ -38,7 +40,7 @@ void wasicaml_main(char **argv) {
     value env = Atom(0);
     int extra_args = 0;
     uint32_t codeptr = 0;
-    value *fp = Caml_state->extern_sp;
+    value *fp = Caml_state->_extern_sp;
     wasicaml_init();
     mainfunc(env, extra_args, codeptr, fp);
 }
