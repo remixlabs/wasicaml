@@ -7,13 +7,13 @@ ML = wc_types.ml wc_util.ml \
      wc_sexp2s.ml
 PKG = compiler-libs.common compiler-libs.bytecomp
 
-all: wc.cma
+all: wasicaml
 
 wc.cma: $(ML)
 	ocamlfind ocamlc -a -o wc.cma -g $(ML) -package "$(PKG)"
 
 clean:
-	rm -f *.cmi *.cmo *.cma main
+	rm -f *.cmi *.cmo *.cma wasicaml
 
-main: wc.cma main.ml
-	ocamlfind ocamlc -o main -g wc.cma main.ml -package "$(PKG)" -linkpkg
+wasicaml: wc_driver.ml wc.cma
+	ocamlfind ocamlc -o wasicaml -g wc.cma wc_driver.ml -package "$(PKG)" -linkpkg

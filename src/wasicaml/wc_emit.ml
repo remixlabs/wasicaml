@@ -8,7 +8,6 @@ open Wc_sexp
      (needs a helper function in C to get the address, and generated init
      code to set the global)
    - wasicaml_domain_state = caml_domain_state
-   - wasicaml_builtin_cprim = caml_builtin_cprim
    - wasicaml_atom_table = caml_atom_table
    - wasicaml_functions
 
@@ -57,7 +56,8 @@ type gpad =  (* global pad *)
        functions : (string, func) Hashtbl.t;
        globals : (string, global) Hashtbl.t;
      *)
-    primitives : (string, int) Hashtbl.t;
+    primitives : (string, sexp list) Hashtbl.t;
+    (* maps name to type *)
     funcmapping : (int, int * int) Hashtbl.t;
     (* maps function label to (letrec_label, subfunction_id) *)
     subfunctions : (int, int list) Hashtbl.t;
@@ -266,29 +266,35 @@ let pop_to_local var =
       ]
   ]
 
+let load_offset offset =
+  if offset >= 0 then
+    [ L [ K "i32.load";
+          K (sprintf "offset=0x%lx" (Int32.of_int offset));
+          K "align=2";
+        ]
+    ]
+  else
+    [ L [ K "i32.const"; N (I32 (Int32.of_int (-offset))) ];
+      L [ K "i32.sub" ];
+      L [ K "i32.load"; K "align=2" ]
+    ]
+
+
 let push_field var_base field =
   [ L [ K "local.get";
         ID var_base;
-      ];
-    L [ K "i32.load";
-        K (sprintf "offset=0x%lx" (Int32.of_int (4 * field)));
-        K "align=2";
-      ];
-  ]
+      ]
+  ] @ load_offset (4 * field)
 
 let push_global_field var_base field =
   [ L [ K "global.get";
         ID var_base;
-      ];
-    L [ K "i32.load";
-        K (sprintf "offset=0x%lx" (Int32.of_int (4 * field)));
-        K "align=2";
-      ];
-  ]
+      ]
+  ] @ load_offset (4 * field)
 
 let push_field_addr var_base field =
   [ L [ K "local.get"; ID var_base ] ]
-  @ if field > 0 then
+  @ if field <> 0 then
       [ L [ K "i32.const";
             N (I32 (Int32.of_int (4 * field)));
           ];
@@ -310,30 +316,42 @@ let push_global_field_addr var_base field =
 let push_stack pos =
   push_field "fp" pos
 
+let store_offset addr value offset =
+  if offset >= 0 then
+    [ L [ K "local.get"; ID addr ];
+      L [ K "local.get"; ID value ];
+      L [ K "i32.store";
+          K (sprintf "offset=0x%lx" (Int32.of_int offset));
+          K "align=2";
+        ]
+    ]
+  else
+    [ L [ K "local.get"; ID addr ];
+      L [ K "i32.const"; N (I32 (Int32.of_int (-offset))) ];
+      L [ K "i32.sub" ];
+      L [ K "local.get"; ID value ];
+      L [ K "i32.store"; K "align=2" ]
+    ]
+
 let pop_to_field var_base field =
-  [ L [ K "local.get";
-        ID var_base;
-      ];
-    L [ K "i32.store";
-        K (sprintf "offset=0x%lx" (Int32.of_int (4 * field)));
-        K "align=2";
-      ];
-  ]
+  [ L [ K "local.set"; ID "h.i32" ];
+  ] @ store_offset var_base "h.i32" (4*field)
 
 let pop_to_double_field var_base field =
-  [ L [ K "local.get";
-        ID var_base;
+  [ L [ K "local.set"; ID "h.f64" ];
+    L [ K "local.get"; ID var_base ];
+    L [ K "i32.const";
+        N (I32 (Int32.of_int (4 * double_size * field)));
       ];
-    L [ K "f64.store";
-        K (sprintf "offset=0x%lx" (Int32.of_int (4 * double_size * field)));
-        K "align=2";
-      ];
+    L [ K "i32.add" ];
+    L [ K "local.get"; ID "h.f64" ];
+    L [ K "f64.store"; K "align=2" ];
   ]
 
 let pop_to_domain_field field =
-  [ L [ K "global.get";
-        ID "wasicaml_domain_state";
-      ];
+  [ L [ K "local.set"; ID "h.i32" ];
+    L [ K "global.get"; ID "wasicaml_domain_state" ];
+    L [ K "local.get"; ID "h.i32" ];
     L [ K "i32.store";
         K (sprintf "offset=0x%lx" (Int32.of_int (8 * field)));
         K "align=2";
@@ -347,6 +365,12 @@ let load_double =
   [ L [ K "f64.load";
         K "align=2"
       ]
+  ]
+
+let debug2 x0 x1 =
+  [ L [ K "i32.const"; N (I32 (Int32.of_int x0)) ];
+    L [ K "i32.const"; N (I32 (Int32.of_int x1)) ];
+    L [ K "call"; ID "debug2" ]
   ]
 
 let stack_init gpad lpad state realdepth =
@@ -478,6 +502,7 @@ let alloc_non_atom gpad lpad state size tag =
             L ( [ [
                     K "then";
                   ];
+                  debug2 1 0;
                   setup_for_gc gpad lpad state rdepth;
 
                   (* caml_alloc_small_dispatch(size, CAML_FROM_C, 1, NULL); *)
@@ -516,12 +541,9 @@ let alloc_non_atom gpad lpad state size tag =
             L [
                 K "else";
                 (* Caml_state_field(young_ptr) = ptr *)
-                L [ K "local.get";
-                    ID ptr
-                  ];
-                L [ K "global.get";
-                    ID "wasicaml_domain_state";
-                  ];
+                L (K "block" :: debug2 1 1);
+                L [ K "global.get"; ID "wasicaml_domain_state" ];
+                L [ K "local.get"; ID ptr ];
                 L [ K "i32.store";
                     K (sprintf "offset=0x%lx" (Int32.of_int (8 * domain_field_young_ptr)));
                     K "align=2"
@@ -529,11 +551,13 @@ let alloc_non_atom gpad lpad state size tag =
               ];
           ];
 
+        L [ K "local.get"; ID ptr ];
+        L [ K "i32.const"; N (I32 4l) ];
+        L [ K "i32.sub" ];
         L [ K "i32.const";
             N (I32 (Int32.of_int (make_header size tag)))
           ];
-        L [ K "local.get"; ID ptr ];
-        L [ K "i32.store"; K (sprintf "offset=0x%lx" (-4l)); K "align=2" ];
+        L [ K "i32.store"; K "align=2" ];
       ]
     else
       [ L [ K "i32.const";
@@ -571,6 +595,7 @@ let grab_helper gpad =
             L [ K "result"; K "i32" ];
             L [ K "local"; ID "accu"; K "i32" ];
             L [ K "local"; ID "i"; K "i32" ];
+            L [ K "local"; ID "h.i32"; K "i32" ];
           ];
 
           setup_for_gc gpad lpad state 0;
@@ -590,14 +615,6 @@ let grab_helper gpad =
           pop_to_local "i";
 
           [ L [ K "loop"; ID "fields"; BR;
-                (* fp[i] *)
-                L [ K "local.get"; ID "fp" ];
-                L [ K "local.get"; ID "i" ];
-                L [ K "i32.const"; N (I32 2l) ];
-                L [ K "i32.shl" ];
-                L [ K "i32.add" ];
-                L [ K "i32.load"; K "align=2" ];
-
                 (* Field(accu, i+3) = ... *)
                 L [ K "local.get"; ID "accu" ];
                 L [ K "local.get"; ID "i" ];
@@ -606,6 +623,16 @@ let grab_helper gpad =
                 L [ K "i32.const"; N (I32 2l) ];
                 L [ K "i32.shl" ];
                 L [ K "i32.add" ];
+
+                (* fp[i] *)
+                L [ K "local.get"; ID "fp" ];
+                L [ K "local.get"; ID "i" ];
+                L [ K "i32.const"; N (I32 2l) ];
+                L [ K "i32.shl" ];
+                L [ K "i32.add" ];
+                L [ K "i32.load"; K "align=2" ];
+
+                (* assign *)
                 L [ K "i32.store"; K "align=2" ];
 
                 (* i++, and jump back if i <= extra_args *)
@@ -652,7 +679,9 @@ let restart_helper gpad =
 
           [ (* num_args = Wosize_val(env) - 3 *)
             L [ K "local.get"; ID "env" ];
-            L [ K "i32.load"; K (sprintf "offset=0x%lx" (-4l)); K "align=2" ];
+            L [ K "i32.const"; N (I32 4l) ];
+            L [ K "i32.sub" ];
+            L [ K "i32.load"; K "align=2" ];
             L [ K "i32.const"; N (I32 10l) ];
             L [ K "i32.shr_u" ];
             L [ K "i32.const"; N (I32 3l) ];
@@ -672,6 +701,13 @@ let restart_helper gpad =
           [ L [ K "i32.const"; N (I32 0l)];
             L [ K "local.set"; ID "i" ];
             L [ K "loop"; ID "args"; BR;
+                (* fp[i[ = ... *)
+                L [ K "local.get"; ID "fp" ];
+                L [ K "local.get"; ID "i" ];
+                L [ K "i32.const"; N (I32 2l) ];
+                L [ K "i32.shl" ];
+                L [ K "i32.add" ];
+
                 (* Field(env, i+3) *)
                 L [ K "local.get"; ID "env" ];
                 L [ K "local.get"; ID "i" ];
@@ -682,12 +718,7 @@ let restart_helper gpad =
                 L [ K "i32.add" ];
                 L [ K "i32.load"; K "align=2" ];
 
-                (* fp[i[ = ... *)
-                L [ K "local.get"; ID "fp" ];
-                L [ K "local.get"; ID "i" ];
-                L [ K "i32.const"; N (I32 2l) ];
-                L [ K "i32.shl" ];
-                L [ K "i32.add" ];
+                (* assign *)
                 L [ K "i32.store"; K "align=2" ];
 
                 (* i++, and jump back if i < num_args *)
@@ -765,6 +796,13 @@ let reset_frame =
             L [ K "i32.sub" ];
             L [ K "local.set"; ID "i" ];
 
+            (* new_fp[i] = ... *)
+            L [ K "local.get"; ID "new_fp" ];
+            L [ K "local.get"; ID "i" ];
+            L [ K "i32.const"; N (I32 2l) ];
+            L [ K "i32.shl" ];
+            L [ K "i32.add" ];
+
             (* fp[-(depth-i)] *)
             L [ K "local.get"; ID "fp" ];
             L [ K "local.get"; ID "depth" ];
@@ -775,12 +813,7 @@ let reset_frame =
             L [ K "i32.sub" ];
             L [ K "i32.load"; K "align=2" ];
 
-            (* new_fp[i] = ... *)
-            L [ K "local.get"; ID "new_fp" ];
-            L [ K "local.get"; ID "i" ];
-            L [ K "i32.const"; N (I32 2l) ];
-            L [ K "i32.shl" ];
-            L [ K "i32.add" ];
+            (* assign *)
             L [ K "i32.store"; K "align=2" ];
 
             (* loop if i > 0 *)
@@ -806,18 +839,16 @@ let wasicaml_get_data =
       ]
   ]
 
-(*
-let wasicaml_get_data_size =
+let wasicaml_get_data_size size =
   [ L [ K "func";
         ID "wasicaml_get_data_size";
         (* L [ K "export"; S "wasicaml_get_data_size" ]; *)
         L [ K "result"; K "i32" ];
         BR;
-        L [ K "global.get"; ID "wc__memory_size" ];
+        L [ K "i32.const"; N (I32 (Int32.of_int size)) ];
         L [ K "return" ]
       ]
   ]
- *)
 
 let wasicaml_init =
   [ L [ K "func";
@@ -828,8 +859,6 @@ let wasicaml_init =
         L [ K "global.set"; ID "wasicaml_global_data" ];
         L [ K "call"; ID "wasicaml_get_domain_state" ];
         L [ K "global.set"; ID "wasicaml_domain_state" ];
-        L [ K "call"; ID "wasicaml_get_builtin_cprim" ];
-        L [ K "global.set"; ID "wasicaml_builtin_cprim" ];
         L [ K "call"; ID "wasicaml_get_atom_table" ];
         L [ K "global.set"; ID "wasicaml_atom_table" ];
         L [ K "return" ]
@@ -1257,9 +1286,6 @@ let makefloatblock gpad lpad state size =
   (state, sexpl_alloc @ sexpl_init @ sexpl_flush @ sexpl_set)
 
 let c_call gpad lpad state name num_args =
-  let prim =
-    try Hashtbl.find gpad.primitives name
-    with Not_found -> assert false in
   let state, sexpl =
     if num_args <= 5 then
       let state, sexpl_flush = flush_accu gpad lpad state in
@@ -1281,14 +1307,14 @@ let c_call gpad lpad state name num_args =
       let p_i32 = L [ K "param"; K "i32" ] in
       let r_i32 = L [ K "result"; K "i32" ] in
       let ty = (args |> List.map (fun _ -> p_i32)) @ [ r_i32 ] in
+      Hashtbl.replace gpad.primitives name ty;
       ( state,
         sexpl_flush
         @ sexpl_setup
         @ sexpl_args
-        @ push_global_field "wasicaml_builtin_cprim" prim
-        @ [ L ( [ K "call_indirect";
-                  N (I32 0l);   (* table index *)
-                ] @ ty);
+        @ [ L [ K "call";
+                ID name
+              ]
           ]
         @ pop_to_local "accu"
         @ sexpl_restore
@@ -1307,6 +1333,11 @@ let c_call gpad lpad state name num_args =
       let sexpl_accu =
         push gpad lpad state state.accu
         @ pop_to_stack (-state.camldepth-1) in
+      let ty =
+        [ L [ K "param"; K "i32" ];
+          L [ K "param"; K "i32" ];
+          L [ K "result"; K "i32" ] ] in
+      Hashtbl.replace gpad.primitives name ty;
       ( state,
         sexpl_flush
         @ sexpl_stack_fixup
@@ -1314,12 +1345,8 @@ let c_call gpad lpad state name num_args =
         @ sexpl_setup
         @ push_field_addr "fp" (-state.camldepth-1)
         @ push_const (Int32.of_int num_args)
-        @ push_global_field "wasicaml_builtin_cprim" prim
-        @ [ L [ K "call_indirect";
-                N (I32 0l);     (* table index *)
-                L [ K "param"; K "i32" ];
-                L [ K "param"; K "i32" ];
-                L [ K "result"; K "i32" ];
+        @ [ L [ K "call";
+                ID name
               ]
           ]
         @ pop_to_local "accu"
@@ -1371,16 +1398,11 @@ let switch gpad lpad state labls_ints labls_blocks =
 
           L [ K "else";
 
-              L [ K "local.get";
-                  ID value
-                ];
-              L [ K "i32.load";
-                  K (sprintf "offset=0x%lx" (-4l));
-                  K "align=2"
-                ];
-              L [ K "i32.const";
-                  N (I32 0xffl);
-                ];
+              L [ K "local.get"; ID value ];
+              L [ K "i32.const"; N (I32 4l) ];
+              L [ K "i32.sub" ];
+              L [ K "i32.load"; K "align=2" ];
+              L [ K "i32.const"; N (I32 0xffl) ];
               L [ K "i32.and" ];
 
               L ( [  K "br_table" ]
@@ -1732,6 +1754,7 @@ let emit_instr gpad lpad state instr =
         nullary_operation gpad lpad state RValue sexpl
     | Kgetglobal ident ->
         let offset = global_offset ident in
+        assert(offset >= 0);
         let sexpl =
           [ L [ K "global.get";
                 ID "wasicaml_global_data";
@@ -1772,15 +1795,16 @@ let emit_instr gpad lpad state instr =
           ] in
         unary_operation gpad lpad state RInt offset_sexpl
     | Koffsetref offset ->
+        (* Field(accu, 0) += offset *)
         let local = new_local lpad TI32 in
         let offset_sexpl =
           [ L [ K "local.tee"; ID local ];
+            L [ K "local.get"; ID local ];
             L [ K "i32.load"; K "align=2" ];
             L [ K "i32.const";
                 N (I32 (Int32.shift_left (Int32.of_int offset) 1));
               ];
             L [ K "i32.add" ];
-            L [ K "local.get"; ID local ];
             L [ K "i32.store";  K "align=2" ];
           ] in
         unary_operation_rvalue_unit gpad lpad state offset_sexpl
@@ -1818,6 +1842,7 @@ let emit_instr gpad lpad state instr =
           ] in
         unary_operation_rvalue_unit gpad lpad state sexpl
     | Kgetfield field ->
+        assert(field >= 0);
         let sexpl =
           [ L [ K "i32.load";
                 K (sprintf "offset=0x%lx" (Int32.of_int (4 * field)));
@@ -1826,37 +1851,31 @@ let emit_instr gpad lpad state instr =
           ] in
         unary_operation gpad lpad state RValue sexpl
     | Kgetfloatfield field ->
+        assert(field >= 0);
         let (sexpl_alloc, ptr, _) =
           alloc gpad lpad state double_size double_tag in
+        let local = new_local lpad TI32 in
         let sexpl =
           sexpl_alloc
           @ [ L [ K "f64.load";
                   K (sprintf "offset=0x%lx" (Int32.of_int (4 * double_size * field)));
                   K "align=2";
                 ];
-              L [ K "local.get";
-                  ID ptr
-                ];
-              L [ K "f64.store";
-                  K "align=2"
-                ];
+              L [ K "local.set"; ID local ];
+              L [ K "local.get"; ID ptr ];
+              L [ K "local.get"; ID local ];
+              L [ K "f64.store"; K "align=2" ];
             ] in
         unary_operation gpad lpad state RValue sexpl
     | Kvectlength ->
         let local = new_local lpad TI32 in
         let sexpl =
-          [ L [ K "i32.load";
-                K (sprintf "offset=0x%lx" (-4l));
-              ];
-            L [ K "local.tee";
-                ID local
-              ];
-            L [ K "local.get";
-                ID local
-              ];
-            L [ K "i32.const";
-                N (I32 0xffl);
-              ];
+          [ L [ K "i32.const"; N (I32 4l) ];
+            L [ K "i32.sub" ];
+            L [ K "i32.load" ];
+            L [ K "local.tee"; ID local ];
+            L [ K "local.get"; ID local ];
+            L [ K "i32.const"; N (I32 0xffl) ];
             L [ K "i32.and" ];
             L [ K "i32.const";
                 N (I32 (Int32.of_int double_array_tag));
@@ -1922,7 +1941,7 @@ let emit_instr gpad lpad state instr =
         let cmp_sexpl = [ L [ K wasm_op ]] in
         binary_operation gpad lpad state RInt cmp_sexpl
     | Kisout ->
-        let cmp_sexpl = [ L [ K "i32.lt_u" ]] in
+        let cmp_sexpl = [ L [ K "i32.gt_u" ]] in
         binary_operation gpad lpad state RInt cmp_sexpl
     | Ksetfield field ->
         let local = new_local lpad TI32 in
@@ -1946,10 +1965,9 @@ let emit_instr gpad lpad state instr =
           ] in
         binary_operation gpad lpad state RValue sexpl
     | Ksetfloatfield field ->
+        assert(field >= 0);
         let sexpl =
-          [ L [ K "f64.load";
-                K "align=2";
-              ];
+          [ L [ K "f64.load"; K "align=2" ];
             L [ K "f64.store";
                 K (sprintf "offset=0x%lx" (Int32.of_int (8 * field)));
                 K "align=2";
@@ -2024,7 +2042,6 @@ let emit_instr gpad lpad state instr =
         (* FIXME: it would be better if there was a variant of ternary_op
            that puts the args in the reverse order on the wasm stack *)
         let local = new_local lpad TI32 in
-        let local2 = new_local lpad TI32 in
         let sexpl =
           [ L [ K "i32.const"; N (I32 1l) ];
             L [ K "i32.shr_s" ];
@@ -2032,9 +2049,7 @@ let emit_instr gpad lpad state instr =
             L [ K "i32.const"; N (I32 1l) ];
             L [ K "i32.shr_s" ];
             L [ K "i32.add" ];
-            L [ K "local.set"; ID local2 ];
             L [ K "local.get"; ID local ];
-            L [ K "local.get"; ID local2 ];
             L [ K "i32.store8" ];
             L [ K "i32.const"; N (I32 1l) ];
           ] in
@@ -2367,17 +2382,6 @@ let get_funcmapping scode =
     subfunctions_rev
   )
 
-
-let get_primitives exe =
-  let open Wc_reader in
-  let primitives = Hashtbl.create 7 in
-  Array.iteri
-    (fun k name ->
-      Hashtbl.add primitives name k
-    )
-    exe.primitives;
-  primitives
-
 let block_cascade start_sexpl label_sexpl_pairs =
   let rec shift prev_sexpl pairs =
     match pairs with
@@ -2418,9 +2422,11 @@ let cond_loop cond label sexpl =
     sexpl
 
 
-let generate_function scode gpad func_name subfunc_labels export_flag =
+let generate_function scode gpad letrec_label func_name subfunc_labels export_flag =
   let lpad = empty_lpad() in
   Hashtbl.add lpad.locals "accu" TI32;
+  Hashtbl.add lpad.locals "h.i32" TI32;
+  Hashtbl.add lpad.locals "h.f64" TF64;
 
   let subfunc_pairs =
     List.map
@@ -2496,6 +2502,7 @@ let generate_function scode gpad func_name subfunc_labels export_flag =
                )
                locals
             )
+          @ debug2 0 letrec_label
           @ sexpl
           @ [ L [ K "unreachable" ]]
         )
@@ -2508,7 +2515,7 @@ let generate_letrec scode gpad letrec_label =
     with Not_found -> assert false in
   assert(subfunc_labels <> []);
   let func_name = sprintf "letrec%d" letrec_label in
-  generate_function scode gpad func_name subfunc_labels false
+  generate_function scode gpad letrec_label func_name subfunc_labels false
 
 let generate_main scode gpad =
   let letrec_label = 0 in
@@ -2517,13 +2524,12 @@ let generate_main scode gpad =
     with Not_found -> assert false in
   assert(subfunc_labels <> []);
   let func_name = "mainfunc" in
-  generate_function scode gpad func_name subfunc_labels true
+  generate_function scode gpad letrec_label func_name subfunc_labels true
 
 
 let globals =
   [ "wasicaml_global_data", true, TI32;
     "wasicaml_domain_state", true, TI32;
-    "wasicaml_builtin_cprim", true, TI32;
     "wasicaml_atom_table", true, TI32;
     "exn_result", true, TI32;
   ]
@@ -2571,15 +2577,16 @@ let imp_functions =
     [ L [ K "result"; K "i32" ]];
     "wasicaml", "wasicaml_get_domain_state",
     [ L [ K "result"; K "i32" ]];
-    "wasicaml", "wasicaml_get_builtin_cprim",
-    [ L [ K "result"; K "i32" ]];
     "wasicaml", "wasicaml_get_atom_table",
     [ L [ K "result"; K "i32" ]];
+    "wasicaml", "debug2",
+    [ L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+    ]
   ]
 
 let generate scode exe =
   let (funcmapping, subfunctions) = get_funcmapping scode in
-  let primitives = get_primitives exe in
   let wasmindex = Hashtbl.create 7 in
   (* Need 'elements' this only for PIC: *)
   let nextindex = ref 0 in
@@ -2595,14 +2602,24 @@ let generate scode exe =
       )
       subfunctions
       [] in
-  let data = Marshal.to_string exe.data [] in
+  let data = Marshal.to_string Wc_reader.(exe.data) [] in
 
   let gpad =
     { funcmapping;
       subfunctions;
-      primitives;
+      primitives = Hashtbl.create 7;
       wasmindex;
     } in
+
+  let sexpl_code =
+    Hashtbl.fold
+      (fun letrec_label _ acc ->
+        let sexpl = generate_letrec scode gpad letrec_label in
+        sexpl @ acc
+      )
+      gpad.subfunctions
+      []
+  @ generate_main scode gpad in
 
   let sexpl_memory =
     [ L [ K "import";
@@ -2638,7 +2655,21 @@ let generate scode exe =
               )
           ]
       )
-      imp_functions in
+      imp_functions
+    @ Hashtbl.fold
+        (fun name typeuse acc ->
+          ( L [ K "import";
+                S "ocaml";
+                S name;
+                L ( [ K "func";
+                      ID name;
+                    ] @ typeuse
+                  )
+              ]
+          ) :: acc
+        )
+        gpad.primitives
+        []  in
 
   let sexpl_globals =
     List.map
@@ -2662,18 +2693,11 @@ let generate scode exe =
   @ sexpl_globals
   @ wasicaml_init
   @ wasicaml_get_data
-  (* @ wasicaml_get_data_size *)
+  @ wasicaml_get_data_size (String.length data)
   @ grab_helper gpad
   @ restart_helper gpad
   @ reset_frame
-  @ Hashtbl.fold
-      (fun letrec_label _ acc ->
-        let sexpl = generate_letrec scode gpad letrec_label in
-        sexpl @ acc
-      )
-      gpad.subfunctions
-      []
-  @ generate_main scode gpad
+  @ sexpl_code
 (* Only PIC:
   @ [ L ( [ K "elem";
             L [ K "global.get"; ID "__table_base" ];

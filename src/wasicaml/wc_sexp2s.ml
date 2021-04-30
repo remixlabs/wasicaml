@@ -47,29 +47,16 @@ let extract_func_type l =
           (llvm_type, other) in
   scan [] [] l
 
+let abbrev_empty_type s =
+  if s = "() -> ()" then
+    ""
+  else
+    s
+
 let llvm_type_of_func_type typeuse =
   let (llvm_type, rest) = extract_func_type typeuse in
   if rest <> [] then
     failwith ("llvm_type_of_func_type: " ^ string_of_sexp (L rest));
-  llvm_type
-
-let extract_value_type l =
-  let rec scan params results l =
-    match l with
-      | (L [K "param"; K ty]) :: l' ->
-          scan (ty :: params) results l'
-      | other ->
-          let llvm_type =
-            sprintf "(%s) -> (%s)"
-                    (String.concat ", " (List.rev params))
-                    (String.concat ", " (List.rev results)) in
-          (llvm_type, other) in
-  scan [] [] l
-
-let llvm_type_of_value_type typeuse =
-  let (llvm_type, rest) = extract_value_type typeuse in
-  if rest <> [] then
-    failwith ("llvm_type_of_value_type: " ^ string_of_sexp (L rest));
   llvm_type
 
 let extract_label l =
@@ -130,7 +117,7 @@ let write_func_body f func_name locals_table sexpl =
             with Not_found ->
               failwith (sprintf "local not found - function %s local %s"
                                 func_name name) in
-          fprintf f "\t%s%s %d\n" indent instr index;
+          fprintf f "\t%s%s %d   # $%s\n" indent instr index name;
           next labels depth rest
       | L (K ("i32.load"|"i32.store"|"i64.load"|"i64.store"|
               "f32.load"|"f32.store"|"f64.load"|"f64.store"
@@ -141,28 +128,34 @@ let write_func_body f func_name locals_table sexpl =
           fprintf f "\t%s%s 0x%x:p2align=%d\n" indent instr offset align;
           next labels depth rest
       | L (K ("br"|"br_if"|"br_table" as instr) :: inner) :: rest ->
-          let labs =
+          let lab_names =
             List.map
               (function
-               | ID lab ->
-                   ( try find_label lab labels
-                     with Not_found ->
-                          failwith (sprintf "label not found - function %s label %s"
-                                            func_name lab)
-                   )
+               | ID lab -> lab
                | bad ->
                   failwith (sprintf "bad code - function %s - %s"
                                     func_name (string_of_sexp bad))
               )
               inner in
+          let all_lab_names =
+            lab_names |> String.concat "," in
+          let lab_nums =
+            List.map
+              (fun name ->
+                try find_label name labels
+                with Not_found ->
+                  failwith (sprintf "label not found - function %s label %s"
+                                    func_name name)
+              )
+              lab_names in
           let branches =
-            List.map string_of_int labs |> String.concat ", " in
+            List.map string_of_int lab_nums |> String.concat ", " in
           let opt_curlies =
             if instr = "br_table" then
               "{ " ^ branches ^ " }"
             else
               branches in
-          fprintf f "\t%s%s %s\n" indent instr opt_curlies;
+          fprintf f "\t%s%s %s   # %s\n" indent instr opt_curlies all_lab_names;
           next labels depth rest
       | L (K "call_indirect" :: N (I32 table) :: inner) :: rest ->
           let ty, inner2 = extract_func_type inner in
@@ -173,21 +166,24 @@ let write_func_body f func_name locals_table sexpl =
           next labels depth rest
       | L (K "block" :: inner) :: rest ->
           let label, inner2 = extract_label inner in
-          let ty, body = extract_value_type inner2 in
+          let ty, body = extract_func_type inner2 in
+          let ty = abbrev_empty_type ty in
           fprintf f "\t%sblock %s # label %s\n" indent ty label;
           next (label :: labels) (depth+1) body;
           fprintf f "\t%send_block # label %s\n" indent label;
           next labels depth rest
       | L (K "loop" :: inner) :: rest ->
           let label, inner2 = extract_label inner in
-          let ty, body = extract_value_type inner2 in
+          let ty, body = extract_func_type inner2 in
+          let ty = abbrev_empty_type ty in
           fprintf f "\t%sloop %s # label %s\n" indent ty label;
           next (label :: labels) (depth+1) body;
           fprintf f "\t%send_loop # label %s\n" indent label;
           next labels depth rest
       | L (K "if" :: inner) :: rest ->
           let label, inner2 = extract_label inner in
-          let ty, body = extract_value_type inner2 in
+          let ty, body = extract_func_type inner2 in
+          let ty = abbrev_empty_type ty in
           ( match body with
               | [ L (K "then" :: then_sexpl) ] ->
                   fprintf f "\t%sif %s # label %s\n" indent ty label;

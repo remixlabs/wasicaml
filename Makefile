@@ -4,7 +4,7 @@
         setup setup-downloads setup-git setup-bin setup-js \
         configure configure-ocaml \
 	build build-ocaml \
-	install install-downloads install-bin install-ocaml \
+	install install-downloads install-bin install-ocaml install-lib \
 	clean clean-ocaml
 
 default: setup configure build install
@@ -92,8 +92,7 @@ build: build-ocaml
 build-ocaml:
 	cd ocaml && make
 
-install: install-downloads install-bin install-js install-ocaml
-	cp lib/initwasi.o $(prefix)/lib
+install: install-downloads install-bin install-js install-ocaml install-lib
 
 install-downloads:
 	mkdir -p $(prefix)/lib/wasicaml
@@ -116,6 +115,10 @@ install-js:
 
 install-ocaml:
 	cd ocaml && make install
+
+install-lib:
+	cp lib/initwasi.o $(prefix)/lib
+	cp lib/initruntime.o $(prefix)/lib
 
 clean: clean-ocaml
 	rm -f wasi_preamble

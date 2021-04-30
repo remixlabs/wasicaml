@@ -27,3 +27,8 @@ let print() =
   let f = open_out "t.s" in
   Wc_sexp2s.write_file f "t.s" sexpl;
   close_out f;
+
+  (*
+~/.wasicaml/bin/wasi_cc -c t.s
+~/.wasicaml/bin/wasi_cc -o caml.wasm lib/initruntime.o lib/prims.o src/wasicaml/t.o ~/.wasicaml/lib/ocaml/libcamlrun.a
+   *)
