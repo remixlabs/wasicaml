@@ -30,7 +30,7 @@ __attribute__((export_name("wasicaml_call")))
 extern void wasicaml_call(void (*f)(void *), void *ctx);
 
 __attribute__((export_name("wasicaml_call4")))
-extern void wasicaml_call4(void (*f)(void *, void *, void *, void *),
+extern void wasicaml_call4(int32_t (*f)(void *, void *, void *, void *),
                            void *ctx1, void *ctx2, void *ctx3, void *ctx4 );
 
 __attribute__((import_module("wasicaml")))

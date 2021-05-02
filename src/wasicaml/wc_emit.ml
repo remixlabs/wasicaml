@@ -23,6 +23,9 @@ open Wc_sexp
    - do a stack check at the beginning of a function (but no realloc)
    - use helper functions for Kapply?
    - check that subfunc fits into codeptr (10 bits)
+   - allow swapped stack positions (could avoid a lot of code)
+   - implement 31 bit arithmetic correctly
+   - do not emit "$letrec0" in addition to "$mainfunc"
  *)
 
 (* OCaml functions are translated to Wasm functions with parameters:
@@ -316,6 +319,14 @@ let push_global_field_addr var_base field =
 let push_stack pos =
   push_field "fp" pos
 
+let push_domain_field field =
+  [ L [ K "global.get"; ID "wasicaml_domain_state" ];
+    L [ K "i32.load";
+        K (sprintf "offset=0x%lx" (Int32.of_int (8 * field)));
+        K "align=2";
+      ];
+  ]
+
 let store_offset addr value offset =
   if offset >= 0 then
     [ L [ K "local.get"; ID addr ];
@@ -370,6 +381,12 @@ let load_double =
 let debug2 x0 x1 =
   [ L [ K "i32.const"; N (I32 (Int32.of_int x0)) ];
     L [ K "i32.const"; N (I32 (Int32.of_int x1)) ];
+    L [ K "call"; ID "debug2" ]
+  ]
+
+let debug2_var x0 var =
+  [ L [ K "i32.const"; N (I32 (Int32.of_int x0)) ];
+    L [ K "local.get"; ID var ];
     L [ K "call"; ID "debug2" ]
   ]
 
@@ -459,11 +476,104 @@ let alloc_atom gpad lpad state tag =
           N (I32 (Int32.of_int (4 * tag)));
         ];
       L [ K "i32.add" ];
-      L [ K "local.set";
-          ID ptr
-        ]
     ] in
   (code, ptr, false)
+
+let alloc_decr =
+  [ L [ K "func";
+        ID "alloc_decr";
+        L [ K "param"; ID "size"; K "i32" ];
+        BR;
+        L [ K "result"; C "ptr"; K "i32" ];
+        L [ K "local"; ID "x"; K "i32" ];
+
+        (* Caml_state_field(young_ptr) = ... *)
+        L [ K "global.get"; ID "wasicaml_domain_state" ];
+
+        (* Caml_state_field(young_ptr) - Whsize_wosize (wosize) *)
+        L [ K "global.get"; ID "wasicaml_domain_state" ];
+        L [ K "i32.load";
+            K (sprintf "offset=0x%lx" (Int32.of_int (8 * domain_field_young_ptr)));
+            K "align=2"
+          ];
+        L [ K "local.get"; ID "size" ];
+        L [ K "i32.sub" ];
+        L [ K "local.tee"; ID "x" ];
+
+        L [ K "i32.store";
+            K (sprintf "offset=0x%lx" (Int32.of_int (8 * domain_field_young_ptr)));
+            K "align=2"
+          ];
+
+        L [ K "local.get"; ID "x" ];
+        L [ K "return" ]
+      ]
+  ]
+
+let alloc_slow =
+  [ L ( [ [ K "func";
+            ID "alloc_slow";
+            L [ K "param"; ID "size"; K "i32" ];
+            L [ K "param"; ID "fp"; K "i32" ];
+            L [ K "param"; ID "stackdepth"; K "i32" ];
+            L [ K "param"; ID "accu"; K "i32" ];
+            L [ K "param"; ID "env"; K "i32" ];
+            BR;
+            L [ K "result"; C "ptr"; K "i32" ];
+            L [ K "local"; ID "h.i32"; K "i32" ];
+          ];
+          if !enable_multireturn then [
+              L [ K "result"; C "out_accu"; K "i32" ];
+              L [ K "result"; C "out_env"; K "i32" ];
+            ] else [];
+          [ L [ K "local.get"; ID "fp" ];
+            L [ K "local.get"; ID "stackdepth" ];
+            L [ K "i32.sub" ];
+            L [ K "i32.const"; N (I32 8l) ];
+            L [ K "i32.sub" ];
+
+            L [ K "local.tee"; ID "h.i32" ];
+            L ( K "block" :: debug2_var 20 "h.i32");
+          ]
+          @ pop_to_domain_field domain_field_extern_sp
+          @ push_local "accu"
+          @ pop_to_stack 4
+          @ push_local "env"
+          @ pop_to_stack 0;
+
+          (* caml_alloc_small_dispatch(size, CAML_FROM_C, 1, NULL); *)
+          [ L [ K "local.get"; ID "size" ];
+            L [ K "i32.const"; N (I32 (Int32.of_int caml_from_c)) ];
+            L [ K "i32.const"; N (I32 1l) ];
+            L [ K "i32.const"; N (I32 0l) ];
+            L [ K "call"; ID "caml_alloc_small_dispatch" ];
+          ];
+
+          (* return Caml_state_field(young_ptr) *)
+          push_domain_field domain_field_young_ptr;
+
+          (* return accu, env *)
+          push_local "accu";
+          push_local "env";
+
+          if !enable_multireturn then [] else
+            [ L [ K "global.set"; ID "retval3" ];
+              L [ K "global.set"; ID "retval2" ];
+            ];
+
+          [ L [ K "return" ]]
+
+        ] |> List.flatten
+      )
+  ]
+
+let call_alloc_slow =
+  [ L [ K "call"; ID "alloc_slow" ]]
+  @ if !enable_multireturn then [] else
+      [ L [ K "global.get"; ID "retval2" ];
+        L [ K "global.get"; ID "retval3" ];
+      ]
+
 
 let alloc_non_atom gpad lpad state size tag =
   (* TODO: use new push/pop functions *)
@@ -472,103 +582,47 @@ let alloc_non_atom gpad lpad state size tag =
   let code =
     if young then
       let rdepth = realdepth state in
-      [
-        (* ptr = Caml_state_field(young_ptr) - Whsize_wosize (wosize) *)
-        L [ K "global.get";
-            ID "wasicaml_domain_state";
-          ];
-        L [ K "i32.load";
-            K (sprintf "offset=0x%lx" (Int32.of_int (8 * domain_field_young_ptr)));
-            K "align=2"
-          ];
-        L [ K "i32.const";
-            N (I32 (Int32.of_int (4 * (size+1))));
-          ];
-        L [ K "i32.sub" ];
-        L [ K "local.tee";
-            ID ptr;
-          ];
+      [ [ L [ K "i32.const";
+              N (I32 (Int32.of_int (4 * (size+1))));
+            ];
+          L [ K "call"; ID "alloc_decr" ];
+          L [ K "local.tee"; ID ptr ];
+        ];
 
         (* if (ptr < Caml_state_field(young_limit)) *)
-        L [ K "global.get";
-            ID "wasicaml_domain_state";
-          ];
-        L [ K "i32.load";
-            K (sprintf "offset=0x%lx" (Int32.of_int (8 * domain_field_young_limit)));
-            K "align=2"
-          ];
-        L [ K "i32.lt_u" ];
-        L [ K "if";
-            L ( [ [
-                    K "then";
-                  ];
-                  debug2 1 0;
-                  setup_for_gc gpad lpad state rdepth;
-
-                  (* caml_alloc_small_dispatch(size, CAML_FROM_C, 1, NULL); *)
-                  [ L [ K "i32.const";
-                        N (I32 (Int32.of_int size));
-                      ];
-                    L [ K "i32.const";
-                        N (I32 (Int32.of_int caml_from_c));
-                      ];
-                    L [ K "i32.const";
-                        N (I32 1l);
-                      ];
-                    L [ K "i32.const";
-                        N (I32 0l);
-                      ];
-                    L [ K "call";
-                        ID "caml_alloc_small_dispatch";
-                      ];
-                  ];
-                  restore_after_gc gpad lpad state rdepth;
-
-                  (* ptr = Caml_state_field(young_ptr) *)
-                  [ L [ K "global.get";
-                        ID "wasicaml_domain_state";
-                      ];
-                    L [ K "i32.load";
-                        K (sprintf "offset=0x%lx" (Int32.of_int (8 * domain_field_young_ptr)));
-                        K "align=2"
-                      ];
-                    L [ K "local.set";
-                        ID ptr
-                      ];
-                  ]
+        push_domain_field domain_field_young_limit;
+        [ L [ K "i32.lt_u" ] ];
+        [ L [ K "if";
+              L ( [ [
+                      K "then";
+                    ];
+                    stack_init gpad lpad state rdepth;
+                    push_const (Int32.of_int size);
+                    push_local "fp";
+                    push_const (Int32.of_int (4 * rdepth));
+                    push_local "accu";
+                    push_local "env";
+                    call_alloc_slow;
+                    pop_to_local "env";
+                    pop_to_local "accu";
+                    pop_to_local ptr;
                 ] |> List.flatten
               );
-            L [
-                K "else";
-                (* Caml_state_field(young_ptr) = ptr *)
-                L (K "block" :: debug2 1 1);
-                L [ K "global.get"; ID "wasicaml_domain_state" ];
-                L [ K "local.get"; ID ptr ];
-                L [ K "i32.store";
-                    K (sprintf "offset=0x%lx" (Int32.of_int (8 * domain_field_young_ptr)));
-                    K "align=2"
-                  ];
-              ];
           ];
 
         L [ K "local.get"; ID ptr ];
-        L [ K "i32.const"; N (I32 4l) ];
-        L [ K "i32.sub" ];
         L [ K "i32.const";
             N (I32 (Int32.of_int (make_header size tag)))
           ];
         L [ K "i32.store"; K "align=2" ];
-      ]
+        L [ K "local.get"; ID ptr ];
+        L [ K "i32.const"; N (I32 4l) ];
+        L [ K "i32.add" ];
+      ] ] |> List.flatten
     else
-      [ L [ K "i32.const";
-            N (I32 (Int32.of_int size));
-          ];
-        L [ K "i32.const";
-            N (I32 (Int32.of_int tag));
-          ];
-        L [ K "call";
-            ID "caml_alloc_shr"
-          ]
+      [ L [ K "i32.const"; N (I32 (Int32.of_int size)) ];
+        L [ K "i32.const"; N (I32 (Int32.of_int tag)) ];
+        L [ K "call"; ID "caml_alloc_shr" ];
       ] in
   (code, ptr, young)
 
@@ -577,6 +631,11 @@ let alloc gpad lpad state size tag =
     alloc_atom gpad lpad state tag
   else
     alloc_non_atom gpad lpad state size tag
+
+let alloc_set gpad lpad state size tag =
+  let (code, ptr, young) = alloc gpad lpad state size tag in
+  let code = code @ [ L [ K "local.set"; ID ptr ]] in
+  (code, ptr, young)
 
 let grab_helper gpad =
   (* generates a helper function:
@@ -1225,7 +1284,7 @@ let makeblock gpad lpad state start vars size tag =
      [start+vars-1] are initialized with values from the accu and the
      top of the stack. Returns the block in accu.
    *)
-  let sexpl_alloc, ptr, young = alloc gpad lpad state size tag in
+  let sexpl_alloc, ptr, young = alloc_set gpad lpad state size tag in
   let fields = enum start vars in
   let camlstack = Array.of_list state.camlstack in
   let store_of_field field =
@@ -1236,7 +1295,7 @@ let makeblock gpad lpad state start vars size tag =
         (fun field ->
           let store = store_of_field field in
           push gpad lpad state store
-          @ pop_to_field ptr (field+start)
+          @ pop_to_field ptr field
         )
         fields
       |> List.flatten
@@ -1244,7 +1303,7 @@ let makeblock gpad lpad state start vars size tag =
       List.map
         (fun field ->
           let store = store_of_field field in
-          push_field_addr ptr (field+start)
+          push_field_addr ptr field
           @ push gpad lpad state store
           @ [ L [ K "call";
                   ID "caml_initialize"
@@ -1263,7 +1322,7 @@ let makeblock gpad lpad state start vars size tag =
 
 let makefloatblock gpad lpad state size =
   let wosize = size * double_size in
-  let sexpl_alloc, ptr, _ = alloc gpad lpad state wosize double_array_tag in
+  let sexpl_alloc, ptr, _ = alloc_set gpad lpad state wosize double_array_tag in
   let fields = enum 0 size in
   let camlstack = Array.of_list state.camlstack in
   let store_of_field field =
@@ -1312,6 +1371,7 @@ let c_call gpad lpad state name num_args =
         sexpl_flush
         @ sexpl_setup
         @ sexpl_args
+        @ debug2 19 0
         @ [ L [ K "call";
                 ID name
               ]
@@ -1345,6 +1405,7 @@ let c_call gpad lpad state name num_args =
         @ sexpl_setup
         @ push_field_addr "fp" (-state.camldepth-1)
         @ push_const (Int32.of_int num_args)
+        @ debug2 19 0
         @ [ L [ K "call";
                 ID name
               ]
@@ -1464,6 +1525,7 @@ let grab gpad lpad state num =
               L [ K "i32.or" ];  (* codeptr of RESTART *)
               L [ K "local.get"; ID "fp" ];
               L [ K "call"; ID "grab_helper" ];
+              L ( K "block" :: debug2 1 0);
               L [ K "return" ];
             ]
         ];
@@ -1482,6 +1544,11 @@ let return =
             ]
             @ push_field "accu" 0
             @ [ L [ K "local.tee"; ID "codeptr" ];
+
+                L [ K "i32.const"; N (I32 4l) ];
+                L [ K "local.get"; ID "codeptr" ];
+                L [ K "call"; ID "debug2" ];
+
                 L [ K "local.get"; ID "fp" ];
                 L [ K "local.get"; ID "codeptr" ];
                 L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
@@ -1499,21 +1566,35 @@ let return =
           )
       ];
     L [ K "local.get"; ID "accu" ];
+    L ( K "block" :: debug2 1 1);
     L [ K "return" ];
   ]
 
-let apply_code extra_args sp_decr env_pos =
+let apply_code lpad extra_args sp_decr env_pos =
+  let codeptr = new_local lpad TI32 in
   [ L [ K "local.get"; ID "accu" ];
     L [ K "i32.const"; N (I32 (Int32.of_int extra_args)) ];
   ]
   @ push_field "accu" 0
-  @ [ L [ K "local.tee"; ID "accu" ];
+  @ [ L [ K "local.tee"; ID codeptr ];
+
+      L [ K "i32.const"; N (I32 3l) ];
+      L [ K "local.get"; ID codeptr ];
+      L [ K "call"; ID "debug2" ];
+
       L [ K "local.get"; ID "fp" ];
       L [ K "i32.const"; N (I32 (Int32.of_int (4 * sp_decr))) ];
       L [ K "i32.sub" ];
-      L [ K "local.get"; ID "accu" ];
+      L [ K "local.get"; ID codeptr ];
       L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
       L [ K "i32.shr_u" ];
+
+      L [ K "local.set"; ID "h.i32" ];
+      L [ K "i32.const"; N (I32 2l) ];
+      L [ K "local.get"; ID "h.i32" ];
+      L [ K "call"; ID "debug2" ];
+      L [ K "local.get"; ID "h.i32" ];
+
       L [ K "call_indirect";
           N (I32 0l);     (* table index *)
           L [ K "param"; K "i32" ];
@@ -1545,17 +1626,17 @@ let apply123 gpad lpad state num =
     @ push_const 1l  (* instead of extra_args *)
     @ pop_to_stack (-state.camldepth+num-1) in
   let sexpl_call =
-    apply_code (num-1) (state.camldepth+3) (-state.camldepth+num-2) in
-  let sexpl = sexpl_move @ sexpl_frame @ sexpl_call in
+    apply_code lpad (num-1) (state.camldepth+3) (-state.camldepth+num-2) in
+  let sexpl = sexpl_str @ sexpl_move @ sexpl_frame @ sexpl_call in
   let state = popn_camlstack state num in
   (state, sexpl)
 
 let apply4plus gpad lpad state num =
   let state, sexpl_str = straighten_all gpad lpad state in
   let sexpl =
-    apply_code (num-1) state.camldepth (-state.camldepth + num + 1) in
+    apply_code lpad (num-1) state.camldepth (-state.camldepth + num + 1) in
   let state = popn_camlstack state (num+3) in
-  (state, sexpl)
+  (state, sexpl_str @ sexpl)
 
 let appterm_common =
   let sexpl_frame =
@@ -1653,17 +1734,26 @@ let push_codeptr gpad lab =
   let wasmindex, letrec_label, subfunc = lookup_label gpad lab in
   push_wasmptr gpad lab
   @ [ L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
-      L [ K "i32.shl" ];
-      L [ K "i32.const"; N (I32 (Int32.of_int (subfunc lsl 1))) ];
-      L [ K "i32.or" ];
+      L [ K "i32.shl" ]
     ]
+  @ (if subfunc <> 0 then
+      [ L [ K "i32.const"; N (I32 (Int32.of_int (subfunc lsl 1))) ];
+        L [ K "i32.or" ];
+      ]
+     else [])
 
 let closure gpad lpad state lab num =
   let (state, sexpl_alloc) =
     makeblock gpad lpad state 2 num (num + 2) closure_tag in
   let sexpl_codeval =
     push_codeptr gpad lab
-    @ pop_to_field "accu" 0 in
+    @ pop_to_field "accu" 0
+    @ [ L [ K "i32.const"; (N (I32 5l)) ];
+        L [ K "local.get"; ID "accu" ];
+        L [ K "i32.load" ];
+        L [ K "call"; ID "debug2" ]
+      ]
+  in
   let sexpl_closinfo =
     push_const 5l
     @ pop_to_field "accu" 1 in
@@ -1679,26 +1769,30 @@ let closurerec gpad lpad state func_labs nvars =
     List.mapi (fun i func_lab -> (i, func_lab)) func_labs
     |> List.fold_left
          (fun (state, envofs, sexpl) (i, func_lab) ->
-           let sexpl_infix =
-             if i=0 then [] else
-               push_const (Int32.of_int (make_header (i*3) infix_tag))
-               @ pop_to_field "accu" (3*i-1) in
            let sexpl_cp =
              push_codeptr gpad func_lab
-             @ pop_to_field "accu" (if i=0 then 0 else 3*i) in
+             @ pop_to_field "accu" (3*i) in
            let sexpl_closinfo =
              push_const (Int32.of_int ((envofs lsl 1) + 1))
-             @ pop_to_field "accu" (if i=0 then 1 else 3*i+1) in
+             @ pop_to_field "accu" (3*i+1) in
            let sexpl_addr =
-             push_field_addr "accu" (if i=0 then 0 else 3*i-1)
+             push_field_addr "accu" (3*i)
              @ pop_to_stack (-state.camldepth-1) in
+           let sexpl_infix =
+             push_const (Int32.of_int (make_header (i*3) infix_tag))
+             @ pop_to_field "accu" (3*i-1) in
+           let sexpl =
+             sexpl @
+               if i = 0 then
+                 sexpl_cp @ sexpl_closinfo @ sexpl_addr
+               else
+                 sexpl_infix @ sexpl_cp @ sexpl_closinfo @ sexpl_addr in
            let state =
              push_camlstack (RealStack (-state.camldepth-1)) state in
-           (state, envofs-3,
-            sexpl @ sexpl_infix @ sexpl_cp @ sexpl_closinfo @ sexpl_addr
-           )
+           (state, envofs-3, sexpl)
          )
          (state, envofs, []) in
+  let state = { state with accu = Invalid } in
   (state, sexpl_alloc @ sexpl_init)
 
 let global_offset ident =
@@ -1822,6 +1916,7 @@ let emit_instr gpad lpad state instr =
         let offset = global_offset ident in
         let local = new_local lpad TI32 in
         let sexpl =
+          debug2 6 offset @
           [ L [ K "local.set";
                 ID local
               ];
@@ -1853,7 +1948,7 @@ let emit_instr gpad lpad state instr =
     | Kgetfloatfield field ->
         assert(field >= 0);
         let (sexpl_alloc, ptr, _) =
-          alloc gpad lpad state double_size double_tag in
+          alloc_set gpad lpad state double_size double_tag in
         let local = new_local lpad TI32 in
         let sexpl =
           sexpl_alloc
@@ -2143,6 +2238,7 @@ let emit_instr gpad lpad state instr =
         (* wasicaml_throw() *)
         let sexpl =
           push_as gpad lpad state state.accu RValue
+          @ debug2 30 2
           @ [ L [ K "global.get"; ID "wasicaml_domain_state" ];
               L [ K "i32.load";
                   K (sprintf "offset=0x%lx" (Int32.of_int (8 * domain_field_exn_bucket)));
@@ -2167,6 +2263,7 @@ let emit_instr gpad lpad state instr =
         (* return NULL pointer *)
         let sexpl =
           [ L [ K "i32.const"; N (I32 0l) ];
+            L ( K "block" :: debug2 1 2);
             L [ K "return" ]
           ] in
         (state, sexpl)
@@ -2200,9 +2297,11 @@ let emit_trap gpad lpad state trylabel catchlabel =
     @ [ L [ K "i32.const"; N (I32 (Int32.of_int (4 * (state.camldepth + 4))))];
         L [ K "i32.sub" ]
       ]
+    @ debug2 30 0
     @ [ L [ K "call"; ID "wasicaml_try4" ];
         L [ K "local.set"; ID local ];
       ]
+    @ debug2 30 1
     @ push_stack (-state.camldepth-3)
     @ pop_to_local "env"
     @ [ L [ K "local.get"; ID local ];
@@ -2229,6 +2328,7 @@ let emit_try_return gpad lpad state =
     push_as gpad lpad state state.accu RValue
     @ [ L [ K "global.set"; ID "exn_result" ];
         L [ K "i32.const"; N (I32 0l) ];
+        L ( K "block" :: debug2 1 3);
         L [ K "return" ]
       ] in
   (state, sexpl)
@@ -2305,7 +2405,7 @@ let emit_fblock gpad lpad fblock =
                         (next_state.camldepth);
                  *)
                 let comment =
-                  C (Wc_util.string_of_instruction i) in
+                  C ("***" ^ Wc_util.string_of_instruction i) in
                 (next_state, (comment :: sexpl) :: acc)
             | Trap { trylabel; catchlabel } ->
                 (* update_depth_table state [catchlabel]; *)
@@ -2503,6 +2603,10 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
                locals
             )
           @ debug2 0 letrec_label
+          @ debug2_var 10 "fp"
+          @ debug2_var 11 "env"
+          @ debug2_var 12 "codeptr"
+          @ debug2_var 13 "extra_args"
           @ sexpl
           @ [ L [ K "unreachable" ]]
         )
@@ -2694,6 +2798,8 @@ let generate scode exe =
   @ wasicaml_init
   @ wasicaml_get_data
   @ wasicaml_get_data_size (String.length data)
+  @ alloc_decr
+  @ alloc_slow
   @ grab_helper gpad
   @ restart_helper gpad
   @ reset_frame

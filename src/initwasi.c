@@ -24,7 +24,7 @@ void wasicaml_call(void (*f)(void *), void *ctx) {
 }
 
 
-void wasicaml_call4(void (*f)(void *, void *, void *, void *),
+void wasicaml_call4(int32_t (*f)(void *, void *, void *, void *),
                     void *x1, void *x2, void *x3, void *x4) {
     f(x1,x2,x3,x4);
 }
