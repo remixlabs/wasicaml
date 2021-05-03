@@ -2,6 +2,7 @@
 #define WASICAML_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 // Functions that are defined outside ocaml, either by helper code, or
 // even in the host environment.
@@ -15,7 +16,7 @@ extern bool wasicaml_try(void (*f)(void *), void *ctx);
 
 __attribute__((import_module("wasicaml")))
 __attribute__((import_name("wasicaml_try4")))
-extern bool wasicaml_try4(void (*f)(void *, void *, void *, void *),
+extern bool wasicaml_try4(int32_t (*f)(void *, void *, void *, void *),
                           void *ctx1, void *ctx2, void *ctx3, void *ctx4);
 // Same but f is called with four context params:
 // f(ctx1,ctx2,ctx3,ctx4)

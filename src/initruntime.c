@@ -49,6 +49,7 @@ void wasicaml_main(char **argv) {
     printf("young_limit=%p\n", Caml_state_field(young_limit));
     printf("&extern_sp=%p\n", &Caml_state_field(extern_sp));
     printf("delta extern_sp=%lx\n", ((char *) &Caml_state_field(extern_sp)) - ((char *) &Caml_state_field(young_ptr)));
+    printf("&atom_table=%p\n", caml_atom_table);
     value env = Atom(0);
     int extra_args = 0;
     uint32_t codeptr = 0;

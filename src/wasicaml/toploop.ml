@@ -10,7 +10,7 @@ open Wc_sexp;;
 open Printf;;
 #print_length 20000;;
 let exec = read_executable "t";;
-let code, labels = decode exec;;
+let code, labels, maplab = decode exec;;
 eprintf "Number instructions: %d\n" (Array.length code);;
 eprintf "Number labels: %d\n%!" (ISet.cardinal labels);;
 let cfg = create_cfg code labels;;

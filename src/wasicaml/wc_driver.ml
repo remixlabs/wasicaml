@@ -32,22 +32,24 @@ let main() =
     try read_executable inp
     with Bytesections.Bad_magic_number ->
       failwith ("not a bytecode executable: " ^ inp) in
-  let code, labels = decode exec in
+  let code, labels, maplab = decode exec in
   eprintf "  number instructions: %d\n" (Array.length code);
   eprintf "  number labels: %d\n%!" (ISet.cardinal labels);
+
+  let get_defname = defname_of_label exec maplab in
 
   eprintf "* creating CFG...\n%!";
   let cfg = create_cfg code labels in
   eprintf "  number nodes: %d\n%!" (IMap.cardinal cfg.nodes);
 
-  eprintf "* decompile...\n%!";
+  eprintf "* linearize...\n%!";
   let s = recover_structure cfg in
   eprintf "  number functions: %d\n%!" (IMap.cardinal s.functions);
   eprintf "* validating...\n%!";
   validate s;
 
   eprintf "* translating to WASM...\n%!";
-  let sexpl = generate s exec in
+  let sexpl = generate s exec get_defname in
 
   eprintf "* print as .wat...\n%!";
   let full = K "module" :: sexpl in

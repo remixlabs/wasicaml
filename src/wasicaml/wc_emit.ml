@@ -26,6 +26,8 @@ open Wc_sexp
    - allow swapped stack positions (could avoid a lot of code)
    - implement 31 bit arithmetic correctly
    - do not emit "$letrec0" in addition to "$mainfunc"
+   - helper functions for "makeblock"
+   - rename "decompiling" -> "linearizing"
  *)
 
 (* OCaml functions are translated to Wasm functions with parameters:
@@ -59,6 +61,8 @@ type gpad =  (* global pad *)
        functions : (string, func) Hashtbl.t;
        globals : (string, global) Hashtbl.t;
      *)
+    letrec_name : (int, string) Hashtbl.t;
+    (* maps letrec label to name *)
     primitives : (string, sexp list) Hashtbl.t;
     (* maps name to type *)
     funcmapping : (int, int * int) Hashtbl.t;
@@ -97,6 +101,8 @@ type repr =
     (* a pointer to an OCaml block, or an OCaml integer when LSB=1 *)
   | RInt
     (* an I32 integer that needs to be converted to an OCaml integer *)
+  | RIntVal
+    (* an I32 integer that is already converted to an OCaml integer *)
   | RNatInt
     (* an I32 integer that will be stored as nativeint block *)
   | RInt32
@@ -213,7 +219,7 @@ let repr_of_store =
 
 let vtype repr =
   match repr with
-    | RValue | RInt | RNatInt | RInt32 ->
+    | RValue | RInt | RIntVal | RNatInt | RInt32 ->
         TI32
     | RInt64 ->
         TI64
@@ -532,8 +538,9 @@ let alloc_slow =
             L [ K "i32.const"; N (I32 8l) ];
             L [ K "i32.sub" ];
 
-            L [ K "local.tee"; ID "h.i32" ];
-            L ( K "block" :: debug2_var 20 "h.i32");
+            (* L [ K "local.tee"; ID "h.i32" ];
+               L ( K "block" :: debug2_var 20 "h.i32");
+             *)
           ]
           @ pop_to_domain_field domain_field_extern_sp
           @ push_local "accu"
@@ -877,7 +884,6 @@ let reset_frame =
 
             (* loop if i > 0 *)
             L [ K "local.get"; ID "i" ];
-            L [ K "i32.eqz" ];
             L [ K "br_if"; ID "args" ];
           ];
         L [ K "local.get"; ID "new_fp" ];
@@ -929,7 +935,7 @@ let tovalue repr =
   (* transform the value of the Wasm stack to a proper OCaml value,
      and put that back on the Wasm stack *)
   match repr with
-    | RValue ->
+    | RValue | RIntVal ->
         []
     | RInt ->
         [ L [ K "i32.const";
@@ -956,7 +962,7 @@ let toint repr =
   match repr with
     | RInt ->
         []
-    | RValue ->
+    | RValue | RIntVal ->
         [ L [ K "i32.const";
               N (I32 1l);
             ];
@@ -968,7 +974,7 @@ let toint repr =
 let convert repr_from repr_to =
   (* convert the value on the wasm stack, from repr_from to repr_to *)
   match repr_to with
-    | RValue -> tovalue repr_from
+    | RValue | RIntVal -> tovalue repr_from
     | RInt -> toint repr_from
     | _ ->
         assert false (* TODO *)
@@ -1084,7 +1090,7 @@ let push gpad lpad state store =
 
 let push_as gpad lpad state store req_repr =
   match store, req_repr with
-    | Const x, RValue ->
+    | Const x, (RValue | RIntVal) ->
         push_const (Int32.logor (Int32.shift_left (Int32.of_int x) 1) 1l)
     | _ ->
         let sexpl_push = push gpad lpad state store in
@@ -1195,6 +1201,13 @@ let nullary_operation gpad lpad state op_repr op_sexpl =
         let sexpl =
           sexpl_flush @ op_sexpl @ pop_to_local "accu" in
         (state, sexpl)
+    | RInt ->
+        let result = new_local lpad (vtype op_repr) in
+        let state = { state with accu = Local(RIntVal, result) } in
+        let intval_sexpl = tovalue RInt in
+        let sexpl =
+          op_sexpl @ op_sexpl @ intval_sexpl @ pop_to_local result in
+        (state, sexpl)
     | _ ->
         let result = new_local lpad (vtype op_repr) in
         let state = { state with accu = Local(op_repr, result) } in
@@ -1205,10 +1218,12 @@ let nullary_operation gpad lpad state op_repr op_sexpl =
 let unary_operation_norvalue gpad lpad state op_repr op_sexpl =
   assert(op_repr <> RValue);
   let sexpl_push = push_as gpad lpad state state.accu op_repr in
-  let result = new_local lpad (vtype op_repr) in
-  let state = { state with accu = Local(op_repr, result) } in
+  let res_repr = if op_repr = RInt then RIntVal else op_repr in
+  let result = new_local lpad (vtype res_repr) in
+  let state = { state with accu = Local(res_repr, result) } in
+  let sexpl_cvt = convert op_repr res_repr in
   let sexpl_pop = pop_to_local result in
-  (state, sexpl_push @ op_sexpl @ sexpl_pop)
+  (state, sexpl_push @ op_sexpl @ sexpl_cvt @ sexpl_pop)
 
 let unary_operation_rvalue gpad lpad state op_sexpl =
   let state, flush_sexpl = flush_accu gpad lpad state in
@@ -1233,14 +1248,16 @@ let unary_operation gpad lpad state op_repr op_sexpl =
 
 let binary_operation_norvalue gpad lpad state op_repr op_sexpl =
   assert(op_repr <> RValue);
+  let res_repr = if op_repr = RInt then RIntVal else op_repr in
   let sexpl_push1 = push_as gpad lpad state state.accu op_repr in
   let second = List.hd state.camlstack in
   let sexpl_push2 = push_as gpad lpad state second op_repr in
-  let result = new_local lpad (vtype op_repr) in
+  let result = new_local lpad (vtype res_repr) in
   let state = pop_camlstack state in
-  let state = { state with accu = Local(op_repr, result) } in
+  let state = { state with accu = Local(res_repr, result) } in
+  let sexpl_cvt = convert op_repr res_repr in
   let sexpl_pop = pop_to_local result in
-  (state, sexpl_push1 @ sexpl_push2 @ op_sexpl @ sexpl_pop)
+  (state, sexpl_push1 @ sexpl_push2 @ op_sexpl @ sexpl_cvt @ sexpl_pop)
 
 let binary_operation_rvalue gpad lpad state op_sexpl =
   (* Logically, first operand is in accu, second operand on top of stack.
@@ -1294,7 +1311,7 @@ let makeblock gpad lpad state start vars size tag =
       List.map
         (fun field ->
           let store = store_of_field field in
-          push gpad lpad state store
+          push_as gpad lpad state store RValue
           @ pop_to_field ptr field
         )
         fields
@@ -1304,7 +1321,7 @@ let makeblock gpad lpad state start vars size tag =
         (fun field ->
           let store = store_of_field field in
           push_field_addr ptr field
-          @ push gpad lpad state store
+          @ push_as gpad lpad state store RValue
           @ [ L [ K "call";
                   ID "caml_initialize"
                 ]
@@ -1312,9 +1329,8 @@ let makeblock gpad lpad state start vars size tag =
         )
         fields
       |> List.flatten in
-  let num_vars = size - start in
   let state =
-    if num_vars > 0 then popn_camlstack state (num_vars-1) else state in
+    if vars > 0 then popn_camlstack state (vars-1) else state in
   let state, sexpl_flush = flush_accu gpad lpad state in
   let state = { state with accu = RealAccu } in
   let sexpl_set = push_local ptr @ pop_to_local "accu" in
@@ -1331,7 +1347,7 @@ let makefloatblock gpad lpad state size =
     List.map
       (fun field ->
         let store = store_of_field field in
-        push gpad lpad state store
+        push_as gpad lpad state store RValue
         @ load_double
         @ pop_to_double_field ptr field
       )
@@ -1359,7 +1375,7 @@ let c_call gpad lpad state name num_args =
         List.map
           (fun arg ->
             let store = store_of_arg arg in
-            push gpad lpad state store
+            push_as gpad lpad state store RValue
           )
           args
         |> List.flatten in
@@ -1371,7 +1387,7 @@ let c_call gpad lpad state name num_args =
         sexpl_flush
         @ sexpl_setup
         @ sexpl_args
-        @ debug2 19 0
+        (* @ debug2 19 0 *)
         @ [ L [ K "call";
                 ID name
               ]
@@ -1391,7 +1407,7 @@ let c_call gpad lpad state name num_args =
       let sexpl_setup = setup_for_c_call gpad lpad state 1 state.camldepth in
       let sexpl_restore = restore_after_c_call gpad lpad state 1 state.camldepth in
       let sexpl_accu =
-        push gpad lpad state state.accu
+        push_as gpad lpad state state.accu RValue
         @ pop_to_stack (-state.camldepth-1) in
       let ty =
         [ L [ K "param"; K "i32" ];
@@ -1405,7 +1421,7 @@ let c_call gpad lpad state name num_args =
         @ sexpl_setup
         @ push_field_addr "fp" (-state.camldepth-1)
         @ push_const (Int32.of_int num_args)
-        @ debug2 19 0
+        (* @ debug2 19 0 *)
         @ [ L [ K "call";
                 ID name
               ]
@@ -1426,7 +1442,7 @@ let string_label lpad label =
 let switch gpad lpad state labls_ints labls_blocks =
   lpad.need_panic <- true;
   let value = new_local lpad TI32 in
-  push gpad lpad state state.accu
+  push_as gpad lpad state state.accu RValue
   @ pop_to_local value
   @ [ (* if (!Is_block(value)) *)
       L [ K "local.get";
@@ -1525,7 +1541,7 @@ let grab gpad lpad state num =
               L [ K "i32.or" ];  (* codeptr of RESTART *)
               L [ K "local.get"; ID "fp" ];
               L [ K "call"; ID "grab_helper" ];
-              L ( K "block" :: debug2 1 0);
+              (* L ( K "block" :: debug2 1 0); *)
               L [ K "return" ];
             ]
         ];
@@ -1545,9 +1561,10 @@ let return =
             @ push_field "accu" 0
             @ [ L [ K "local.tee"; ID "codeptr" ];
 
-                L [ K "i32.const"; N (I32 4l) ];
-                L [ K "local.get"; ID "codeptr" ];
-                L [ K "call"; ID "debug2" ];
+                (* L [ K "i32.const"; N (I32 4l) ];
+                   L [K "local.get"; ID "codeptr" ];
+                   L [K "call"; ID "debug2" ];
+                 *)
 
                 L [ K "local.get"; ID "fp" ];
                 L [ K "local.get"; ID "codeptr" ];
@@ -1566,7 +1583,7 @@ let return =
           )
       ];
     L [ K "local.get"; ID "accu" ];
-    L ( K "block" :: debug2 1 1);
+    (* L ( K "block" :: debug2 1 1); *)
     L [ K "return" ];
   ]
 
@@ -1578,9 +1595,11 @@ let apply_code lpad extra_args sp_decr env_pos =
   @ push_field "accu" 0
   @ [ L [ K "local.tee"; ID codeptr ];
 
+      (*
       L [ K "i32.const"; N (I32 3l) ];
       L [ K "local.get"; ID codeptr ];
       L [ K "call"; ID "debug2" ];
+       *)
 
       L [ K "local.get"; ID "fp" ];
       L [ K "i32.const"; N (I32 (Int32.of_int (4 * sp_decr))) ];
@@ -1589,11 +1608,13 @@ let apply_code lpad extra_args sp_decr env_pos =
       L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
       L [ K "i32.shr_u" ];
 
+      (*
       L [ K "local.set"; ID "h.i32" ];
       L [ K "i32.const"; N (I32 2l) ];
       L [ K "local.get"; ID "h.i32" ];
       L [ K "call"; ID "debug2" ];
       L [ K "local.get"; ID "h.i32" ];
+       *)
 
       L [ K "call_indirect";
           N (I32 0l);     (* table index *)
@@ -1605,6 +1626,7 @@ let apply_code lpad extra_args sp_decr env_pos =
         ];
       L [ K "local.set"; ID "accu" ];
     ]
+  (* @ debug2_var 51 "accu" *)
   @ push_stack env_pos   (* env might have been moved by GC *)
   @ pop_to_local "env"
 
@@ -1641,6 +1663,7 @@ let apply4plus gpad lpad state num =
 let appterm_common =
   let sexpl_frame =
     (* TODO: for small num, expand reset_frame *)
+    (* debug2_var 40 "accu" *)
     push_local "fp"
     @ push_local "appterm_depth"
     @ push_local "appterm_old_num_args"
@@ -1728,7 +1751,7 @@ let push_wasmptr gpad lab =
      address of a function is not officially supported in the wat file format.
    *)
   let wasmindex, letrec_label, subfunc = lookup_label gpad lab in
-  [ L [ K "i32.const"; ID (sprintf "letrec%d" letrec_label) ]]
+  [ L [ K "i32.const"; ID (Hashtbl.find gpad.letrec_name letrec_label) ]]
 
 let push_codeptr gpad lab =
   let wasmindex, letrec_label, subfunc = lookup_label gpad lab in
@@ -1748,11 +1771,12 @@ let closure gpad lpad state lab num =
   let sexpl_codeval =
     push_codeptr gpad lab
     @ pop_to_field "accu" 0
-    @ [ L [ K "i32.const"; (N (I32 5l)) ];
-        L [ K "local.get"; ID "accu" ];
-        L [ K "i32.load" ];
-        L [ K "call"; ID "debug2" ]
+    (* @ [ L [ K "i32.const"; (N (I32 5l)) ];
+       L [ K "local.get"; ID "accu" ];
+       L [ K "i32.load" ];
+       L [ K "call"; ID "debug2" ]
       ]
+     *)
   in
   let sexpl_closinfo =
     push_const 5l
@@ -1789,7 +1813,7 @@ let closurerec gpad lpad state func_labs nvars =
                  sexpl_infix @ sexpl_cp @ sexpl_closinfo @ sexpl_addr in
            let state =
              push_camlstack (RealStack (-state.camldepth-1)) state in
-           (state, envofs-3, sexpl)
+           (state, envofs, sexpl)
          )
          (state, envofs, []) in
   let state = { state with accu = Invalid } in
@@ -1839,12 +1863,22 @@ let emit_instr gpad lpad state instr =
                 store
             )
             state.camlstack in
-        let state = { state with camlstack;
-                                 realaccu = ISet.add (-cd+sp) state.realaccu
-                    } in
+        let realaccu =
+          if state.accu = RealAccu then
+            ISet.add (-cd+sp) state.realaccu
+          else
+            state.realaccu in
+        let state = { state with camlstack; realaccu } in
         (state, sexpl)
     | Kenvacc field ->
-        let sexpl = push_field "env" field in
+        let sexpl =
+          push_field "env" field
+          (*
+          @ [ L [ K "local.set"; ID "h.i32" ]]
+          @ debug2_var 50 "h.i32"
+          @ [ L [ K "local.get"; ID "h.i32" ]]
+           *)
+        in
         nullary_operation gpad lpad state RValue sexpl
     | Kgetglobal ident ->
         let offset = global_offset ident in
@@ -1861,33 +1895,33 @@ let emit_instr gpad lpad state instr =
           ] in
         nullary_operation gpad lpad state RValue sexpl
     | Knegint ->
-        let negate_sexpl =  (* could also multiply by (-1) *)
+        let negate_sexpl =
           [ L [ K "i32.const";
-                N (I32 (-1l));
+                N (I32 (0xffff_fffel));
               ];
             L [ K "i32.xor" ];
             L [ K "i32.const";
-                N (I32 1l);
+                N (I32 2l);
               ];
             L [ K "i32.add" ];
           ] in
-        unary_operation gpad lpad state RInt negate_sexpl
+        unary_operation gpad lpad state RIntVal negate_sexpl
     | Kboolnot ->
         let not_sexpl =
           [ L [ K "i32.const";
-                N (I32 1l);
+                N (I32 2l);
               ];
             L [ K "i32.xor" ]
           ] in
-        unary_operation gpad lpad state RInt not_sexpl
+        unary_operation gpad lpad state RIntVal not_sexpl
     | Koffsetint offset ->
         let offset_sexpl =
           [ L [ K "i32.const";
-                N (I32 (Int32.of_int offset));
+                N (I32 (Int32.shift_left (Int32.of_int offset) 1));
               ];
             L [ K "i32.add" ]
           ] in
-        unary_operation gpad lpad state RInt offset_sexpl
+        unary_operation gpad lpad state RIntVal offset_sexpl
     | Koffsetref offset ->
         (* Field(accu, 0) += offset *)
         let local = new_local lpad TI32 in
@@ -1916,7 +1950,7 @@ let emit_instr gpad lpad state instr =
         let offset = global_offset ident in
         let local = new_local lpad TI32 in
         let sexpl =
-          debug2 6 offset @
+          (* debug2 6 offset @ *)
           [ L [ K "local.set";
                 ID local
               ];
@@ -1989,11 +2023,19 @@ let emit_instr gpad lpad state instr =
           ] in
         unary_operation gpad lpad state RValue sexpl
     | Kaddint ->
-        let add_sexpl = [ L [ K "i32.add" ] ] in
-        binary_operation gpad lpad state RInt add_sexpl
+        let add_sexpl =
+          [ L [ K "i32.add" ];
+            L [ K "i32.const"; N(I32 1l) ];
+            L [ K "i32.sub" ]
+          ] in
+        binary_operation gpad lpad state RIntVal add_sexpl
     | Ksubint ->
-        let sub_sexpl = [ L [ K "i32.sub" ] ] in
-        binary_operation gpad lpad state RInt sub_sexpl
+        let sub_sexpl =
+          [ L [ K "i32.sub" ];
+            L [ K "i32.const"; N(I32 1l) ];
+            L [ K "i32.add" ]
+          ] in
+        binary_operation gpad lpad state RIntVal sub_sexpl
     | Kmulint ->
         let mul_sexpl = [ L [ K "i32.mul" ] ] in
         binary_operation gpad lpad state RInt mul_sexpl
@@ -2008,13 +2050,17 @@ let emit_instr gpad lpad state instr =
         binary_operation gpad lpad state RInt mod_sexpl
     | Kandint ->
         let and_sexpl = [ L [ K "i32.and" ] ] in
-        binary_operation gpad lpad state RInt and_sexpl
+        binary_operation gpad lpad state RIntVal and_sexpl
     | Korint ->
         let or_sexpl = [ L [ K "i32.or" ] ] in
-        binary_operation gpad lpad state RInt or_sexpl
+        binary_operation gpad lpad state RIntVal or_sexpl
     | Kxorint ->
-        let xor_sexpl = [ L [ K "i32.xor" ] ] in
-        binary_operation gpad lpad state RInt xor_sexpl
+        let xor_sexpl =
+          [ L [ K "i32.xor" ];
+            L [ K "i32.const"; N (I32 1l) ];
+            L [ K "i32.or" ];
+          ] in
+        binary_operation gpad lpad state RIntVal xor_sexpl
     | Klslint ->
         let lsl_sexpl = [ L [ K "i32.shl" ] ] in
         binary_operation gpad lpad state RInt lsl_sexpl
@@ -2033,8 +2079,10 @@ let emit_instr gpad lpad state instr =
             | Cle -> "i32.le_s"
             | Cgt -> "i32.gt_s"
             | Cge -> "i32.ge_s" in
-        let cmp_sexpl = [ L [ K wasm_op ]] in
-        binary_operation gpad lpad state RInt cmp_sexpl
+        let cmp_sexpl =
+          [ L [ K wasm_op ] ]
+          @ convert RInt RIntVal in
+        binary_operation gpad lpad state RIntVal cmp_sexpl
     | Kisout ->
         let cmp_sexpl = [ L [ K "i32.gt_u" ]] in
         binary_operation gpad lpad state RInt cmp_sexpl
@@ -2164,15 +2212,19 @@ let emit_instr gpad lpad state instr =
         let state, sexpl_str = straighten_all gpad lpad state in
         let sexpl =
           sexpl_str
-          @ push_as gpad lpad state state.accu RInt
-          @ [ L [ K "br_if"; ID (string_label lpad lab) ] ] in
+          @ push_as gpad lpad state state.accu RIntVal
+          @ [ L [ K "i32.const"; N (I32 1l) ];
+              L [ K "i32.gt_u" ];
+              L [ K "br_if"; ID (string_label lpad lab) ]
+            ] in
         (state, sexpl)
     | Kbranchifnot lab ->
         let state, sexpl_str = straighten_all gpad lpad state in
         let sexpl =
           sexpl_str
-          @ push_as gpad lpad state state.accu RInt
-          @ [ L [ K "i32.eqz" ];
+          @ push_as gpad lpad state state.accu RIntVal
+          @ [ L [ K "i32.const"; N (I32 1l) ];
+              L [ K "i32.le_u" ];
               L [ K "br_if"; ID (string_label lpad lab) ] ] in
         (state, sexpl)
     | Kswitch (labls_ints, labls_blocks) ->
@@ -2238,7 +2290,7 @@ let emit_instr gpad lpad state instr =
         (* wasicaml_throw() *)
         let sexpl =
           push_as gpad lpad state state.accu RValue
-          @ debug2 30 2
+          (* @ debug2 30 2 *)
           @ [ L [ K "global.get"; ID "wasicaml_domain_state" ];
               L [ K "i32.load";
                   K (sprintf "offset=0x%lx" (Int32.of_int (8 * domain_field_exn_bucket)));
@@ -2263,7 +2315,7 @@ let emit_instr gpad lpad state instr =
         (* return NULL pointer *)
         let sexpl =
           [ L [ K "i32.const"; N (I32 0l) ];
-            L ( K "block" :: debug2 1 2);
+            (* L ( K "block" :: debug2 1 2); *)
             L [ K "return" ]
           ] in
         (state, sexpl)
@@ -2297,11 +2349,11 @@ let emit_trap gpad lpad state trylabel catchlabel =
     @ [ L [ K "i32.const"; N (I32 (Int32.of_int (4 * (state.camldepth + 4))))];
         L [ K "i32.sub" ]
       ]
-    @ debug2 30 0
+    (* @ debug2 30 0 *)
     @ [ L [ K "call"; ID "wasicaml_try4" ];
         L [ K "local.set"; ID local ];
       ]
-    @ debug2 30 1
+    (* @ debug2 30 1 *)
     @ push_stack (-state.camldepth-3)
     @ pop_to_local "env"
     @ [ L [ K "local.get"; ID local ];
@@ -2328,7 +2380,7 @@ let emit_try_return gpad lpad state =
     push_as gpad lpad state state.accu RValue
     @ [ L [ K "global.set"; ID "exn_result" ];
         L [ K "i32.const"; N (I32 0l) ];
-        L ( K "block" :: debug2 1 3);
+        (* L ( K "block" :: debug2 1 3); *)
         L [ K "return" ]
       ] in
   (state, sexpl)
@@ -2602,11 +2654,12 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
                )
                locals
             )
-          @ debug2 0 letrec_label
-          @ debug2_var 10 "fp"
-          @ debug2_var 11 "env"
-          @ debug2_var 12 "codeptr"
-          @ debug2_var 13 "extra_args"
+          (* @ debug2 0 letrec_label
+             @ debug2_var 10 "fp"
+             @ debug2_var 11 "env"
+             @ debug2_var 12 "codeptr"
+             @ debug2_var 13 "extra_args"
+           *)
           @ sexpl
           @ [ L [ K "unreachable" ]]
         )
@@ -2618,7 +2671,7 @@ let generate_letrec scode gpad letrec_label =
     try Hashtbl.find gpad.subfunctions letrec_label
     with Not_found -> assert false in
   assert(subfunc_labels <> []);
-  let func_name = sprintf "letrec%d" letrec_label in
+  let func_name = Hashtbl.find gpad.letrec_name letrec_label in
   generate_function scode gpad letrec_label func_name subfunc_labels false
 
 let generate_main scode gpad =
@@ -2689,8 +2742,30 @@ let imp_functions =
     ]
   ]
 
-let generate scode exe =
+let sanitize =
+  String.map
+    (fun c ->
+      match c with
+        | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' | '.' -> c
+        | _ -> '?'
+    )
+
+let generate scode exe get_defname =
   let (funcmapping, subfunctions) = get_funcmapping scode in
+
+  let letrec_name = Hashtbl.create 7 in
+  Hashtbl.iter
+    (fun letrec_label _ ->
+      let suffix =
+        try
+          let defname = get_defname letrec_label in
+          "_" ^ sanitize defname
+        with
+          | Not_found -> "" in
+      Hashtbl.add letrec_name letrec_label (sprintf "letrec%d%s" letrec_label suffix)
+    )
+    subfunctions;
+
   let wasmindex = Hashtbl.create 7 in
   (* Need 'elements' this only for PIC: *)
   let nextindex = ref 0 in
@@ -2701,7 +2776,7 @@ let generate scode exe =
         incr nextindex;
         let name =
           if letrec_label = 0 then "mainfunc" else
-            sprintf "letrec%d" letrec_label in
+            Hashtbl.find letrec_name letrec_label in
         (ID name) :: acc
       )
       subfunctions
@@ -2713,13 +2788,17 @@ let generate scode exe =
       subfunctions;
       primitives = Hashtbl.create 7;
       wasmindex;
+      letrec_name;
     } in
 
   let sexpl_code =
     Hashtbl.fold
       (fun letrec_label _ acc ->
-        let sexpl = generate_letrec scode gpad letrec_label in
-        sexpl @ acc
+        if letrec_label > 0 then
+          let sexpl = generate_letrec scode gpad letrec_label in
+          sexpl @ acc
+        else
+          acc
       )
       gpad.subfunctions
       []

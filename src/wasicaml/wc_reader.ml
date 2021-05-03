@@ -8,6 +8,7 @@ type executable =
     code : string;
     data : Obj.t array;
     symbols : Symtable.global_map;
+    debug : (int, string) Hashtbl.t;
   }
 
 let input_stringlist f section =
@@ -31,7 +32,28 @@ let input_symbols f section : Symtable.global_map =
     Marshal.from_channel f
   with
     | Not_found -> Symtable.empty_global_map
-                 
+
+let input_debug f section =
+  let ht = Hashtbl.create 7 in
+  try
+    let _len = Bytesections.seek_section f section in
+    let n = input_binary_int f in
+    for k = 1 to n do
+      let ofs = input_binary_int f in
+      let evl = input_value f in
+      let _ = input_value f in
+      List.iter
+        (fun ev ->
+          (* if I.(ev.ev_kind = Event_pseudo) then *)
+            Hashtbl.add ht I.((ofs + ev.ev_pos) / 4) I.(ev.ev_defname)
+        )
+        evl
+    done;
+    ht
+  with
+    | Not_found -> ht
+
+
 let read_executable name =
   let f = open_in name in
   Bytesections.read_toc f;
@@ -51,13 +73,15 @@ let read_executable name =
   let code = Bytesections.read_section_string f "CODE" in
   let data = input_objarray f "DATA" in
   let symbols = input_symbols f "SYMB" in
+  let debug = input_debug f "DBUG" in
   close_in f;
   { dll_paths;
     dll_names;
     primitives;
     code;
     data;
-    symbols
+    symbols;
+    debug
   }
 
 type format =
@@ -153,9 +177,9 @@ let instructions exec =
     O.opPUSHATOM, [C], (fun args ->
       [I.Kpush; I.Kmakeblock(0, args.(0))]);
     O.opMAKEBLOCK, [C;C], (fun args -> [I.Kmakeblock(args.(0), args.(1))]);
-    O.opMAKEBLOCK1, [C], (fun args -> [I.Kmakeblock(0, args.(0))]);
-    O.opMAKEBLOCK2, [C], (fun args -> [I.Kmakeblock(1, args.(0))]);
-    O.opMAKEBLOCK3, [C], (fun args -> [I.Kmakeblock(2, args.(0))]);
+    O.opMAKEBLOCK1, [C], (fun args -> [I.Kmakeblock(1, args.(0))]);
+    O.opMAKEBLOCK2, [C], (fun args -> [I.Kmakeblock(2, args.(0))]);
+    O.opMAKEBLOCK3, [C], (fun args -> [I.Kmakeblock(3, args.(0))]);
     O.opMAKEFLOATBLOCK, [C], (fun args -> [I.Kmakefloatblock args.(0)]);
     O.opGETFIELD0, [], (fun args -> [I.Kgetfield 0]);
     O.opGETFIELD1, [], (fun args -> [I.Kgetfield 1]);
@@ -398,6 +422,11 @@ let decode exec =
     if lab' < 0 then failwith "bad label";
     all_labels := ISet.add lab' !all_labels;
     lab' in
+  let ext_map_label lab =
+    if lab < 0 || lab >= Array.length labels then raise Not_found;
+    let lab' = labels.(lab) in
+    if lab' < 0 then raise Not_found;
+    lab' in
   let all_instrs =
     decoded_a
     |> Array.mapi
@@ -417,7 +446,34 @@ let decode exec =
              | I.Kpushtrap lab -> I.Kpushtrap (map_label lab)
              | _ -> instr
          ) in
-  (all_instrs, !all_labels)
+  (all_instrs, !all_labels, ext_map_label)
 
-
-
+let defname_of_label exec map_label =
+  (* let rec search_label pos =
+    try map_label pos
+    with Not_found when pos >= 0 -> search_label (pos-1) in
+   *)
+  let ht = Hashtbl.create 7 in
+  Hashtbl.iter
+    (fun pos defname ->
+      try
+        let lab = map_label pos in
+        try
+          let (old_pos, _) = Hashtbl.find ht lab in
+          if pos < old_pos then
+            Hashtbl.replace ht lab (pos, defname)
+        with
+          | Not_found ->
+              Hashtbl.add ht lab (pos, defname)
+      with
+        | Not_found ->
+            ()
+    )
+    exec.debug;
+  (fun lab ->
+    try
+      snd(Hashtbl.find ht lab)
+    with
+      | Not_found ->
+          snd(Hashtbl.find ht (lab+1))
+  )
