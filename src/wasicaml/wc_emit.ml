@@ -153,6 +153,8 @@ type state =
      *)
     camldepth : int;
     (* = List.length camlstack *)
+    maxdepth : int;
+    (* maximum depth *)
     realstack : ISet.t;
     (* which real stack positions have been initialized *)
     accu : store;
@@ -235,6 +237,7 @@ let new_local lpad vtype =
 let empty_state =
   { camlstack = [];
     camldepth = 0;
+    maxdepth = 0;
     realstack = ISet.empty;
     accu = RealAccu;
     realaccu = ISet.empty;
@@ -322,8 +325,11 @@ let push_global_field_addr var_base field =
     L [ K "i32.add" ]
   ]
 
-let push_stack pos =
-  push_field "fp" pos
+let push_stack state pos =
+  if pos >= 0 then
+    push_field "fp" pos
+  else
+    push_field "bp" (pos + state.maxdepth)
 
 let push_domain_field field =
   [ L [ K "global.get"; ID "wasicaml_domain_state" ];
@@ -375,8 +381,11 @@ let pop_to_domain_field field =
       ];
   ]
 
-let pop_to_stack pos =
-  pop_to_field "fp" pos
+let pop_to_stack state pos =
+  if pos >= 0 then
+    pop_to_field "fp" pos
+  else
+    pop_to_field "bp" (pos + state.maxdepth)
 
 let load_double =
   [ L [ K "f64.load";
@@ -403,7 +412,7 @@ let stack_init gpad lpad state realdepth =
       let pos = -k in
       let is_used = ISet.mem pos state.realstack in
       ( if not is_used then
-          push_const 1l @ pop_to_stack pos
+          push_const 1l @ pop_to_stack state pos
         else
           []
       ) @ gen_init (k-1)
@@ -422,11 +431,11 @@ let setup_for_gc gpad lpad state realdepth =
     stack_init gpad lpad state realdepth in
   let sexpl_accu =
     if accu_contains_value then
-      push_local "accu" @ pop_to_stack (-realdepth-1)
+      push_local "accu" @ pop_to_stack state (-realdepth-1)
     else
       [] in
   let sexpl_env =
-    push_local "env" @ pop_to_stack (-realdepth-sp_decr) in
+    push_local "env" @ pop_to_stack state (-realdepth-sp_decr) in
   let sexpl_extern_sp =
     [ L [ K "local.get";
           ID "fp";
@@ -445,18 +454,18 @@ let restore_after_gc gpad lpad state realdepth =
     if accu_contains_value then 2 else 1 in
   let sexpl_accu =
     if accu_contains_value then
-      push_stack (-realdepth-1) @ pop_to_local "accu"
+      push_stack state (-realdepth-1) @ pop_to_local "accu"
     else
       [] in
   let sexpl_env =
-    push_stack (-realdepth-sp_decr) @ pop_to_local "env" in
+    push_stack state (-realdepth-sp_decr) @ pop_to_local "env" in
   sexpl_accu @ sexpl_env
 
 let setup_for_c_call gpad lpad state extra realdepth =
   let sexpl_stack =
     stack_init gpad lpad state realdepth in
   let sexpl_env =
-    push_local "env" @ pop_to_stack (-realdepth-1-extra) in
+    push_local "env" @ pop_to_stack state (-realdepth-1-extra) in
   let sexpl_extern_sp =
     [ L [ K "local.get";
           ID "fp";
@@ -470,7 +479,7 @@ let setup_for_c_call gpad lpad state extra realdepth =
   sexpl_stack @ sexpl_env @ sexpl_extern_sp
 
 let restore_after_c_call gpad lpad state extra realdepth =
-  push_stack (-realdepth-1-extra) @ pop_to_local "env"
+  push_stack state (-realdepth-1-extra) @ pop_to_local "env"
 
 let alloc_atom gpad lpad state tag =
   let ptr = new_local lpad TI32 in
@@ -544,9 +553,9 @@ let alloc_slow =
           ]
           @ pop_to_domain_field domain_field_extern_sp
           @ push_local "accu"
-          @ pop_to_stack 4
+          @ pop_to_field "fp" 4
           @ push_local "env"
-          @ pop_to_stack 0;
+          @ pop_to_field "fp" 0;
 
           (* caml_alloc_small_dispatch(size, CAML_FROM_C, 1, NULL); *)
           [ L [ K "local.get"; ID "size" ];
@@ -661,7 +670,12 @@ let grab_helper gpad =
             L [ K "result"; K "i32" ];
             L [ K "local"; ID "accu"; K "i32" ];
             L [ K "local"; ID "i"; K "i32" ];
+            L [ K "local"; ID "bp"; K "i32" ];
             L [ K "local"; ID "h.i32"; K "i32" ];
+          ];
+
+          [ L [ K "local.get"; ID "fp" ];
+            L [ K "local.set"; ID "bp" ]  (* used in setup_for_gc *)
           ];
 
           setup_for_gc gpad lpad state 0;
@@ -1048,7 +1062,7 @@ let flush_accu gpad lpad state =
   let sexpll =
     ISet.fold
       (fun pos sexpl_acc ->
-        let sexpl = push_local "accu" @ pop_to_stack pos in
+        let sexpl = push_local "accu" @ pop_to_stack state pos in
         sexpl :: sexpl_acc
       )
       state.realaccu
@@ -1083,7 +1097,7 @@ let push gpad lpad state store =
     | Const x ->
         push_const (Int32.of_int x)
     | RealStack pos ->
-        push_stack pos
+        push_stack state pos
     | Invalid ->
         (* FIXME: assert false *)
         push_local "invalid"
@@ -1150,7 +1164,7 @@ let straighten_stack_at gpad lpad state pos =
   let k = pos + state.camldepth in
   let store = List.nth state.camlstack k in
   let sexpl_push = push_as gpad lpad state store RValue in
-  let sexpl_pop = pop_to_stack pos in
+  let sexpl_pop = pop_to_stack state pos in
   let state =
     { state with
       camlstack = set_camlstack pos (RealStack pos) state;
@@ -1408,7 +1422,7 @@ let c_call gpad lpad state name num_args =
       let sexpl_restore = restore_after_c_call gpad lpad state 1 state.camldepth in
       let sexpl_accu =
         push_as gpad lpad state state.accu RValue
-        @ pop_to_stack (-state.camldepth-1) in
+        @ pop_to_stack state (-state.camldepth-1) in
       let ty =
         [ L [ K "param"; K "i32" ];
           L [ K "param"; K "i32" ];
@@ -1587,7 +1601,7 @@ let return =
     L [ K "return" ];
   ]
 
-let apply_code lpad extra_args sp_decr env_pos =
+let apply_code lpad state extra_args sp_decr env_pos =
   let codeptr = new_local lpad TI32 in
   [ L [ K "local.get"; ID "accu" ];
     L [ K "i32.const"; N (I32 (Int32.of_int extra_args)) ];
@@ -1627,7 +1641,7 @@ let apply_code lpad extra_args sp_decr env_pos =
       L [ K "local.set"; ID "accu" ];
     ]
   (* @ debug2_var 51 "accu" *)
-  @ push_stack env_pos   (* env might have been moved by GC *)
+  @ push_stack state env_pos   (* env might have been moved by GC *)
   @ pop_to_local "env"
 
 let apply123 gpad lpad state num =
@@ -1636,19 +1650,19 @@ let apply123 gpad lpad state num =
     enum 0 num
     |> List.map
          (fun k ->
-           push_stack (-state.camldepth+k)
-           @ pop_to_stack (-state.camldepth+k-3)
+           push_stack state (-state.camldepth+k)
+           @ pop_to_stack state (-state.camldepth+k-3)
          )
     |> List.flatten in
   let sexpl_frame =
     push_const 1l   (* instead of pc *)
-    @ pop_to_stack (-state.camldepth+num-3)
+    @ pop_to_stack state (-state.camldepth+num-3)
     @ push_local "env"
-    @ pop_to_stack (-state.camldepth+num-2)
+    @ pop_to_stack state (-state.camldepth+num-2)
     @ push_const 1l  (* instead of extra_args *)
-    @ pop_to_stack (-state.camldepth+num-1) in
+    @ pop_to_stack state (-state.camldepth+num-1) in
   let sexpl_call =
-    apply_code lpad (num-1) (state.camldepth+3) (-state.camldepth+num-2) in
+    apply_code lpad state (num-1) (state.camldepth+3) (-state.camldepth+num-2) in
   let sexpl = sexpl_str @ sexpl_move @ sexpl_frame @ sexpl_call in
   let state = popn_camlstack state num in
   (state, sexpl)
@@ -1656,7 +1670,7 @@ let apply123 gpad lpad state num =
 let apply4plus gpad lpad state num =
   let state, sexpl_str = straighten_all gpad lpad state in
   let sexpl =
-    apply_code lpad (num-1) state.camldepth (-state.camldepth + num + 1) in
+    apply_code lpad state (num-1) state.camldepth (-state.camldepth + num + 1) in
   let state = popn_camlstack state (num+3) in
   (state, sexpl_str @ sexpl)
 
@@ -1801,7 +1815,7 @@ let closurerec gpad lpad state func_labs nvars =
              @ pop_to_field "accu" (3*i+1) in
            let sexpl_addr =
              push_field_addr "accu" (3*i)
-             @ pop_to_stack (-state.camldepth-1) in
+             @ pop_to_stack state (-state.camldepth-1) in
            let sexpl_infix =
              push_const (Int32.of_int (make_header (i*3) infix_tag))
              @ pop_to_field "accu" (3*i-1) in
@@ -2234,11 +2248,11 @@ let emit_instr gpad lpad state instr =
         let d = state.camldepth in
         let sexpl =
           push_const 1l
-          @ pop_to_stack (-d-1)
+          @ pop_to_stack state (-d-1)
           @ push_local "env"
-          @ pop_to_stack (-d-2)
+          @ pop_to_stack state (-d-2)
           @ push_const 1l
-          @ pop_to_stack (-d-1) in
+          @ pop_to_stack state (-d-1) in
         let state =
           { state with
             camlstack = RealStack(-d-3) ::
@@ -2333,13 +2347,13 @@ let emit_trap gpad lpad state trylabel catchlabel =
   let state, sexpl_str = straighten_all gpad lpad state in
   let sexpl_stack =
     push_const 0l
-    @ pop_to_stack (-state.camldepth-1)
+    @ pop_to_stack state (-state.camldepth-1)
     @ push_const 0l
-    @ pop_to_stack (-state.camldepth-2)
+    @ pop_to_stack state (-state.camldepth-2)
     @ push_local "env"
-    @ pop_to_stack (-state.camldepth-3)
+    @ pop_to_stack state (-state.camldepth-3)
     @ push_local "extra_args"
-    @ pop_to_stack (-state.camldepth-4) in
+    @ pop_to_stack state (-state.camldepth-4) in
   let sexpl_try =
     push_wasmptr gpad trylabel
     @ push_local "env"
@@ -2354,7 +2368,7 @@ let emit_trap gpad lpad state trylabel catchlabel =
         L [ K "local.set"; ID local ];
       ]
     (* @ debug2 30 1 *)
-    @ push_stack (-state.camldepth-3)
+    @ push_stack state (-state.camldepth-3)
     @ pop_to_local "env"
     @ [ L [ K "local.get"; ID local ];
         L [ K "if";
@@ -2398,6 +2412,8 @@ let emit_fblock gpad lpad fblock =
   let depth_table = Hashtbl.create 7 in
   (* maps label to depth of camlstack *)
 
+  let maxdepth = Wc_tracestack.max_stack_depth_of_fblock fblock in
+
   let get_state label =
     let camldepth =
       try Hashtbl.find depth_table label
@@ -2412,6 +2428,7 @@ let emit_fblock gpad lpad fblock =
            ISet.empty in
     { camlstack;
       camldepth;
+      maxdepth;
       realstack;
       accu = RealAccu;
       realaccu = ISet.empty
@@ -2500,7 +2517,12 @@ let emit_fblock gpad lpad fblock =
       | None, None ->
           inner_sexpl in
 
-  emit_block fblock.block ISet.empty
+  [ L [ K "local.get"; ID "fp" ];
+    L [ K "i32.const"; N (I32 (Int32.of_int (4 * maxdepth))) ];
+    L [ K "i32.sub" ];
+    L [ K "local.set"; ID "bp" ];
+  ]
+  @ emit_block fblock.block ISet.empty
 
 let get_funcmapping scode =
   let open Wc_control in
@@ -2577,6 +2599,7 @@ let cond_loop cond label sexpl =
 let generate_function scode gpad letrec_label func_name subfunc_labels export_flag =
   let lpad = empty_lpad() in
   Hashtbl.add lpad.locals "accu" TI32;
+  Hashtbl.add lpad.locals "bp" TI32;
   Hashtbl.add lpad.locals "h.i32" TI32;
   Hashtbl.add lpad.locals "h.f64" TF64;
 
