@@ -2,6 +2,7 @@ open Printf
 open Wc_types
 open Wc_number
 open Wc_sexp
+open Wc_instruct
 
 (* TODO:
    - create global wasicaml_global_data and initialize it with &caml_global_data
@@ -53,15 +54,8 @@ let zero_expr_of_vtype =
   | TI64 -> [ L [ K "i64.const"; N (I64 0L) ] ]
   | TF64 -> [ L [ K "f64.const"; N (F64 0.0) ] ]
 
-type wasm_func_type =
-  | TFunc of { args: wasm_value_type list; results: wasm_value_type list }
-
 type gpad =  (* global pad *)
-  { (* functypes : (wasm_func_type, int) Hashtbl.t;
-       functions : (string, func) Hashtbl.t;
-       globals : (string, global) Hashtbl.t;
-     *)
-    letrec_name : (int, string) Hashtbl.t;
+  { letrec_name : (int, string) Hashtbl.t;
     (* maps letrec label to name *)
     primitives : (string, sexp list) Hashtbl.t;
     (* maps name to type *)
@@ -73,44 +67,13 @@ type gpad =  (* global pad *)
     (* maps letrec label to the (relative) index in the table of functions *)
   }
 
- and func =
-   { func_type : wasm_func_type;
-     func_def : entity;
-   }
-
- and global =
-   { global_mut : bool;
-     global_type : wasm_value_type;
-     global_def : entity
-   }
-
- and entity =
-   | Imported of string   (* module name *)
-   | Defined of sexp
-
-type lpad =  (* local pad *)
-  { locals : (string, wasm_value_type) Hashtbl.t;
-    mutable loops : ISet.t;
+type fpad =  (* function pad *)
+  { lpad : Wc_unstack.lpad;
+    mutable maxdepth : int;
     mutable need_appterm_common : bool;
     mutable need_return : bool;
     mutable need_panic : bool;
   }
-
-type repr =
-  | RValue
-    (* a pointer to an OCaml block, or an OCaml integer when LSB=1 *)
-  | RInt
-    (* an I32 integer that needs to be converted to an OCaml integer *)
-  | RIntVal
-    (* an I32 integer that is already converted to an OCaml integer *)
-  | RNatInt
-    (* an I32 integer that will be stored as nativeint block *)
-  | RInt32
-    (* an I32 integer that will be stored as int32 block *)
-  | RInt64
-    (* an I64 integer that will be stored as int64 block *)
-  | RFloat
-    (* an F64 number that will be stored as float block *)
 
 (* Stack layout of a function with N arguments:
 
@@ -127,44 +90,6 @@ type repr =
    - fp-camldepth-1 etc:     free
  *)
 
-
-type store =
-  | RealStack of int
-    (* it's on the real OCaml stack at the given position, i.e. at fp[pos] *)
-  | RealAccu
-    (* stored in the accu variable as RValue *)
-  | Const of int
-    (* it's a constant *)
-  | Local of repr * string
-    (* stored in a local variable with the given name.
-       There cannot be heap-allocated values in local variables, i.e.
-       repr=RValue is forbidden.
-     *)
-  | Invalid
-
-type state =
-  { camlstack : store list;
-    (* where the contents are stored that are supposed to be on the
-       OCaml stack - in top to bottom order.
-       If an OCaml stack value is stored in the real stack, it is only
-       allowed to store it at its original position - in other words,
-       swapping of values is not allowed. Formally, if element k is
-       set to store=RealStack(pos), then pos=-camldepth+k.
-     *)
-    camldepth : int;
-    (* = List.length camlstack *)
-    maxdepth : int;
-    (* maximum depth *)
-    realstack : ISet.t;
-    (* which real stack positions have been initialized *)
-    accu : store;
-    (* where the accu is stored *)
-    realaccu : ISet.t;
-    (* in which stack positions the "accu" variable must be saved on flush.
-       If additionally accu=RealAccu, the "accu" variable also keeps the
-       logical accu value.
-     *)
-  }
 
 let enable_multireturn = ref false
 (* whether Wasm code can use multivalue returns *)
@@ -205,20 +130,6 @@ let make_header size tag =
   (* color=white *)
   (size lsl 10) lor tag
 
-let rec enum k n =
-  if n > 0 then
-    k :: enum (k+1) (n-1)
-  else
-    []
-
-let repr_of_store =
-  function
-  | RealStack _ -> RValue
-  | Const _ -> RInt
-  | Local(repr, _) -> repr
-  | RealAccu -> RValue
-  | Invalid -> RValue (* FIXME: assert false *)
-
 let vtype repr =
   match repr with
     | RValue | RInt | RIntVal | RNatInt | RInt32 ->
@@ -228,37 +139,16 @@ let vtype repr =
     | RFloat ->
         TF64
 
-let new_local lpad vtype =
-  let k = Hashtbl.length lpad.locals in
-  let s = sprintf "x%d" k in
-  Hashtbl.add lpad.locals s vtype;
-  s
-
-let empty_state =
-  { camlstack = [];
-    camldepth = 0;
+let empty_fpad() =
+  { lpad = Wc_unstack.empty_lpad();
     maxdepth = 0;
-    realstack = ISet.empty;
-    accu = RealAccu;
-    realaccu = ISet.empty;
-  }
-
-let empty_lpad() =
-  { locals = Hashtbl.create 7;
-    loops = ISet.empty;
     need_appterm_common = false;
     need_return = false;
     need_panic = false;
   }
 
-let realdepth state =
-  (* how many stack positions are really used, counted from the bottom? *)
-  match ISet.min_elt_opt state.realstack with
-    | None ->
-        0
-    | Some pos ->
-        assert(pos < 0);
-        -pos
+let new_local fpad repr =
+  Wc_unstack.new_local fpad.lpad repr
 
 let push_const n =
   [ L [ K "i32.const";
@@ -325,11 +215,11 @@ let push_global_field_addr var_base field =
     L [ K "i32.add" ]
   ]
 
-let push_stack state pos =
+let push_stack fpad pos =
   if pos >= 0 then
     push_field "fp" pos
   else
-    push_field "bp" (pos + state.maxdepth)
+    push_field "bp" (pos + fpad.maxdepth)
 
 let push_domain_field field =
   [ L [ K "global.get"; ID "wasicaml_domain_state" ];
@@ -381,11 +271,11 @@ let pop_to_domain_field field =
       ];
   ]
 
-let pop_to_stack state pos =
+let pop_to_stack fpad pos =
   if pos >= 0 then
     pop_to_field "fp" pos
   else
-    pop_to_field "bp" (pos + state.maxdepth)
+    pop_to_field "bp" (pos + fpad.maxdepth)
 
 let load_double =
   [ L [ K "f64.load";
@@ -405,94 +295,66 @@ let debug2_var x0 var =
     L [ K "call"; ID "debug2" ]
   ]
 
-let stack_init gpad lpad state realdepth =
+let stack_init fpad descr =
   (* put zeros into the uninitialized stack positions *)
   let rec gen_init k =
     if k >= 1 then
       let pos = -k in
-      let is_used = ISet.mem pos state.realstack in
+      let is_used = ISet.mem pos descr.stack_init in
       ( if not is_used then
-          push_const 1l @ pop_to_stack state pos
+          push_const 1l @ pop_to_stack fpad pos
         else
           []
       ) @ gen_init (k-1)
     else
       [] in
-  gen_init realdepth
+  gen_init descr.stack_depth
 
-let whether_accu_contains_value state =
-  state.realaccu <> ISet.empty || state.accu = RealAccu
-
-let setup_for_gc gpad lpad state realdepth =
-  let accu_contains_value = whether_accu_contains_value state in
+let setup_for_gc fpad descr =
   let sp_decr =
-    if accu_contains_value then 2 else 1 in
+    if descr.stack_save_accu then 2 else 1 in
   let sexpl_stack =
-    stack_init gpad lpad state realdepth in
+    stack_init fpad descr in
   let sexpl_accu =
-    if accu_contains_value then
-      push_local "accu" @ pop_to_stack state (-realdepth-1)
+    if descr.stack_save_accu then
+      push_local "accu" @ pop_to_stack fpad (-descr.stack_depth-1)
     else
       [] in
   let sexpl_env =
-    push_local "env" @ pop_to_stack state (-realdepth-sp_decr) in
+    push_local "env" @ pop_to_stack fpad (-descr.stack_depth-sp_decr) in
   let sexpl_extern_sp =
     [ L [ K "local.get";
           ID "fp";
         ];
       L [ K "i32.const";
-          N (I32 (Int32.of_int ( 4 * (realdepth + sp_decr))));
+          N (I32 (Int32.of_int ( 4 * (descr.stack_depth + sp_decr))));
         ];
       L [ K "i32.sub" ];
     ]
     @ pop_to_domain_field domain_field_extern_sp in
   sexpl_stack @ sexpl_accu @ sexpl_env @ sexpl_extern_sp
 
-let restore_after_gc gpad lpad state realdepth =
-  let accu_contains_value = whether_accu_contains_value state in
+let restore_after_gc fpad descr =
   let sp_decr =
-    if accu_contains_value then 2 else 1 in
+    if descr.stack_save_accu then 2 else 1 in
   let sexpl_accu =
-    if accu_contains_value then
-      push_stack state (-realdepth-1) @ pop_to_local "accu"
+    if descr.stack_save_accu then
+      push_stack fpad (-descr.stack_depth-1) @ pop_to_local "accu"
     else
       [] in
   let sexpl_env =
-    push_stack state (-realdepth-sp_decr) @ pop_to_local "env" in
+    push_stack fpad (-descr.stack_depth-sp_decr) @ pop_to_local "env" in
   sexpl_accu @ sexpl_env
 
-let setup_for_c_call gpad lpad state extra realdepth =
-  let sexpl_stack =
-    stack_init gpad lpad state realdepth in
-  let sexpl_env =
-    push_local "env" @ pop_to_stack state (-realdepth-1-extra) in
-  let sexpl_extern_sp =
-    [ L [ K "local.get";
-          ID "fp";
-        ];
-      L [ K "i32.const";
-          N (I32 (Int32.of_int ( 4 * (realdepth + extra + 1))));
-        ];
-      L [ K "i32.sub" ];
-    ]
-    @ pop_to_domain_field domain_field_extern_sp in
-  sexpl_stack @ sexpl_env @ sexpl_extern_sp
-
-let restore_after_c_call gpad lpad state extra realdepth =
-  push_stack state (-realdepth-1-extra) @ pop_to_local "env"
-
-let alloc_atom gpad lpad state tag =
-  let ptr = new_local lpad TI32 in
-  let code =
-    [ L [ K "global.get";
-          ID "wasicaml_atom_table";
-        ];
-      L [ K "i32.const";
-          N (I32 (Int32.of_int (4 * tag)));
-        ];
-      L [ K "i32.add" ];
-    ] in
-  (code, ptr, false)
+let alloc_atom fpad tag =
+  [ L [ K "global.get";
+        ID "wasicaml_atom_table";
+      ];
+    L [ K "i32.const";
+        N (I32 (Int32.of_int (4 * tag)));
+      ];
+    L [ K "i32.add" ];
+  ]
 
 let alloc_decr =
   [ L [ K "func";
@@ -591,13 +453,12 @@ let call_alloc_slow =
       ]
 
 
-let alloc_non_atom gpad lpad state size tag =
+let alloc_non_atom fpad descr size tag =
   (* TODO: use new push/pop functions *)
-  let ptr = new_local lpad TI32 in
+  let ptr = new_local fpad RValue in
   let young = size <= max_young_wosize in
   let code =
     if young then
-      let rdepth = realdepth state in
       [ [ L [ K "i32.const";
               N (I32 (Int32.of_int (4 * (size+1))));
             ];
@@ -612,10 +473,10 @@ let alloc_non_atom gpad lpad state size tag =
               L ( [ [
                       K "then";
                     ];
-                    stack_init gpad lpad state rdepth;
+                    stack_init fpad descr;
                     push_const (Int32.of_int size);
                     push_local "fp";
-                    push_const (Int32.of_int (4 * rdepth));
+                    push_const (Int32.of_int (4 * descr.stack_depth));
                     push_local "accu";
                     push_local "env";
                     call_alloc_slow;
@@ -642,14 +503,16 @@ let alloc_non_atom gpad lpad state size tag =
       ] in
   (code, ptr, young)
 
-let alloc gpad lpad state size tag =
+let alloc fpad descr size tag =
   if size = 0 then
-    alloc_atom gpad lpad state tag
+    let ptr = new_local fpad RValue in
+    let young = false in
+    (alloc_atom fpad tag, ptr, young)
   else
-    alloc_non_atom gpad lpad state size tag
+    alloc_non_atom fpad descr size tag
 
-let alloc_set gpad lpad state size tag =
-  let (code, ptr, young) = alloc gpad lpad state size tag in
+let alloc_set fpad descr size tag =
+  let (code, ptr, young) = alloc fpad descr size tag in
   let code = code @ [ L [ K "local.set"; ID ptr ]] in
   (code, ptr, young)
 
@@ -657,8 +520,9 @@ let grab_helper gpad =
   (* generates a helper function:
      $grab_helper(env, extra_args, codeptr, fp)
    *)
-  let state = { empty_state with accu = Invalid } in
-  let lpad = empty_lpad() in
+  let fpad = empty_fpad() in
+  let descr = empty_descr in
+  assert(descr.stack_save_accu = false);
 
   [ L ( [ [ K "func";
             ID "grab_helper";
@@ -678,7 +542,7 @@ let grab_helper gpad =
             L [ K "local.set"; ID "bp" ]  (* used in setup_for_gc *)
           ];
 
-          setup_for_gc gpad lpad state 0;
+          setup_for_gc fpad descr;
           [ L [ K "local.get"; ID "extra_args" ];
             L [ K "i32.const"; N (I32 4l) ];
             L [ K "i32.add" ];
@@ -686,7 +550,7 @@ let grab_helper gpad =
             L [ K "call"; ID "caml_alloc_small" ];
             L [ K "local.set"; ID "accu" ];
           ];
-          restore_after_gc gpad lpad state 0;  (* won't overwrite accu *)
+          restore_after_gc fpad descr;  (* won't overwrite accu *)
 
           push_local "env";
           pop_to_field "accu" 2;
@@ -945,7 +809,7 @@ let wasicaml_init =
   ]
 
 
-let tovalue repr =
+let tovalue_alloc fpad repr descr_opt =
   (* transform the value of the Wasm stack to a proper OCaml value,
      and put that back on the Wasm stack *)
   match repr with
@@ -961,6 +825,21 @@ let tovalue repr =
             ];
           L [ K "i32.or" ];
         ]
+    | RFloat ->
+        ( match descr_opt with
+            | None -> failwith "cannot convert to double w/o stack descr"
+            | Some descr ->
+                let (instrs_alloc, _, _) =
+                  alloc fpad descr double_size double_tag in
+                let local = new_local fpad RFloat in
+                let instrs =
+                  [ L [ K "local.set"; ID local ] ]
+                  @ instrs_alloc
+                  @ [ L [ K "local.get"; ID local ];
+                      L [ K "f64.store"; K "align=2" ];
+                    ] in
+                instrs
+        )
     | _ ->
         (* TODO: need to allocate the block *)
         (* Careful: when allocating a block and initializing it,
@@ -971,6 +850,9 @@ let tovalue repr =
            positions that are neither RValue nor RInt.
          *)
         assert false
+
+let tovalue fpad repr =
+  tovalue_alloc fpad repr None
 
 let toint repr =
   match repr with
@@ -985,109 +867,23 @@ let toint repr =
     | _ ->
         assert false
 
-let convert repr_from repr_to =
+let tofloat repr =
+  match repr with
+    | RValue ->
+        load_double
+    | _ ->
+        assert false
+
+let convert fpad repr_from repr_to descr_opt =
   (* convert the value on the wasm stack, from repr_from to repr_to *)
   match repr_to with
-    | RValue | RIntVal -> tovalue repr_from
+    | RValue | RIntVal -> tovalue_alloc fpad repr_from descr_opt
     | RInt -> toint repr_from
+    | RFloat -> tofloat repr_from
     | _ ->
         assert false (* TODO *)
 
-let set_camlstack pos store state =
-  let cd = state.camldepth in
-  if pos >= (-cd) && pos <= (-1) then
-    let camlstack =
-      List.mapi
-        (fun i old_store ->
-          if (-cd+i) = pos then store else old_store
-        )
-        state.camlstack in
-    camlstack
-  else
-    state.camlstack
-
-let pop_camlstack state =
-  let cd = state.camldepth in
-  let cpos = (-cd) in
-  match state.camlstack with
-    | RealStack pos :: tl ->
-        { state with
-          camlstack = tl;
-          camldepth = cd - 1;
-          realstack = ISet.remove pos state.realstack;
-          realaccu = ISet.remove cpos state.realaccu;
-        }
-    | RealAccu :: tl ->
-        { state with
-          camlstack = tl;
-          camldepth = cd - 1;
-          realaccu = ISet.remove cpos state.realaccu;
-        }
-    | (Const _ | Local _ | Invalid) :: tl ->
-        { state with camlstack = tl; camldepth = cd - 1 }
-    | [] ->
-        assert false
-
-let rec popn_camlstack state number =
-  if number = 0 then
-    state
-  else
-    popn_camlstack (pop_camlstack state) (number-1)
-
-let push_camlstack store state =
-  let cd = state.camldepth in
-  let cpos = (-cd-1) in
-  match store with
-    | RealStack pos ->
-        { state with
-          camlstack = store :: state.camlstack;
-          camldepth = cd + 1;
-          realstack = ISet.add pos state.realstack;
-        }
-    | RealAccu ->
-        { state with
-          camlstack = store :: state.camlstack;
-          camldepth = cd + 1;
-          realaccu = ISet.add cpos state.realaccu;
-        }
-    | (Const _ | Local _ | Invalid) ->
-        { state with
-          camlstack = store :: state.camlstack;
-          camldepth = cd + 1;
-        }
-
-let flush_accu gpad lpad state =
-  (* If the accu is not yet saved, do this now. This function needs to be called
-     before setting the accu to a new value. *)
-  let sexpll =
-    ISet.fold
-      (fun pos sexpl_acc ->
-        let sexpl = push_local "accu" @ pop_to_stack state pos in
-        sexpl :: sexpl_acc
-      )
-      state.realaccu
-      [] in
-  let sexpl =
-    List.rev sexpll |> List.flatten in
-  let camlstack =
-    List.mapi
-      (fun i old ->
-        let pos = (-state.camldepth+i) in
-        if ISet.mem pos state.realaccu then
-          RealStack pos
-        else
-          old
-      )
-      state.camlstack in
-  let state =
-    { state with
-      camlstack;
-      realaccu = ISet.empty;
-      realstack = ISet.union state.realstack state.realaccu;
-    } in
-  (state, sexpl)
-
-let push gpad lpad state store =
+let push fpad store =
   (* put the value in store onto the wasm stack *)
   match store with
     | RealAccu ->
@@ -1097,107 +893,49 @@ let push gpad lpad state store =
     | Const x ->
         push_const (Int32.of_int x)
     | RealStack pos ->
-        push_stack state pos
-    | Invalid ->
-        (* FIXME: assert false *)
-        push_local "invalid"
+        push_stack fpad pos
+    | Atom tag ->
+        alloc_atom fpad tag
 
-let push_as gpad lpad state store req_repr =
+let push_alloc_as fpad store req_repr descr_opt =
   match store, req_repr with
     | Const x, (RValue | RIntVal) ->
         push_const (Int32.logor (Int32.shift_left (Int32.of_int x) 1) 1l)
     | _ ->
-        let sexpl_push = push gpad lpad state store in
+        let sexpl_push = push fpad store in
         let repr = repr_of_store store in
-        sexpl_push @ convert repr req_repr
+        sexpl_push @ convert fpad repr req_repr descr_opt
 
-let straighten_accu gpad lpad state =
-  (* if the accu is stored elsewhere, load it now into "accu". This function
-     needs to be called before doing something with the value in the accu
-   *)
-  let state, sexpl_flush = flush_accu gpad lpad state in
-  match state.accu with
+let push_as fpad store req_repr =
+  push_alloc_as fpad store req_repr None
+
+let pop_to fpad store repr descr_opt =
+  match store with
     | RealAccu ->
-        (state, [])
-    | Local _ | Const _ ->
-        let sexpl_push = push_as gpad lpad state state.accu RValue in
-        let state = { state with accu = RealAccu } in
-        let sexpl_pop = pop_to_local "accu" in
-        (state, sexpl_flush @ sexpl_push @ sexpl_pop)
+        tovalue_alloc fpad repr descr_opt
+        @ pop_to_local "accu"
+    | Local(lrepr, name) ->
+        convert fpad repr lrepr descr_opt
+        @ pop_to_local name
     | RealStack pos ->
-        let sexpl_push = push_as gpad lpad state state.accu RValue in
-        let state = { state with accu = RealAccu } in
-        let sexpl_pop = pop_to_local "accu" in
-        (state, sexpl_flush @ sexpl_push @ sexpl_pop)
-    | Invalid ->
-        (* FIXME: assert false *)
-        (state, [])
-
-let straighten_accu_when_on_stack gpad lpad state =
-  (* Load the accu if it is stored in the real stack. This is needed before
-     renaming the accu into another stack position, in order to enforece
-     the "no swapping of stack positions" rule.
-   *)
-  match state.accu with
-    | RealStack _ ->
-        straighten_accu gpad lpad state
+        tovalue_alloc fpad repr descr_opt
+        @ pop_to_stack fpad pos
     | _ ->
-        (state, [])
+        assert false
 
-let flush_real_stack gpad lpad state pos_from pos_to =
-  (* Ensure that values stored at pos_from...pos_to are saved to their
-     real stores, so that the real stack at pos_from...pos_to can be
-     overwritten.
-
-     Essentially, this can only be the accu (because of the "no swapping
-     of stack positions" rule).
-   *)
-  match state.accu with
-    | RealStack pos when pos >= pos_from && pos <= pos_to ->
-        straighten_accu gpad lpad state
+let copy fpad src dest descr_opt =
+  match dest with
+    | RealAccu ->
+        push_as fpad src RValue
+        @ pop_to_local "accu"
+    | Local(repr, name) ->
+        push_as fpad src repr
+        @ pop_to_local name
+    | RealStack pos ->
+        push_as fpad src RValue
+        @ pop_to_stack fpad pos
     | _ ->
-        (state, [])
-
-let straighten_stack_at gpad lpad state pos =
-  (* ensure that the caml stack for pos is set to the real stack *)
-  let state, sexpl_flush = flush_real_stack gpad lpad state pos pos in
-  let k = pos + state.camldepth in
-  let store = List.nth state.camlstack k in
-  let sexpl_push = push_as gpad lpad state store RValue in
-  let sexpl_pop = pop_to_stack state pos in
-  let state =
-    { state with
-      camlstack = set_camlstack pos (RealStack pos) state;
-      realstack = ISet.add pos state.realstack;
-    } in
-  let sexpl =
-    sexpl_flush @ sexpl_push @ sexpl_pop in
-  (state, sexpl)
-
-let straighten_stack_multi gpad lpad state pos_list =
-  List.fold_left
-    (fun (state, acc) pos ->
-      let (state, sexpl) = straighten_stack_at gpad lpad state pos in
-      (state, acc @ sexpl)
-    )
-    (state, [])
-    pos_list
-
-let straighten_all gpad lpad state =
-  let rec recurse state camlstack pos =
-    match camlstack with
-      | RealStack p :: camlstack' ->
-          assert(p = pos);
-          recurse state camlstack' (pos+1)
-      | store :: camlstack' ->
-          let state, sexpl1 = straighten_stack_at gpad lpad state pos in
-          let state, sexpl2 = recurse state camlstack' (pos+1) in
-          (state, sexpl1 @ sexpl2)
-      | [] ->
-          (state, []) in
-  let state, sexpl_accu = straighten_accu gpad lpad state in
-  let state, sexpl_stack = recurse state state.camlstack (-state.camldepth) in
-  (state, sexpl_accu @ sexpl_stack)
+        assert false
 
 let rec drop n l =
   if n > 0 then
@@ -1206,6 +944,201 @@ let rec drop n l =
       | [] -> []
   else
     l
+
+let emit_unary fpad op src1 dest =
+  match op with
+    | Pnegint ->
+        push_as fpad src1 RIntVal
+        @  [ L [ K "i32.const";
+                 N (I32 (0xffff_fffel));
+               ];
+             L [ K "i32.xor" ];
+             L [ K "i32.const";
+                 N (I32 2l);
+               ];
+             L [ K "i32.add" ];
+           ]
+        @ pop_to fpad dest RIntVal None
+    | Pboolnot ->
+        push_as fpad src1 RIntVal
+        @ [ L [ K "i32.const";
+                N (I32 2l);
+              ];
+            L [ K "i32.xor" ]
+          ]
+        @ pop_to fpad dest RIntVal None
+    | Poffsetint offset ->
+        push_as fpad src1 RIntVal
+        @ [ L [ K "i32.const";
+                N (I32 (Int32.shift_left (Int32.of_int offset) 1));
+              ];
+            L [ K "i32.add" ]
+          ]
+        @ pop_to fpad dest RIntVal None
+    | Pisint ->
+        push_as fpad src1 RValue
+        @ [ L [ K "i32.const"; N (I32 1l) ];
+            L [ K "i32.and" ];
+          ]
+        @ pop_to fpad dest RInt None
+    | Pgetfield field ->
+        assert(field >= 0);
+        push_as fpad src1 RValue
+        @ [ L [ K "i32.load";
+                K (sprintf "offset=0x%lx" (Int32.of_int (4 * field)));
+                K "align=2";
+              ];
+          ]
+        @ pop_to fpad dest RValue None
+    | Pgetfloatfield field ->
+        (* dest is here a Local(RFloat,_), so no allocation needed *)
+        ( match dest with
+            | Local(RFloat, name) ->
+                push_as fpad src1 RValue
+                @ [ L [ K "f64.load";
+                        K (sprintf "offset=0x%lx" (Int32.of_int (4 * double_size * field)));
+                        K "align=2";
+                      ];
+                    L [ K "local.set"; ID name ]
+                  ]
+            | _ ->
+                assert false
+        )
+    | Pvectlength ->
+        (* CHECK: this is long enough for a helper function *)
+        let local = new_local fpad RInt in
+        push_as fpad src1 RValue
+        @ [ L [ K "i32.const"; N (I32 4l) ];
+            L [ K "i32.sub" ];
+            L [ K "i32.load" ];
+            L [ K "local.tee"; ID local ];
+            L [ K "local.get"; ID local ];
+            L [ K "i32.const"; N (I32 0xffl) ];
+            L [ K "i32.and" ];
+            L [ K "i32.const";
+                N (I32 (Int32.of_int double_array_tag));
+              ];
+            L [ K "i32.eq" ];  (* 1 if double array, else 0 *)
+            L [ K "i32.const";
+                N (I32 9l)
+              ];
+            L [ K "i32.add" ];
+            L [ K "i32.shr_u" ];
+            (* shift by 10 for double array, else by 9 *)
+            L [ K "i32.const";
+                N (I32 1l);
+              ];
+            L [ K "i32.or" ];
+          ]
+        @ pop_to fpad dest RIntVal None
+    | Pgetpubmet k ->
+        assert false (* TODO *)
+
+let rec emit_instr fpad instr =
+  match instr with
+    | Wcomment s ->
+        [ C s ]
+    | Wblock arg ->
+        ( match arg.label with
+            | Label lab ->
+                [ L ( [ K "block";
+                        ID (sprintf "label%d" lab);
+                        BR
+                      ]
+                      @ emit_instrs fpad arg.body
+                    )
+                ]
+            | Loop lab ->
+                [ L ( [ K "loop";
+                        ID (sprintf "loop%d" lab);
+                        BR
+                      ]
+                      @ emit_instrs fpad arg.body
+                    )
+                ]
+        )
+    | Wcopy arg ->
+        copy fpad arg.src arg.dest None
+    | Walloc arg ->
+        copy fpad arg.src arg.dest (Some arg.descr)
+    | Wenv arg ->
+        push_field "env" arg.field
+        @ pop_to_local "accu"
+    | Wcopyenv arg ->
+        push_local "env"
+        @ ( if arg.offset > 0 then
+              [ L [ K "i32.const"; N (I32 (Int32.of_int arg.offset)) ];
+                L [ K "i32.add" ]
+              ]
+            else
+              []
+          )
+        @ pop_to_local "accu"
+    | Wgetglobal arg ->
+        let Global offset = arg.src in
+        [ L [ K "global.get";
+              ID "wasicaml_global_data";
+            ];
+          L [ K "i32.load" ];
+          L [ K "i32.load";
+              K (sprintf "offset=0x%lx" (Int32.of_int (4 * offset)));
+              K "align=2";
+            ];
+        ]
+        @ pop_to_local "accu"
+    | Wunary arg ->
+        emit_unary arg.op arg.src1 arg.dest
+    | Wunaryeffect arg ->
+        XXX
+    | Wbinary arg ->
+        XXX
+    | Wbinaryeffect arg ->
+        XXX
+    | Wternaryeffect arg ->
+        XXX
+    | Wmakeblock arg ->
+        XXX
+    | Wmakefloatblock arg ->
+        XXX
+    | Wccall arg ->
+        XXX
+    | Wccall_vector arg ->
+        XXX
+    | Wbranch arg ->
+        XXX
+    | Wbranchif arg ->
+        XXX
+    | Wbranchifnot arg ->
+        XXX
+    | Wswitch arg ->
+        XXX
+    | Wapply arg ->
+        XXX
+    | Wappterm arg ->
+        XXX
+    | Wreturn arg ->
+        XXX
+    | Wgrab arg ->
+        XXX
+    | Wclosurerec arg ->
+        XXX
+    | Wraise arg ->
+        XXX
+    | Wtrap arg ->
+        XXX
+    | Wtryreturn arg ->
+        XXX
+    | Wstop ->
+        XXX
+
+and emit_instrs fpad instrs =
+  List.fold_left
+    (fun acc instr ->
+      List.rev_append (emit_instr fpad instr) acc
+    )
+    []
+    instrs
+  |> List.rev
 
 let nullary_operation gpad lpad state op_repr op_sexpl =
   match op_repr with
@@ -2274,6 +2207,7 @@ let emit_instr gpad lpad state instr =
     | Kappterm(num, slots) ->
         appterm gpad lpad state num slots
     | Kreturn slots ->
+        (* TODO: if accu does not contain an RValue we can return directly *)
         lpad.need_return <- true;
         let state, sexpl_str = straighten_accu gpad lpad state in
         (state, sexpl_str @ [ L [ K "br"; ID "return" ] ])
@@ -2399,130 +2333,18 @@ let emit_try_return gpad lpad state =
       ] in
   (state, sexpl)
 
-let local_branch_labels =
-  function
-  | I.Kbranch l -> [l]
-  | Kbranchif l -> [l]
-  | Kbranchifnot l -> [l]
-  | Kswitch (la1,la2) -> Array.to_list la1 @ Array.to_list la2
-  | _ -> []
-
-let emit_fblock gpad lpad fblock =
-  let open Wc_control in
-  let depth_table = Hashtbl.create 7 in
-  (* maps label to depth of camlstack *)
-
+let emit_fblock fpad fblock =
   let maxdepth = Wc_tracestack.max_stack_depth_of_fblock fblock in
-
-  let get_state label =
-    let camldepth =
-      try Hashtbl.find depth_table label
-      with Not_found -> 0 in
-    let camlstack =
-      enum (-camldepth) camldepth
-      |> List.map (fun pos -> RealStack pos) in
-    let realstack =
-      enum (-camldepth) camldepth
-      |> List.fold_left
-           (fun acc pos -> ISet.add pos acc)
-           ISet.empty in
-    { camlstack;
-      camldepth;
-      maxdepth;
-      realstack;
-      accu = RealAccu;
-      realaccu = ISet.empty
-    } in
-
-  let update_depth_table state labels =
-    List.iter
-      (fun label ->
-        try
-          let d = Hashtbl.find depth_table label in
-          assert(d = state.camldepth)
-        with
-          | Not_found ->
-              Hashtbl.add depth_table label state.camldepth
-      )
-      labels in
-
-  let rec emit_block block loops =
-    let state = { empty_state with accu = Invalid } in
-    (* eprintf "BLOCK\n%!";*)
-    let upd_loops =
-      match block.loop_label with
-        | Some lab -> ISet.add lab loops
-        | _ -> loops in
-    let state, acc =
-      Array.fold_left
-        (fun (state, acc) instr ->
-          match instr with
-            | Label label ->
-                (* eprintf "LABEL %d\n" label; *)
-                let comment = C (sprintf "Label %d" label) in
-                (get_state label, [comment] :: acc)
-            | Simple i ->
-                let labels = local_branch_labels i in
-                update_depth_table state labels;
-                lpad.loops <- upd_loops;
-                let (next_state, sexpl) =
-                  emit_instr gpad lpad state i in
-                (*
-                eprintf "%s predepth=%d postdepth=%d\n%!"
-                        (Wc_util.string_of_instruction i)
-                        (state.camldepth)
-                        (next_state.camldepth);
-                 *)
-                let comment =
-                  C ("***" ^ Wc_util.string_of_instruction i) in
-                (next_state, (comment :: sexpl) :: acc)
-            | Trap { trylabel; catchlabel } ->
-                (* update_depth_table state [catchlabel]; *)
-                let (next_state, sexpl) =
-                  emit_trap gpad lpad state trylabel catchlabel in
-                let comment =
-                  C (sprintf "Kpushtrap(try=%d,catch=%d)" trylabel catchlabel) in
-                (next_state, (comment :: sexpl) :: acc)
-            | TryReturn ->
-                let (next_state, sexpl) =
-                  emit_try_return gpad lpad state in
-                let comment = C "tryreturn" in
-                (next_state, (comment :: sexpl) :: acc)
-            | Block inner ->
-                let sexpl = emit_block inner upd_loops in
-                (state, sexpl :: acc)
-        )
-        (state, [])
-        block.instructions in
-    let inner_sexpl =
-      List.rev acc |> List.flatten in
-    match block.loop_label, block.break_label with
-      | Some _, Some _ -> assert false
-      | Some label, None ->
-          [ L ( [ K "loop";
-                  ID (sprintf "loop%d" label);
-                  BR
-                ]
-                @ inner_sexpl
-              )
-          ]
-      | None, Some label ->
-          [ L ( [ K "block";
-                  ID (sprintf "label%d" label);
-                  BR
-                ]
-                @ inner_sexpl
-              )
-          ]
-      | None, None ->
-          inner_sexpl in
-
+  fpad.maxdepth <- maxdepth;
+  let instrs =
+    Wc_unstack.transl_fblock fpad.lpad fblock
+    |> emit_instrs fpad in
   [ L [ K "local.get"; ID "fp" ];
     L [ K "i32.const"; N (I32 (Int32.of_int (4 * maxdepth))) ];
     L [ K "i32.sub" ];
     L [ K "local.set"; ID "bp" ];
   ]
-  @ emit_block fblock.block ISet.empty
+  @ instrs
 
 let get_funcmapping scode =
   let open Wc_control in
