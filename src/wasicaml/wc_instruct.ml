@@ -50,6 +50,7 @@ type store =
 
 type global = Global of int
 type label = Label of int | Loop of int
+(* only local labels *)
 
 type stack_descriptor =
   { stack_init : ISet.t;
@@ -130,11 +131,11 @@ type instruction =
   | Wappterm of { numargs:int; oldnumargs:int; depth:int } (* src=accu *)
   | Wreturn of { src:store }
   | Wgrab of { numargs:int }
-  | Wclosurerec of { src:store list; dest:(store * label) list;
+  | Wclosurerec of { src:store list; dest:(store * int) list;
                      descr:stack_descriptor (* also "accu" can be used *)
                    }
   | Wraise of { src:store; kind:Lambda.raise_kind }
-  | Wtrap of { trylabel:label; catchlabel:label; depth:int }
+  | Wtrap of { trylabel:int; catchlabel:int; depth:int }
   | Wtryreturn of { src:store }
   | Wstop
 

@@ -409,9 +409,9 @@ let transl_instr lpad state instr =
         let state = push_camlstack (accu_store state) state in
         (state, [])
     | Kpush_retaddr lab ->
-        let state = push_camlstack (Const 1) state in
+        let state = push_camlstack (Const 0) state in
         let state = push_camlstack (Local(RValue, "env")) state in
-        let state = push_camlstack (Const 1) state in
+        let state = push_camlstack (Const 0) state in
         (state, [])
     | Kpop num ->
         let state, instrs = pop_real_stack lpad state num in
@@ -556,11 +556,11 @@ let transl_instr lpad state instr =
           |> popn_camlstack (num-1) in
         (state, instrs)
     | Kccall (name, num) ->
-        let state, instrs_flush = flush_accu lpad state in
+        let state, instrs_str = straighten_all lpad state in
         let descr = stack_descr state in
         let depth = state.camldepth in
         let instrs =
-          instrs_flush
+          instrs_str
           @ [ Wccall_vector { name; numargs=num; depth; descr }] in
         let state =
           { state with accu = Some RealAccu }
@@ -594,9 +594,9 @@ let transl_instr lpad state instr =
                ) in
         let instrs =
           instrs_str
-          @ [ Wcopy { src=Const 1; dest=RealStack(-cd+num-3) };
+          @ [ Wcopy { src=Const 0; dest=RealStack(-cd+num-3) };
               Wcopy { src=Local(RValue, "env"); dest=RealStack(-cd+num-2) };
-              Wcopy { src=Const 1; dest=RealStack(-cd+num-1) };
+              Wcopy { src=Const 0; dest=RealStack(-cd+num-1) };
             ]
           @ instrs_move
           @ [ Wapply { numargs=num; depth=cd+3; src=RealAccu }
@@ -635,7 +635,7 @@ let transl_instr lpad state instr =
         let descr = stack_descr state in
         let instrs =
           instrs_flush
-          @ [ Wclosurerec { src; dest=[ RealAccu, make_label lpad lab ]; descr }] in
+          @ [ Wclosurerec { src; dest=[ RealAccu, lab ]; descr }] in
         let state =
           { state with accu = Some RealAccu }
           |> popn_camlstack (max (num-1) 0) in
@@ -655,7 +655,7 @@ let transl_instr lpad state instr =
         let dest =
           List.mapi
             (fun i lab ->
-              (RealStack(start_dest - i), make_label lpad lab)
+              (RealStack(start_dest - i), lab)
             )
             funcs in
         let state =
@@ -766,8 +766,8 @@ let transl_fblock lpad fblock =
                 let instrs =
                   [ Wcomment (sprintf "Kpushtrap(try=%d,catch=%d)" trylabel catchlabel) ]
                   @ instrs_str
-                  @ [ Wtrap { trylabel=make_label lpad trylabel;
-                              catchlabel=make_label lpad catchlabel;
+                  @ [ Wtrap { trylabel;
+                              catchlabel;
                               depth=state.camldepth
                             }
                     ] in
