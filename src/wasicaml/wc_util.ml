@@ -16,7 +16,7 @@ let string_of_int_comparison =
   | Cle -> "le"
   | Cge -> "ge"
 
-let string_of_instruction =
+let string_of_kinstruction =
   function
   | I.Klabel label -> sprintf "Klabel(label%d)" label
   | Kacc k -> sprintf "Kacc(%d)" k

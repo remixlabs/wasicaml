@@ -9,6 +9,11 @@ open Wc_instruct
    - use helper functions for Kapply?
    - check that subfunc fits into codeptr (10 bits)
    - helper functions for "makeblock"
+   - env: avoid to pass it around. Instead of env we can also can use
+     envptr (a pointer to a value on the stack). This way it is automatically
+     protected at GC time. When calling a new OCaml function, put the NEW
+     env on the stack instead of the old, and let envptr point to it.
+     appterm and restart might be a bit tricky.
  *)
 
 (* OCaml functions are translated to Wasm functions with parameters:
@@ -209,53 +214,50 @@ let push_domain_field field =
       ];
   ]
 
-let store_offset addr value offset =
+let store_offset addr offset code_value =
   if offset >= 0 then
-    [ L [ K "local.get"; ID addr ];
-      L [ K "local.get"; ID value ];
-      L [ K "i32.store";
-          K (sprintf "offset=0x%lx" (Int32.of_int offset));
-          K "align=2";
-        ]
-    ]
+    [ L [ K "local.get"; ID addr ] ]
+    @ code_value
+    @ [ L [ K "i32.store";
+            K (sprintf "offset=0x%lx" (Int32.of_int offset));
+            K "align=2";
+          ]
+      ]
   else
     [ L [ K "local.get"; ID addr ];
       L [ K "i32.const"; N (I32 (Int32.of_int (-offset))) ];
-      L [ K "i32.sub" ];
-      L [ K "local.get"; ID value ];
-      L [ K "i32.store"; K "align=2" ]
+      L [ K "i32.sub" ]
     ]
+    @ code_value
+    @ [ L [ K "i32.store"; K "align=2" ] ]
 
-let pop_to_field var_base field =
-  [ L [ K "local.set"; ID "h.i32" ];
-  ] @ store_offset var_base "h.i32" (4*field)
+let pop_to_field var_base field code_value =
+  store_offset var_base (4*field) code_value
 
-let pop_to_double_field var_base field =
-  [ L [ K "local.set"; ID "h.f64" ];
-    L [ K "local.get"; ID var_base ];
+let pop_to_double_field var_base field code_value =
+  [ L [ K "local.get"; ID var_base ];
     L [ K "i32.const";
         N (I32 (Int32.of_int (4 * double_size * field)));
       ];
-    L [ K "i32.add" ];
-    L [ K "local.get"; ID "h.f64" ];
-    L [ K "f64.store"; K "align=2" ];
+    L [ K "i32.add" ]
   ]
+  @ code_value
+  @ [ L [ K "f64.store"; K "align=2" ]]
 
-let pop_to_domain_field field =
-  [ L [ K "local.set"; ID "h.i32" ];
-    L [ K "global.get"; ID "wasicaml_domain_state" ];
-    L [ K "local.get"; ID "h.i32" ];
-    L [ K "i32.store";
-        K (sprintf "offset=0x%lx" (Int32.of_int (8 * field)));
-        K "align=2";
-      ];
-  ]
+let pop_to_domain_field field code_value =
+  [ L [ K "global.get"; ID "wasicaml_domain_state" ]]
+  @ code_value
+  @ [ L [ K "i32.store";
+          K (sprintf "offset=0x%lx" (Int32.of_int (8 * field)));
+          K "align=2";
+        ];
+    ]
 
-let pop_to_stack fpad pos =
+let pop_to_stack fpad pos code_value =
   if pos >= 0 then
-    pop_to_field "fp" pos
+    pop_to_field "fp" pos code_value
   else
-    pop_to_field "bp" (pos + fpad.maxdepth)
+    pop_to_field "bp" (pos + fpad.maxdepth) code_value
 
 let load_double =
   [ L [ K "f64.load";
@@ -282,7 +284,7 @@ let stack_init fpad descr =
       let pos = -k in
       let is_used = ISet.mem pos descr.stack_init in
       ( if not is_used then
-          push_const 1l @ pop_to_stack fpad pos
+          pop_to_stack fpad pos (push_const 1l)
         else
           []
       ) @ gen_init (k-1)
@@ -297,11 +299,11 @@ let setup_for_gc fpad descr =
     stack_init fpad descr in
   let sexpl_accu =
     if descr.stack_save_accu then
-      push_local "accu" @ pop_to_stack fpad (-descr.stack_depth-1)
+      push_local "accu" |> pop_to_stack fpad (-descr.stack_depth-1)
     else
       [] in
   let sexpl_env =
-    push_local "env" @ pop_to_stack fpad (-descr.stack_depth-sp_decr) in
+    push_local "env" |> pop_to_stack fpad (-descr.stack_depth-sp_decr) in
   let sexpl_extern_sp =
     [ L [ K "local.get";
           ID "fp";
@@ -311,7 +313,7 @@ let setup_for_gc fpad descr =
         ];
       L [ K "i32.sub" ];
     ]
-    @ pop_to_domain_field domain_field_extern_sp in
+    |> pop_to_domain_field domain_field_extern_sp in
   sexpl_stack @ sexpl_accu @ sexpl_env @ sexpl_extern_sp
 
 let restore_after_gc fpad descr =
@@ -377,27 +379,25 @@ let alloc_slow =
             L [ K "param"; ID "env"; K "i32" ];
             BR;
             L [ K "result"; C "ptr"; K "i32" ];
-            L [ K "local"; ID "h.i32"; K "i32" ];
           ];
           if !enable_multireturn then [
               L [ K "result"; C "out_accu"; K "i32" ];
               L [ K "result"; C "out_env"; K "i32" ];
             ] else [];
-          [ L [ K "local.get"; ID "fp" ];
-            L [ K "local.get"; ID "stackdepth" ];
-            L [ K "i32.sub" ];
-            L [ K "i32.const"; N (I32 8l) ];
-            L [ K "i32.sub" ];
+          ( [ L [ K "local.get"; ID "fp" ];
+              L [ K "local.get"; ID "stackdepth" ];
+              L [ K "i32.sub" ];
+              L [ K "i32.const"; N (I32 8l) ];
+              L [ K "i32.sub" ];
 
-            (* L [ K "local.tee"; ID "h.i32" ];
-               L ( K "block" :: debug2_var 20 "h.i32");
-             *)
-          ]
-          @ pop_to_domain_field domain_field_extern_sp
-          @ push_local "accu"
-          @ pop_to_field "fp" 4
-          @ push_local "env"
-          @ pop_to_field "fp" 0;
+             (* L [ K "local.tee"; ID "h.i32" ];
+                L ( K "block" :: debug2_var 20 "h.i32");
+              *)
+            ]
+            |> pop_to_domain_field domain_field_extern_sp
+          )
+          @ (push_local "accu" |> pop_to_field "fp" 4)
+          @ (push_local "env" |> pop_to_field "fp" 0);
 
           (* caml_alloc_small_dispatch(size, CAML_FROM_C, 1, NULL); *)
           [ L [ K "local.get"; ID "size" ];
@@ -515,7 +515,6 @@ let grab_helper gpad =
             L [ K "local"; ID "accu"; K "i32" ];
             L [ K "local"; ID "i"; K "i32" ];
             L [ K "local"; ID "bp"; K "i32" ];
-            L [ K "local"; ID "h.i32"; K "i32" ];
           ];
 
           [ L [ K "local.get"; ID "fp" ];
@@ -532,8 +531,7 @@ let grab_helper gpad =
           ];
           restore_after_gc fpad descr;  (* won't overwrite accu *)
 
-          push_local "env";
-          pop_to_field "accu" 2;
+          (push_local "env" |> pop_to_field "accu" 2);
 
           push_const 0l;
           pop_to_local "i";
@@ -570,11 +568,8 @@ let grab_helper gpad =
               ]
           ];
 
-          push_local "codeptr";
-          pop_to_field "accu" 0;
-
-          push_const 5l;
-          pop_to_field "accu" 1;
+          (push_local "codeptr" |> pop_to_field "accu" 0);
+          (push_const 5l |> pop_to_field "accu" 1);
 
           push_local "accu";
           [  L [ K "return" ] ]
@@ -899,7 +894,7 @@ let pop_to fpad store repr descr_opt =
         @ pop_to_local name
     | RealStack pos ->
         tovalue_alloc fpad repr descr_opt
-        @ pop_to_stack fpad pos
+        |> pop_to_stack fpad pos
     | _ ->
         assert false
 
@@ -913,7 +908,7 @@ let copy fpad src dest descr_opt =
         @ pop_to_local name
     | RealStack pos ->
         push_as fpad src RValue
-        @ pop_to_stack fpad pos
+        |>  pop_to_stack fpad pos
     | _ ->
         assert false
 
@@ -1127,22 +1122,28 @@ let emit_binary fpad op src1 src2 dest =
           fpad src1 src2 dest
           [ L [ K "i32.shr_s" ] ]
     | (Pintcomp cmp | Puintcomp cmp) ->
-        let wasm_op =
+        let wasm_op, force_int =
           match op with
-            | Pintcomp Ceq | Puintcomp Ceq -> "i32.eq"
-            | Pintcomp Cne | Puintcomp Cne -> "i32.ne"
-            | Pintcomp Clt -> "i32.lt_s"
-            | Pintcomp Cle -> "i32.le_s"
-            | Pintcomp Cgt -> "i32.gt_s"
-            | Pintcomp Cge -> "i32.ge_s"
-            | Puintcomp Clt -> "i32.lt_u"
-            | Puintcomp Cle -> "i32.le_u"
-            | Puintcomp Cgt -> "i32.gt_u"
-            | Puintcomp Cge -> "i32.ge_u"
+            | Pintcomp Ceq | Puintcomp Ceq -> "i32.eq", false
+            | Pintcomp Cne | Puintcomp Cne -> "i32.ne", false
+            | Pintcomp Clt -> "i32.lt_s", true
+            | Pintcomp Cle -> "i32.le_s", true
+            | Pintcomp Cgt -> "i32.gt_s", true
+            | Pintcomp Cge -> "i32.ge_s", true
+            | Puintcomp Clt -> "i32.lt_u", true
+            | Puintcomp Cle -> "i32.le_u", true
+            | Puintcomp Cgt -> "i32.gt_u", true
+            | Puintcomp Cge -> "i32.ge_u", true
             | _ -> assert false in
-        emit_int_binary
-          fpad src1 src2 dest
-          [ L [ K wasm_op ] ]
+        if force_int || repr_of_store src1 <> repr_of_store src2 then
+          emit_int_binary
+            fpad src1 src2 dest
+            [ L [ K wasm_op ]]
+        else (* repr doesn't matter *)
+          push fpad src1
+          @ push fpad src2
+          @ [ L [ K wasm_op ]]
+          @ pop_to fpad dest RInt None
     | Pgetvectitem ->
         push_as fpad src1 RValue
         @ ( match src2, repr_of_store src2 with
@@ -1272,7 +1273,7 @@ let makeblock fpad descr src_list tag =
       List.mapi
         (fun field src ->
           push_mb_elem fpad src
-          @ pop_to_field ptr field
+          |>  pop_to_field ptr field
         )
         src_list
     else
@@ -1292,9 +1293,9 @@ let makefloatblock fpad descr src_list =
   let sexpl_init =
     List.mapi
       (fun field src ->
-        push_as fpad src RValue
-        @ load_double
-        @ pop_to_double_field ptr field
+        ( push_as fpad src RValue
+          @ load_double
+        ) |> pop_to_double_field ptr field
       )
       src_list in
   (ptr, sexpl_alloc @ List.flatten sexpl_init)
@@ -1667,14 +1668,10 @@ let trap gpad fpad trylabel catchlabel depth =
   (* at end of try function: global "exn_result" = accu *)
   let local = new_local fpad RValue in
   let sexpl_stack =
-    push_const 0l
-    @ pop_to_stack fpad (-depth-1)
-    @ push_const 0l
-    @ pop_to_stack fpad (-depth-2)
-    @ push_local "env"
-    @ pop_to_stack fpad (-depth-3)
-    @ push_local "extra_args"
-    @ pop_to_stack fpad (-depth-4) in
+    (push_const 0l |> pop_to_stack fpad (-depth-1))
+    @ (push_const 0l |> pop_to_stack fpad (-depth-2))
+    @ (push_local "env" |> pop_to_stack fpad (-depth-3))
+    @ (push_local "extra_args" |> pop_to_stack fpad (-depth-4)) in
   let sexpl_try =
     push_wasmptr gpad trylabel
     @ push_local "env"
@@ -1711,7 +1708,7 @@ let trap gpad fpad trylabel catchlabel depth =
 let rec emit_instr gpad fpad instr =
   match instr with
     | Wcomment s ->
-        [ C s ]
+        []
     | Wblock arg ->
         ( match arg.label with
             | Label lab ->
@@ -1783,6 +1780,9 @@ let rec emit_instr gpad fpad instr =
         @ pop_to_local "accu"
     | Wccall arg ->
         (* TODO: maintain a list of noalloc primitives *)
+        (* TODO: maintain a list of unit primitives (set accu=Const 0 instead),
+           or more generally, primitives that never return functions
+         *)
         c_call gpad fpad arg.descr arg.src arg.name
     | Wccall_vector arg ->
         c_call_vector gpad fpad arg.descr arg.numargs arg.depth arg.name
@@ -1860,14 +1860,19 @@ let rec emit_instr gpad fpad instr =
 and emit_instrs gpad fpad instrs =
   List.fold_left
     (fun acc instr ->
-      List.rev_append (emit_instr gpad fpad instr) acc
+      let comment = string_of_winstruction instr in
+      List.rev_append
+        (emit_instr gpad fpad instr)
+        (List.rev_append [C comment] acc)
     )
     []
     instrs
   |> List.rev
 
 let emit_fblock gpad fpad fblock =
-  let maxdepth = Wc_tracestack.max_stack_depth_of_fblock fblock in
+  let maxdepth = Wc_tracestack.max_stack_depth_of_fblock fblock + 2 in
+  (* make maxdepth a bit larger than stricly necessary to completely avoid
+     bp[k] with k<0 *)
   fpad.maxdepth <- maxdepth;
   let instrs =
     Wc_unstack.transl_fblock fpad.lpad fblock
@@ -1955,8 +1960,6 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
   let fpad = empty_fpad() in
   Hashtbl.add fpad.lpad.locals "accu" RValue;
   Hashtbl.add fpad.lpad.locals "bp" RValue;
-  Hashtbl.add fpad.lpad.locals "h.i32" RInt;
-  Hashtbl.add fpad.lpad.locals "h.f64" RFloat;
 
   let subfunc_pairs =
     List.map

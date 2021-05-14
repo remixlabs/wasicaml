@@ -1,4 +1,5 @@
 open Wc_types
+open Printf
 
 type repr =
   | RValue
@@ -45,6 +46,10 @@ type store =
    is to true by some user, and latter when [stack_used] gets true. If there
    is no code that sets [stack_used] the allocation can be avoided. If there
    is such code, the allocation is only done once right at the beginning.
+
+   With Combined we could even put RValues into local variables. Just add
+     local_incompat : bool ref
+   and set this when an incompatibility is found.
  *)
 
 
@@ -100,9 +105,9 @@ type terneffect =
   | Psetvectitem
   | Psetbyteschar
 
-type instruction =
+type winstruction =
   | Wcomment of string
-  | Wblock of { label:label; body:instruction list }
+  | Wblock of { label:label; body:winstruction list }
   | Wcopy of { src:store; dest:store }   (* only non-allocating copies *)
   | Walloc of { src:store; dest:store; descr:stack_descriptor }
   | Wenv of { field:int }         (* dest is always RealAccu *)
@@ -152,3 +157,123 @@ let empty_descr =
     stack_depth = 0;
     stack_save_accu = false;
   }
+
+let string_of_store =
+  function
+  | RealStack pos -> sprintf "fp[%d]" pos
+  | RealAccu -> "accu"
+  | Const k -> sprintf "%d" k
+  | Local(repr, name) -> name
+  | Atom k -> sprintf "atom%d" k
+
+let string_label =
+  function
+  | Label k -> sprintf "label%d" k
+  | Loop k -> sprintf "loop%d" k
+
+
+
+
+let string_of_winstruction =
+  function
+  | Wcomment s -> s
+  | Wblock arg ->
+      ( match arg.label with
+          | Label k ->
+              sprintf "Wblock(..., label%d)" k
+          | Loop k ->
+              sprintf "Wblock(loop%d, ...)" k
+      )
+  | Wcopy arg ->
+      sprintf "Wcopy(%s = %s)"
+              (string_of_store arg.dest) (string_of_store arg.src)
+  | Walloc arg ->
+      sprintf "Walloc(%s = %s)"
+              (string_of_store arg.dest) (string_of_store arg.src)
+  | Wenv arg ->
+      sprintf "Wenv(accu = env[%d])" arg.field
+  | Wcopyenv arg ->
+      sprintf "Wcopyenv(accu = env+%d)" arg.offset
+  | Wgetglobal { src = Global k } ->
+      sprintf "Wgetglobal(accu = global%d)" k
+  | Wunary arg ->
+      sprintf "Wunary(%s = f(%s))"
+              (string_of_store arg.dest) (string_of_store arg.src1)
+  | Wunaryeffect arg ->
+      sprintf "Wunaryeffect(f(%s))"
+              (string_of_store arg.src1)
+  | Wbinary arg ->
+      sprintf "Wbinary(%s = f(%s, %s))"
+              (string_of_store arg.dest) (string_of_store arg.src1)
+              (string_of_store arg.src2)
+  | Wbinaryeffect arg ->
+      sprintf "Wbinaryeffect(f(%s, %s))"
+              (string_of_store arg.src1)
+              (string_of_store arg.src2)
+  | Wternaryeffect arg ->
+      sprintf "Wbinaryeffect(f(%s, %s, %s))"
+              (string_of_store arg.src1)
+              (string_of_store arg.src2)
+              (string_of_store arg.src3)
+  | Wmakeblock arg ->
+      sprintf "Wmakeblock(tag=%d, accu=[%s])"
+              arg.tag
+              (List.map string_of_store arg.src |> String.concat ", ")
+  | Wmakefloatblock arg ->
+      sprintf "Wmakefloatblock(accu=[%s])"
+              (List.map string_of_store arg.src |> String.concat ", ")
+  | Wccall arg ->
+      sprintf "Wccall(accu = %S(%s))"
+              arg.name
+              (List.map string_of_store arg.src |> String.concat ", ")
+  | Wccall_vector arg ->
+      sprintf "Wccall_vector(accu = %S(fp[%d]...fp[%d]))"
+              arg.name (-arg.depth) (-arg.depth+arg.numargs-1)
+  | Wbranch arg ->
+      sprintf "Wbranch(%s)" (string_label arg.label)
+  | Wbranchif arg ->
+      sprintf "Wbranch(%s if %s)"
+              (string_label arg.label) (string_of_store arg.src)
+  | Wbranchifnot arg ->
+      sprintf "Wbranch(%s ifnot %s)"
+              (string_label arg.label) (string_of_store arg.src)
+  | Wswitch arg ->
+      let s1 =
+        Array.to_list arg.labels_int
+        |> List.map string_label
+        |> String.concat "," in
+      let s2 =
+        Array.to_list arg.labels_blk
+        |> List.map string_label
+        |> String.concat "," in
+      sprintf "Wswitch(%s;%s on %s)" s1 s2 (string_of_store arg.src)
+  | Wapply arg ->
+      sprintf "Wapply(f=%s, args=[fp[%d]...fp[%d]])"
+              (string_of_store arg.src)
+              (-arg.depth) (-arg.depth+arg.numargs-1)
+  | Wappterm arg ->
+      sprintf "Wappterm(f=accu, args=[fp[%d]...fp[%d]], oldnum=%d)"
+              (-arg.depth) (-arg.depth+arg.numargs-1)
+              arg.oldnumargs
+  | Wreturn arg ->
+      sprintf "Wreturn(%s)" (string_of_store arg.src)
+  | Wgrab arg ->
+      sprintf "Wgrab(num=%d)" arg.numargs
+  | Wclosurerec arg ->
+      sprintf "Wclosurerec(env=[%s], dest=[%s])"
+              (List.map string_of_store arg.src |> String.concat ", ")
+              (List.map
+                 (fun (s, lab) ->
+                   sprintf "%s=label%d" (string_of_store s) lab
+                 )
+                 arg.dest
+               |> String.concat ",")
+  | Wraise arg ->
+      sprintf "Wraise(%s)" (string_of_store arg.src)
+  | Wtrap arg ->
+      sprintf "Wtrap(try label%d catch label%d, depth=%d)"
+              arg.trylabel arg.catchlabel arg.depth
+  | Wtryreturn arg ->
+      sprintf "Wtryreturn(%s)" (string_of_store arg.src)
+  | Wstop ->
+      "Wstop"
