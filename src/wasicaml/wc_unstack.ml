@@ -593,12 +593,11 @@ let transl_instr lpad state instr =
                ) in
         let instrs =
           instrs_str
+          @ instrs_move
           @ [ Wcopy { src=Const 0; dest=RealStack(-cd+num-3) };
               Wcopy { src=Local(RValue, "env"); dest=RealStack(-cd+num-2) };
               Wcopy { src=Const 0; dest=RealStack(-cd+num-1) };
-            ]
-          @ instrs_move
-          @ [ Wapply { numargs=num; depth=cd+3; src=RealAccu }
+              Wapply { numargs=num; depth=cd+3; src=RealAccu }
             ] in
         let state = state |> popn_camlstack num in
         (state, instrs)

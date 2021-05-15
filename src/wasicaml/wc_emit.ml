@@ -1376,6 +1376,12 @@ let c_call gpad fpad descr src_list name =
   let descr = { descr with stack_save_accu = false } in (* it is overwritten *)
   let sexpl_setup = setup_for_gc fpad descr in
   let sexpl_restore = restore_after_gc fpad descr in
+  (*
+  let sexpl_debug_args =
+    List.map
+      (fun src -> push_const 21l @ push_as fpad src RValue @ [ L [ K "call"; ID "debug2" ]])
+      src_list |> List.flatten in
+   *)
   let sexpl_args =
     List.map
       (fun src -> push_as fpad src RValue)
@@ -1387,7 +1393,10 @@ let c_call gpad fpad descr src_list name =
   let r_i32 = L [ K "result"; K "i32" ] in
   let ty = (src_list |> List.map (fun _ -> p_i32)) @ [ r_i32 ] in
   Hashtbl.replace gpad.primitives name ty;
+  (* debug2 20 0 *)
+  (* @ sexpl_debug_args *)
   sexpl_setup @ List.flatten sexpl_args @ sexpl_call @ sexpl_restore
+  (* @ debug2 20 1 *)
 
 let c_call_vector gpad fpad descr numargs depth name =
   let descr = { descr with stack_save_accu = false } in (* it is overwritten *)
@@ -1403,6 +1412,7 @@ let c_call_vector gpad fpad descr numargs depth name =
       L [ K "param"; K "i32" ];
       L [ K "result"; K "i32" ] ] in
   Hashtbl.replace gpad.primitives name ty;
+  (* debug2 20 0 *)
   sexpl_setup @ sexpl_call @ sexpl_restore
 
 let string_label =
@@ -2035,12 +2045,12 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
                )
                locals
             )
-          (* @ debug2 0 letrec_label
-             @ debug2_var 10 "fp"
-             @ debug2_var 11 "env"
-             @ debug2_var 12 "codeptr"
-             @ debug2_var 13 "extra_args"
-           *)
+           (* @ debug2 0 letrec_label
+              @ debug2_var 10 "fp"
+              @ debug2_var 11 "env"
+              @ debug2_var 12 "codeptr"
+              @ debug2_var 13 "extra_args"
+            *)
           @ sexpl
           @ [ L [ K "unreachable" ]]
         )
