@@ -15,7 +15,7 @@ c_primitive caml_builtin_cprim[] = {};
 char *wasicaml_get_data(void);
 asize_t wasicaml_get_data_size(void);
 void wasicaml_init(void);
-value mainfunc(value env, int extra_args, uint32_t codeptr, value *fp);
+value letrec_main(value *env, int extra_args, uint32_t codeptr, value *fp);
 
 int zerocode[] = { 2+STOP };  // FIXME: why is the offset needed?
 asize_t zerocode_size = 1;
@@ -50,12 +50,11 @@ void wasicaml_main(char **argv) {
     printf("&extern_sp=%p\n", &Caml_state_field(extern_sp));
     printf("delta extern_sp=%lx\n", ((char *) &Caml_state_field(extern_sp)) - ((char *) &Caml_state_field(young_ptr)));
     printf("&atom_table=%p\n", caml_atom_table);
-    value env = Atom(0);
     int extra_args = 0;
     uint32_t codeptr = 0;
     value *fp = Caml_state->_extern_sp;
     wasicaml_init();
-    mainfunc(env, extra_args, codeptr, fp);
+    letrec_main((value *) -1, extra_args, codeptr, fp);
 }
 
 int main(int argc, char **argv) {

@@ -29,6 +29,8 @@ type state =
        If additionally accu=RealAccu, the "accu" variable also keeps the
        logical accu value.
      *)
+    arity : int;
+    (* number of args pf the current function - first set after Kgrab *)
   }
 
 type lpad =  (* local pad *)
@@ -46,6 +48,7 @@ let empty_state =
     realstack = ISet.empty;
     accu = RealAccu;
     realaccu = ISet.empty;
+    arity = 1;
   }
 
 let empty_lpad() =
@@ -307,6 +310,8 @@ let straighten_stack_multi lpad state pos_list =
   (state, List.rev rev_acc)
 
 let straighten_all lpad state =
+  let state, instrs1 = straighten_accu lpad state in
+  assert(state.accu = RealAccu && state.realaccu = ISet.empty);
   let cd = state.camldepth in
   let pos_list =
     state.camlstack
@@ -319,7 +324,9 @@ let straighten_all lpad state =
              | _ ->
                  [-cd+i]
          ) in
-  straighten_stack_multi lpad state pos_list
+  let state, instrs2 = straighten_stack_multi lpad state pos_list in
+  assert(state.accu = RealAccu && state.realaccu = ISet.empty);
+  (state, instrs1 @ instrs2)
 
 let unary_operation lpad state op_repr op_code =
   let src1 = state.accu in
@@ -409,7 +416,7 @@ let transl_instr lpad state instr =
         (state, [])
     | Kpush_retaddr lab ->
         let state = push_camlstack (Const 0) state in
-        let state = push_camlstack (Local(RValue, "env")) state in
+        let state = push_camlstack (Const 0) state in
         let state = push_camlstack (Const 0) state in
         (state, [])
     | Kpop num ->
@@ -595,7 +602,7 @@ let transl_instr lpad state instr =
           instrs_str
           @ instrs_move
           @ [ Wcopy { src=Const 0; dest=RealStack(-cd+num-3) };
-              Wcopy { src=Local(RValue, "env"); dest=RealStack(-cd+num-2) };
+              Wcopy { src=Const 0; dest=RealStack(-cd+num-2) };
               Wcopy { src=Const 0; dest=RealStack(-cd+num-1) };
               Wapply { numargs=num; depth=cd+3; src=RealAccu }
             ] in
@@ -623,10 +630,10 @@ let transl_instr lpad state instr =
             ] in
         (state, instrs)
     | Kreturn slots ->
-        (* assert(state.camldepth = slots); *)
+        assert(state.camldepth + state.arity = slots);
         (state, [ Wreturn { src=state.accu } ])
     | Kgrab num ->
-        (state, [ Wgrab { numargs=num }])
+        ({state with arity = num+1}, [ Wgrab { numargs=num }])
     | Kclosure(lab, num) ->
         let state, instrs_flush = flush_accu lpad state in
         let src =
@@ -672,6 +679,7 @@ let transl_instr lpad state instr =
         (state, instrs)
     | Koffsetclosure offset ->
         let state, instrs_flush = flush_accu lpad state in
+        let state = { state with accu = RealAccu } in
         let instrs =
           instrs_flush
           @ [ Wcopyenv { offset } ] in
@@ -699,36 +707,42 @@ let local_branch_labels =
 
 let transl_fblock lpad fblock =
   let open Wc_control in
-  let depth_table = Hashtbl.create 7 in
-  (* maps label to depth of camlstack *)
+  let state_table = Hashtbl.create 7 in
 
   let get_state label =
-    let camldepth =
-      try Hashtbl.find depth_table label
-      with Not_found -> 0 in
-    let camlstack =
-      enum (-camldepth) camldepth
-      |> List.map (fun pos -> RealStack pos) in
-    let realstack =
-      enum (-camldepth) camldepth
-      |> List.fold_left
-           (fun acc pos -> ISet.add pos acc)
-           ISet.empty in
-    { empty_state with
-      camlstack;
-      camldepth;
-      realstack;
-    } in
+    try  Hashtbl.find state_table label
+    with Not_found -> empty_state in
 
-  let update_depth_table state labels =
+  let validate state =
+    let d = state.camldepth in
+    List.iteri
+      (fun i st ->
+        match st with
+          | RealStack pos -> assert(pos = (-d+i))
+          | _ -> assert false
+      )
+      state.camlstack;
+    if d = 0 then
+      assert(state.realstack = ISet.empty)
+    else (
+      assert(ISet.min_elt state.realstack = (-d));
+      assert(ISet.max_elt state.realstack = (-1));
+      assert(ISet.cardinal state.realstack = d);
+    );
+    assert(state.accu = RealAccu);
+    assert(state.realaccu = ISet.empty) in
+
+  let update_state_table state labels =
+    if labels <> [] then
+      validate state;
     List.iter
       (fun label ->
         try
-          let d = Hashtbl.find depth_table label in
-          assert(d = state.camldepth)
+          let s = Hashtbl.find state_table label in
+          assert(s.camldepth = state.camldepth)
         with
           | Not_found ->
-              Hashtbl.add depth_table label state.camldepth
+              Hashtbl.add state_table label state
       )
       labels in
 
@@ -748,11 +762,10 @@ let transl_fblock lpad fblock =
                 let comment = Wcomment (sprintf "Label %d" label) in
                 (get_state label, comment :: acc)
             | Simple i ->
-                let labels = local_branch_labels i in
-                update_depth_table state labels;
                 lpad.loops <- upd_loops;
-                let (next_state, instrs) =
-                  transl_instr lpad state i in
+                let next_state, instrs = transl_instr lpad state i in
+                let labels = local_branch_labels i in
+                update_state_table next_state labels;
                 (*
                 eprintf "%s predepth=%d postdepth=%d\n%!"
                         (Wc_util.string_of_instruction i)

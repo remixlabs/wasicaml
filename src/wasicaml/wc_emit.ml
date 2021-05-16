@@ -9,18 +9,21 @@ open Wc_instruct
    - use helper functions for Kapply?
    - check that subfunc fits into codeptr (10 bits)
    - helper functions for "makeblock"
-   - env: avoid to pass it around. Instead of env we can also can use
-     envptr (a pointer to a value on the stack). This way it is automatically
-     protected at GC time. When calling a new OCaml function, put the NEW
-     env on the stack instead of the old, and let envptr point to it.
-     appterm and restart might be a bit tricky.
+   - check whether the accu needs to survive branches
  *)
 
 (* OCaml functions are translated to Wasm functions with parameters:
-   param 1: env
+   param 1: envptr
    param 2: extra_args
    param 3: code pointer (overriding the one in the closure)
    param 4: fp
+
+   The envptr is a pointer to the stack location of the environment (env).
+   This pointer is created when a function is called - the bytecode
+   interpreter uses 3 stack locations for PC, saved env, and extra_args,
+   but we use these 3 locations differently. PC and extra_args are set to
+   zero, and the location for env stores the environment of the function
+   being called (instead of the environment of the calling function).
  *)
 
 
@@ -135,23 +138,25 @@ let empty_fpad() =
 let new_local fpad repr =
   Wc_unstack.new_local fpad.lpad repr
 
-let push_const n =
-  [ L [ K "i32.const";
-        N (I32 n)
-      ]
+let set_bp fpad =
+  [ L [ K "local.get"; ID "fp" ];
+    L [ K "i32.const"; N (I32 (Int32.of_int (4 * fpad.maxdepth))) ];
+    L [ K "i32.sub" ];
+    L [ K "local.set"; ID "bp" ];
   ]
+
+let push_const n =
+  [ L [ K "i32.const"; N (I32 n) ]]
 
 let push_local var =
-  [ L [ K "local.get";
-        ID var
-      ]
-  ]
+  [ L [ K "local.get"; ID var ]]
 
 let pop_to_local var =
-  [ L [ K "local.set";
-        ID var
-      ]
-  ]
+  [ L [ K "local.set"; ID var ]]
+
+let pop_to_fp fpad =
+  pop_to_local "fp"
+  @ set_bp fpad
 
 let load_offset offset =
   if offset >= 0 then
@@ -166,6 +171,15 @@ let load_offset offset =
       L [ K "i32.load"; K "align=2" ]
     ]
 
+let add_offset offset =
+  [ L [ K "i32.const"; N (I32 (Int32.of_int offset)) ];
+    L [ K "i32.add" ]
+  ]
+
+let push_env =
+  [ L [ K "local.get"; ID "envptr" ];
+    L [ K "i32.load"; K "align=2" ]
+  ]
 
 let push_field var_base field =
   [ L [ K "local.get";
@@ -294,7 +308,7 @@ let stack_init fpad descr =
 
 let setup_for_gc fpad descr =
   let sp_decr =
-    if descr.stack_save_accu then 2 else 1 in
+    if descr.stack_save_accu then 1 else 0 in
   let sexpl_stack =
     stack_init fpad descr in
   let sexpl_accu =
@@ -302,31 +316,29 @@ let setup_for_gc fpad descr =
       push_local "accu" |> pop_to_stack fpad (-descr.stack_depth-1)
     else
       [] in
-  let sexpl_env =
-    push_local "env" |> pop_to_stack fpad (-descr.stack_depth-sp_decr) in
   let sexpl_extern_sp =
-    [ L [ K "local.get";
-          ID "fp";
-        ];
-      L [ K "i32.const";
-          N (I32 (Int32.of_int ( 4 * (descr.stack_depth + sp_decr))));
-        ];
-      L [ K "i32.sub" ];
-    ]
+    ( [ L [ K "local.get";
+            ID "fp";
+          ]
+      ]
+      @ (if sp_decr > 0 then
+           [ L [ K "i32.const";
+                 N (I32 (Int32.of_int ( 4 * (descr.stack_depth + sp_decr))));
+               ];
+             L [ K "i32.sub" ];
+           ]
+         else
+           []
+        )
+    )
     |> pop_to_domain_field domain_field_extern_sp in
-  sexpl_stack @ sexpl_accu @ sexpl_env @ sexpl_extern_sp
+  sexpl_stack @ sexpl_accu @ sexpl_extern_sp
 
 let restore_after_gc fpad descr =
-  let sp_decr =
-    if descr.stack_save_accu then 2 else 1 in
-  let sexpl_accu =
-    if descr.stack_save_accu then
-      push_stack fpad (-descr.stack_depth-1) @ pop_to_local "accu"
-    else
-      [] in
-  let sexpl_env =
-    push_stack fpad (-descr.stack_depth-sp_decr) @ pop_to_local "env" in
-  sexpl_accu @ sexpl_env
+  if descr.stack_save_accu then
+    push_stack fpad (-descr.stack_depth-1) @ pop_to_local "accu"
+  else
+    []
 
 let alloc_atom fpad tag =
   [ L [ K "global.get";
@@ -376,19 +388,18 @@ let alloc_slow =
             L [ K "param"; ID "fp"; K "i32" ];
             L [ K "param"; ID "stackdepth"; K "i32" ];
             L [ K "param"; ID "accu"; K "i32" ];
-            L [ K "param"; ID "env"; K "i32" ];
             BR;
             L [ K "result"; C "ptr"; K "i32" ];
           ];
           if !enable_multireturn then [
               L [ K "result"; C "out_accu"; K "i32" ];
-              L [ K "result"; C "out_env"; K "i32" ];
             ] else [];
           ( [ L [ K "local.get"; ID "fp" ];
               L [ K "local.get"; ID "stackdepth" ];
               L [ K "i32.sub" ];
-              L [ K "i32.const"; N (I32 8l) ];
+              L [ K "i32.const"; N (I32 4l) ];  (* for the accu *)
               L [ K "i32.sub" ];
+              L [ K "local.tee"; ID "fp" ];
 
              (* L [ K "local.tee"; ID "h.i32" ];
                 L ( K "block" :: debug2_var 20 "h.i32");
@@ -396,8 +407,7 @@ let alloc_slow =
             ]
             |> pop_to_domain_field domain_field_extern_sp
           )
-          @ (push_local "accu" |> pop_to_field "fp" 4)
-          @ (push_local "env" |> pop_to_field "fp" 0);
+          @ (push_local "accu" |> pop_to_field "fp" 0);
 
           (* caml_alloc_small_dispatch(size, CAML_FROM_C, 1, NULL); *)
           [ L [ K "local.get"; ID "size" ];
@@ -410,13 +420,11 @@ let alloc_slow =
           (* return Caml_state_field(young_ptr) *)
           push_domain_field domain_field_young_ptr;
 
-          (* return accu, env *)
-          push_local "accu";
-          push_local "env";
+          (* return saved accu *)
+          push_field "fp" 0;
 
           if !enable_multireturn then [] else
-            [ L [ K "global.set"; ID "retval3" ];
-              L [ K "global.set"; ID "retval2" ];
+            [ L [ K "global.set"; ID "retval2" ];
             ];
 
           [ L [ K "return" ]]
@@ -428,9 +436,7 @@ let alloc_slow =
 let call_alloc_slow =
   [ L [ K "call"; ID "alloc_slow" ]]
   @ if !enable_multireturn then [] else
-      [ L [ K "global.get"; ID "retval2" ];
-        L [ K "global.get"; ID "retval3" ];
-      ]
+      [ L [ K "global.get"; ID "retval2" ] ]
 
 
 let alloc_non_atom fpad descr size tag =
@@ -458,9 +464,7 @@ let alloc_non_atom fpad descr size tag =
                     push_local "fp";
                     push_const (Int32.of_int (4 * descr.stack_depth));
                     push_local "accu";
-                    push_local "env";
                     call_alloc_slow;
-                    pop_to_local "env";
                     pop_to_local "accu";
                     pop_to_local ptr;
                 ] |> List.flatten
@@ -498,7 +502,7 @@ let alloc_set fpad descr size tag =
 
 let grab_helper gpad =
   (* generates a helper function:
-     $grab_helper(env, extra_args, codeptr, fp)
+     $grab_helper(extra_args, codeptr, fp)
    *)
   let fpad = empty_fpad() in
   let descr = empty_descr in
@@ -506,7 +510,7 @@ let grab_helper gpad =
 
   [ L ( [ [ K "func";
             ID "grab_helper";
-            L [ K "param"; ID "env"; K "i32" ];
+            L [ K "param"; ID "envptr"; K "i32" ];
             L [ K "param"; ID "extra_args"; K "i32" ];
             L [ K "param"; ID "codeptr"; K "i32" ];
             L [ K "param"; ID "fp"; K "i32" ];
@@ -531,7 +535,7 @@ let grab_helper gpad =
           ];
           restore_after_gc fpad descr;  (* won't overwrite accu *)
 
-          (push_local "env" |> pop_to_field "accu" 2);
+          (push_env |> pop_to_field "accu" 2);
 
           push_const 0l;
           pop_to_local "i";
@@ -581,14 +585,13 @@ let grab_helper gpad =
 let restart_helper gpad =
   [ L ( [ [ K "func";
             ID "restart_helper";
-            L [ K "param"; ID "env"; K "i32" ];
+            L [ K "param"; ID "envptr"; K "i32" ];
             L [ K "param"; ID "extra_args"; K "i32" ];
             L [ K "param"; ID "fp"; K "i32" ];
             BR;
-            L [ K "result"; C "out_env"; K "i32" ];
+            L [ K "result"; C "out_extra_args"; K "i32" ];
           ];
           if !enable_multireturn then [
-            L [ K "result"; C "out_extra_args"; K "i32" ];
             L [ K "result"; C "out_fp"; K "i32" ];
           ] else [];
 
@@ -596,9 +599,9 @@ let restart_helper gpad =
             L [ K "local"; ID "num_args"; K "i32" ];
           ];
 
-          [ (* num_args = Wosize_val(env) - 3 *)
-            L [ K "local.get"; ID "env" ];
-            L [ K "i32.const"; N (I32 4l) ];
+          (* num_args = Wosize_val(env) - 3 *)
+          push_env;
+          [ L [ K "i32.const"; N (I32 4l) ];
             L [ K "i32.sub" ];
             L [ K "i32.load"; K "align=2" ];
             L [ K "i32.const"; N (I32 10l) ];
@@ -619,41 +622,49 @@ let restart_helper gpad =
 
           [ L [ K "i32.const"; N (I32 0l)];
             L [ K "local.set"; ID "i" ];
-            L [ K "loop"; ID "args"; BR;
-                (* fp[i[ = ... *)
-                L [ K "local.get"; ID "fp" ];
-                L [ K "local.get"; ID "i" ];
-                L [ K "i32.const"; N (I32 2l) ];
-                L [ K "i32.shl" ];
-                L [ K "i32.add" ];
+            L ( [ [ K "loop"; ID "args"; BR;
+                    (* fp[i[ = ... *)
+                    L [ K "local.get"; ID "fp" ];
+                    L [ K "local.get"; ID "i" ];
+                    L [ K "i32.const"; N (I32 2l) ];
+                    L [ K "i32.shl" ];
+                    L [ K "i32.add" ]
+                  ];
 
-                (* Field(env, i+3) *)
-                L [ K "local.get"; ID "env" ];
-                L [ K "local.get"; ID "i" ];
-                L [ K "i32.const"; N (I32 3l) ];
-                L [ K "i32.add" ];
-                L [ K "i32.const"; N (I32 2l) ];
-                L [ K "i32.shl" ];
-                L [ K "i32.add" ];
-                L [ K "i32.load"; K "align=2" ];
+                  (* Field(env, i+3) *)
+                  push_env;
+                  [ L [ K "local.get"; ID "i" ];
+                    L [ K "i32.const"; N (I32 3l) ];
+                    L [ K "i32.add" ];
+                    L [ K "i32.const"; N (I32 2l) ];
+                    L [ K "i32.shl" ];
+                    L [ K "i32.add" ];
+                    L [ K "i32.load"; K "align=2" ];
+                  ];
 
-                (* assign *)
-                L [ K "i32.store"; K "align=2" ];
+                  (* assign *)
+                  [ L [ K "i32.store"; K "align=2" ] ];
 
-                (* i++, and jump back if i < num_args *)
-                L [ K "local.get"; ID "i" ];
-                L [ K "i32.const"; N (I32 1l) ];
-                L [ K "i32.add" ];
-                L [ K "local.tee"; ID "i" ];
-                L [ K "local.get"; ID "num_args" ];
-                L [ K "i32.lt_u" ];
-                L [ K "br_if"; ID "args" ];
-              ]
+                  (* i++, and jump back if i < num_args *)
+                  [ L [ K "local.get"; ID "i" ];
+                    L [ K "i32.const"; N (I32 1l) ];
+                    L [ K "i32.add" ];
+                    L [ K "local.tee"; ID "i" ];
+                    L [ K "local.get"; ID "num_args" ];
+                    L [ K "i32.lt_u" ];
+                    L [ K "br_if"; ID "args" ];
+                  ]
+                ] |> List.flatten
+              )
           ];
 
           (* env = Field(env, 2) *)
-          push_field "env" 2;
-          pop_to_local "env";
+          [ L [ K "local.get"; ID "envptr" ];
+            L [ K "local.get"; ID "envptr" ];
+            L [ K "i32.load"; K "align=2" ];
+            L [ K "i32.load"; K "offset=8"; K "align=2" ];
+            L [ K "i32.store"; K "align=2" ]
+          ];
 
           (* extra_args += num_args *)
           [ L [ K "local.get"; ID "extra_args" ];
@@ -662,15 +673,12 @@ let restart_helper gpad =
             L [ K "local.set"; ID "extra_args" ];
           ];
 
-          (* return env *)
-          push_local "env";
+          (* return *)
           push_local "extra_args";
           push_local "fp";
 
           if !enable_multireturn then [] else
-            [ L [ K "global.set"; ID "retval3" ];
-              L [ K "global.set"; ID "retval2" ];
-            ];
+            [ L [ K "global.set"; ID "retval2" ] ];
 
           [ L [ K "return" ] ];
         ] |> List.flatten
@@ -680,9 +688,7 @@ let restart_helper gpad =
 let call_restart_helper =
   [ L [ K "call"; ID "restart_helper" ]]
   @ if !enable_multireturn then [] else
-      [ L [ K "global.get"; ID "retval2" ];
-        L [ K "global.get"; ID "retval3" ];
-      ]
+      [ L [ K "global.get"; ID "retval2" ]]
 
 let reset_frame =
   [ L [ K "func";
@@ -876,6 +882,14 @@ let push_alloc_as fpad store req_repr descr_opt =
   match store, req_repr with
     | Const x, (RValue | RIntVal) ->
         push_const (Int32.logor (Int32.shift_left (Int32.of_int x) 1) 1l)
+    | Local(RInt, name), (RValue | RIntVal) ->
+        (* saves one instr *)
+        push_local name
+        @ push_local name
+        @ [ L [ K "i32.add" ];
+            L [ K "i32.const"; N (I32 1l) ];
+            L [ K "i32.or" ]
+          ]
     | _ ->
         let sexpl_push = push fpad store in
         let repr = repr_of_store store in
@@ -884,16 +898,18 @@ let push_alloc_as fpad store req_repr descr_opt =
 let push_as fpad store req_repr =
   push_alloc_as fpad store req_repr None
 
-let pop_to fpad store repr descr_opt =
+let pop_to fpad store repr descr_opt code_value =
   match store with
     | RealAccu ->
-        tovalue_alloc fpad repr descr_opt
+        code_value
+        @ tovalue_alloc fpad repr descr_opt
         @ pop_to_local "accu"
     | Local(lrepr, name) ->
-        convert fpad repr lrepr descr_opt
+        code_value
+        @ convert fpad repr lrepr descr_opt
         @ pop_to_local name
     | RealStack pos ->
-        tovalue_alloc fpad repr descr_opt
+        (code_value @ tovalue_alloc fpad repr descr_opt)
         |> pop_to_stack fpad pos
     | _ ->
         assert false
@@ -923,48 +939,48 @@ let rec drop n l =
 let emit_unary fpad op src1 dest =
   match op with
     | Pnegint ->
-        push_as fpad src1 RIntVal
-        @  [ L [ K "i32.const";
-                 N (I32 (0xffff_fffel));
-               ];
-             L [ K "i32.xor" ];
-             L [ K "i32.const";
-                 N (I32 2l);
-               ];
-             L [ K "i32.add" ];
-           ]
-        @ pop_to fpad dest RIntVal None
+        ( push_as fpad src1 RIntVal
+          @  [ L [ K "i32.const";
+                   N (I32 (0xffff_fffel));
+                 ];
+               L [ K "i32.xor" ];
+               L [ K "i32.const";
+                   N (I32 2l);
+                 ];
+               L [ K "i32.add" ];
+             ]
+        ) |> pop_to fpad dest RIntVal None
     | Pboolnot ->
-        push_as fpad src1 RIntVal
-        @ [ L [ K "i32.const";
-                N (I32 2l);
-              ];
-            L [ K "i32.xor" ]
-          ]
-        @ pop_to fpad dest RIntVal None
+        ( push_as fpad src1 RIntVal
+          @ [ L [ K "i32.const";
+                  N (I32 2l);
+                ];
+              L [ K "i32.xor" ]
+            ]
+        ) |> pop_to fpad dest RIntVal None
     | Poffsetint offset ->
-        push_as fpad src1 RIntVal
-        @ [ L [ K "i32.const";
-                N (I32 (Int32.shift_left (Int32.of_int offset) 1));
-              ];
-            L [ K "i32.add" ]
-          ]
-        @ pop_to fpad dest RIntVal None
+        ( push_as fpad src1 RIntVal
+          @ [ L [ K "i32.const";
+                  N (I32 (Int32.shift_left (Int32.of_int offset) 1));
+                ];
+              L [ K "i32.add" ]
+            ]
+        ) |> pop_to fpad dest RIntVal None
     | Pisint ->
-        push_as fpad src1 RValue
-        @ [ L [ K "i32.const"; N (I32 1l) ];
-            L [ K "i32.and" ];
-          ]
-        @ pop_to fpad dest RInt None
+        ( push_as fpad src1 RValue
+          @ [ L [ K "i32.const"; N (I32 1l) ];
+              L [ K "i32.and" ];
+            ]
+        ) |> pop_to fpad dest RInt None
     | Pgetfield field ->
         assert(field >= 0);
-        push_as fpad src1 RValue
-        @ [ L [ K "i32.load";
-                K (sprintf "offset=0x%lx" (Int32.of_int (4 * field)));
-                K "align=2";
-              ];
-          ]
-        @ pop_to fpad dest RValue None
+        ( push_as fpad src1 RValue
+          @ [ L [ K "i32.load";
+                  K (sprintf "offset=0x%lx" (Int32.of_int (4 * field)));
+                  K "align=2";
+                ];
+            ]
+        ) |> pop_to fpad dest RValue None
     | Pgetfloatfield field ->
         (* dest is here a Local(RFloat,_), so no allocation needed *)
         ( match dest with
@@ -982,30 +998,30 @@ let emit_unary fpad op src1 dest =
     | Pvectlength ->
         (* CHECK: this is long enough for a helper function *)
         let local = new_local fpad RInt in
-        push_as fpad src1 RValue
-        @ [ L [ K "i32.const"; N (I32 4l) ];
-            L [ K "i32.sub" ];
-            L [ K "i32.load" ];
-            L [ K "local.tee"; ID local ];
-            L [ K "local.get"; ID local ];
-            L [ K "i32.const"; N (I32 0xffl) ];
-            L [ K "i32.and" ];
-            L [ K "i32.const";
-                N (I32 (Int32.of_int double_array_tag));
-              ];
-            L [ K "i32.eq" ];  (* 1 if double array, else 0 *)
-            L [ K "i32.const";
-                N (I32 9l)
-              ];
-            L [ K "i32.add" ];
-            L [ K "i32.shr_u" ];
-            (* shift by 10 for double array, else by 9 *)
-            L [ K "i32.const";
-                N (I32 1l);
-              ];
-            L [ K "i32.or" ];
-          ]
-        @ pop_to fpad dest RIntVal None
+        ( push_as fpad src1 RValue
+          @ [ L [ K "i32.const"; N (I32 4l) ];
+              L [ K "i32.sub" ];
+              L [ K "i32.load" ];
+              L [ K "local.tee"; ID local ];
+              L [ K "local.get"; ID local ];
+              L [ K "i32.const"; N (I32 0xffl) ];
+              L [ K "i32.and" ];
+              L [ K "i32.const";
+                  N (I32 (Int32.of_int double_array_tag));
+                ];
+              L [ K "i32.eq" ];  (* 1 if double array, else 0 *)
+              L [ K "i32.const";
+                  N (I32 9l)
+                ];
+              L [ K "i32.add" ];
+              L [ K "i32.shr_u" ];
+              (* shift by 10 for double array, else by 9 *)
+              L [ K "i32.const";
+                  N (I32 1l);
+                ];
+              L [ K "i32.or" ];
+            ]
+        ) |> pop_to fpad dest RIntVal None
     | Pgetpubmet k ->
         assert false (* TODO *)
 
@@ -1040,23 +1056,23 @@ let emit_unaryeffect fpad op src1 =
           ]
 
 let emit_int_binary fpad src1 src2 dest instrs_int =
-  push_as fpad src1 RInt
-  @ push_as fpad src2 RInt
-  @ instrs_int
-  @ pop_to fpad dest RInt None
+  ( push_as fpad src1 RInt
+    @ push_as fpad src2 RInt
+    @ instrs_int
+  ) |> pop_to fpad dest RInt None
 
 let emit_intval_binary fpad src1 src2 dest instrs_int instrs_intval =
   if repr_of_store src1 = RInt && repr_of_store src2 = RInt then
-    push_as fpad src1 RInt
-    @ push_as fpad src2 RInt
-    @ instrs_int
-    @ tovalue fpad RInt
-    @ pop_to fpad dest RIntVal None
+    ( push_as fpad src1 RInt
+      @ push_as fpad src2 RInt
+      @ instrs_int
+      @ tovalue fpad RInt
+    ) |> pop_to fpad dest RIntVal None
   else
-    push_as fpad src1 RIntVal
-    @ push_as fpad src2 RIntVal
-    @ instrs_intval
-    @ pop_to fpad dest RIntVal None
+    ( push_as fpad src1 RIntVal
+      @ push_as fpad src2 RIntVal
+      @ instrs_intval
+    ) |> pop_to fpad dest RIntVal None
 
 let emit_binary fpad op src1 src2 dest =
   match op with
@@ -1140,53 +1156,53 @@ let emit_binary fpad op src1 src2 dest =
             fpad src1 src2 dest
             [ L [ K wasm_op ]]
         else (* repr doesn't matter *)
-          push fpad src1
-          @ push fpad src2
-          @ [ L [ K wasm_op ]]
-          @ pop_to fpad dest RInt None
+          ( push fpad src1
+            @ push fpad src2
+            @ [ L [ K wasm_op ]]
+          ) |> pop_to fpad dest RInt None
     | Pgetvectitem ->
-        push_as fpad src1 RValue
-        @ ( match src2, repr_of_store src2 with
-              | Const c, _ ->
-                  [ L [ K "i32.load";
-                        K (sprintf "offset=0x%lx" (Int32.shift_left (Int32.of_int c) 2));
-                        K "align=2"
+        ( push_as fpad src1 RValue
+          @ ( match src2, repr_of_store src2 with
+                | Const c, _ ->
+                    [ L [ K "i32.load";
+                          K (sprintf "offset=0x%lx" (Int32.shift_left (Int32.of_int c) 2));
+                          K "align=2"
+                        ]
+                    ]
+                | _, RInt ->
+                    push_as fpad src2 RInt
+                    @ [ L [ K "i32.const"; N (I32 2l) ];
+                        L [ K "i32.shl" ];
+                        L [ K "i32.add" ];
+                        L [ K "i32.load"; K "align=2" ]
                       ]
-                  ]
-              | _, RInt ->
-                  push_as fpad src2 RInt
-                  @ [ L [ K "i32.const"; N (I32 2l) ];
-                      L [ K "i32.shl" ];
-                      L [ K "i32.add" ];
-                      L [ K "i32.load"; K "align=2" ]
-                    ]
-              | _ ->
-                  push_as fpad src2 RIntVal
-                  @ [ L [ K "i32.const"; N (I32 1l) ];
-                      L [ K "i32.shl" ];
-                      L [ K "i32.const"; N (I32 0xffff_fffcl) ];
-                      L [ K "i32.and" ];
-                      L [ K "i32.add" ];
-                      L [ K "i32.load"; K "align=2" ]
-                    ]
-          )
-        @ pop_to fpad dest RValue None
+                | _ ->
+                    push_as fpad src2 RIntVal
+                    @ [ L [ K "i32.const"; N (I32 1l) ];
+                        L [ K "i32.shl" ];
+                        L [ K "i32.const"; N (I32 0xffff_fffcl) ];
+                        L [ K "i32.and" ];
+                        L [ K "i32.add" ];
+                        L [ K "i32.load"; K "align=2" ]
+                      ]
+            )
+        ) |> pop_to fpad dest RValue None
     | Pgetstringchar | Pgetbyteschar ->
-        push_as fpad src1 RValue
-        @ ( match src2 with
-              | Const c ->
-                  [ L [ K "i32.load8_u";
-                        K "align=2";
-                        K (sprintf "offset=0x%x" c)
-                      ]
-                  ]
-              | _ ->
-                  push_as fpad src2 RInt
-                  @ [ L [ K "i32.add" ];
-                      L [ K "i32.load8_u"; K "align=2" ]
+        ( push_as fpad src1 RValue
+          @ ( match src2 with
+                | Const c ->
+                    [ L [ K "i32.load8_u";
+                          K "align=2";
+                          K (sprintf "offset=0x%x" c)
+                        ]
                     ]
-          )
-        @ pop_to fpad dest RInt None
+                | _ ->
+                    push_as fpad src2 RInt
+                    @ [ L [ K "i32.add" ];
+                        L [ K "i32.load8_u"; K "align=2" ]
+                      ]
+            )
+        ) |> pop_to fpad dest RInt None
     | Pgetmethod ->
         assert false (* TODO *)
     | Pgetdynmet ->
@@ -1284,7 +1300,9 @@ let makeblock fpad descr src_list tag =
           @ [ L [ K "call"; ID "caml_initialize" ]]
         )
         src_list in
-  (ptr, sexpl_alloc @ List.flatten sexpl_init)
+  let c1 = [ C "<makeblock>" ] in
+  let c2 = [ C "</makeblock>" ] in
+  (ptr, c1 @ sexpl_alloc @ List.flatten sexpl_init @ c2)
 
 let makefloatblock fpad descr src_list =
   let size = List.length src_list in
@@ -1358,15 +1376,15 @@ let closurerec gpad fpad descr src_list dest_list =
   let sexpl_dest =
     List.mapi
       (fun i (dest, _) ->
-        [ L [ K "local.get"; ID ptr ] ]
-        @ (if i > 0 then
-             [ L [ K "i32.const"; N (I32 (Int32.of_int (3*i-1))) ];
-               L [ K "i32.add" ]
-             ]
-           else
-             []
-          )
-        @ pop_to fpad dest RValue None  (* descr is not up to date *)
+        ( [ L [ K "local.get"; ID ptr ] ]
+          @ (if i > 0 then
+               [ L [ K "i32.const"; N (I32 (Int32.of_int (3*i-1))) ];
+                 L [ K "i32.add" ]
+               ]
+             else
+               []
+            )
+        ) |> pop_to fpad dest RValue None  (* descr is not up to date *)
       )
       dest_list
     |> List.flatten in
@@ -1467,7 +1485,7 @@ let switch fpad src labls_ints labls_blocks =
         ]
     ]
 
-let grab num =
+let grab fpad num =
   let sexpl =
     [ (* if (codeptr & 1) *)
       L [ K "local.get"; ID "codeptr" ];
@@ -1476,15 +1494,14 @@ let grab num =
       L [ K "if";
           L ( [ K "then";
                 (* RESTART *)
-                (* (env, extra_args, fp) = restart_helper(env, extra_args, fp) *)
-                L [ K "local.get"; ID "env" ];
+                (* (extra_args, fp) = restart_helper(envptr, extra_args, fp) *)
+                L [ K "local.get"; ID "envptr" ];
                 L [ K "local.get"; ID "extra_args" ];
                 L [ K "local.get"; ID "fp" ];
               ]
               @ call_restart_helper
-              @ [ L [ K "local.set"; ID "fp" ];
-                  L [ K "local.set"; ID "extra_args" ];
-                  L [ K "local.set"; ID "env" ];
+              @ pop_to_fp fpad
+              @ [ L [ K "local.set"; ID "extra_args" ];
 
                   (* codeptr &= ~1 *)
                   L [ K "local.get"; ID "codeptr" ];
@@ -1507,7 +1524,7 @@ let grab num =
               L [ K "local.set"; ID "extra_args" ];
             ];
           L [ K "else";
-              L [ K "local.get"; ID "env" ];
+              L [ K "local.get"; ID "envptr" ];
               L [ K "local.get"; ID "extra_args" ];
               L [ K "local.get"; ID "codeptr" ];
               L [ K "i32.const"; N (I32 1l) ];
@@ -1522,15 +1539,19 @@ let grab num =
   sexpl
 
 let return =
+  (* NB. don't use bp here *)
   [ C "$return";
     L [ K "local.get"; ID "extra_args" ];
     L [ K "if";
-        L ( [ K "then";
-              L [ K "local.get"; ID "accu" ];
-              L [ K "local.get"; ID "extra_args" ];
-              L [ K "i32.const"; N (I32 1l) ];
-              L [ K "i32.sub" ];
-            ]
+        L ( [ K "then" ]
+            @ ( push_local "accu"
+                |> pop_to_field "envptr" 0
+              )
+            @ [ L [ K "local.get"; ID "envptr" ];
+                L [ K "local.get"; ID "extra_args" ];
+                L [ K "i32.const"; N (I32 1l) ];
+                L [ K "i32.sub" ];
+              ]
             @ push_field "accu" 0
             @ [ L [ K "local.tee"; ID "codeptr" ];
 
@@ -1551,7 +1572,7 @@ let return =
                     L [ K "param"; K "i32" ];
                     L [ K "result"; K "i32" ];
                   ];
-                L [ K "local.set"; ID "accu" ];
+                L [ K "return" ]
               ]
           )
       ];
@@ -1563,9 +1584,12 @@ let return =
 let apply fpad numargs depth =
   let env_pos = (-depth + numargs + 1) in
   let codeptr = new_local fpad RValue in
-  [ L [ K "local.get"; ID "accu" ];
-    L [ K "i32.const"; N (I32 (Int32.of_int (numargs-1))) ];
-  ]
+  ( push_local "accu"
+    |> pop_to_stack fpad env_pos
+  )
+  @ push_field_addr "fp" env_pos (* new envptr *)
+  @ [ L [ K "i32.const"; N (I32 (Int32.of_int (numargs-1))) ];
+    ]
   @ push_field "accu" 0
   @ [ L [ K "local.tee"; ID codeptr ];
 
@@ -1600,11 +1624,9 @@ let apply fpad numargs depth =
         ];
       L [ K "local.set"; ID "accu" ];
     ]
-  (* @ debug2_var 51 "accu" *)
-  @ push_stack fpad env_pos   (* env might have been moved by GC *)
-  @ pop_to_local "env"
 
-let appterm_common =
+let appterm_common fpad =
+  (* NB. don't use bp here *)
   let sexpl_frame =
     (* TODO: for small num, expand reset_frame *)
     (* debug2_var 40 "accu" *)
@@ -1613,14 +1635,14 @@ let appterm_common =
     @ push_local "appterm_old_num_args"
     @ push_local "appterm_new_num_args"
     @ [ L [ K "call"; ID "reset_frame" ] ]
-    @ pop_to_local "fp" in
+    @ pop_to_local "fp"   (* no need to set bp here *)
+  in
   let sexpl_regs =
     push_local "extra_args"
     @ push_local "appterm_new_num_args"
     @ [ L [ K "i32.add" ]]
     @ pop_to_local "extra_args"
-    @ push_local "accu"
-    @ pop_to_local "env"
+    @ (push_local "accu" |> pop_to_field "envptr" 0)
     @ push_field "accu" 0
     @ pop_to_local "appterm_codeptr" in
   let sexpl_call =
@@ -1642,14 +1664,13 @@ let appterm_common =
               L [ K "local.set"; ID "codeptr" ];
               L [ K "br"; ID "startover" ]
             ];
-          L [ K "else";
-              (* different letrec: call + return. In the future,
-                 this can be turned to a tailcall *)
-              (* we can jump to $return if we adjust a bit... *)
-              L [ K "local.get"; ID "env" ];
-              L [ K "local.set"; ID "accu" ];
-              L [ K "br"; ID "return" ];
-            ]
+          L ( [ K "else";
+                (* different letrec: call + return. In the future,
+                   this can be turned to a tailcall *)
+                (* we can jump to $return *)
+              ]
+              @ [ L [ K "br"; ID "return" ] ]
+            )
         ]
     ] in
   [ C "$appterm_common" ]
@@ -1670,7 +1691,7 @@ let appterm fpad numargs oldnumargs depth =
   sexpl
 
 let trap gpad fpad trylabel catchlabel depth =
-  (* push 4 values onto stack: 0, 0, env, extra_args *)
+  (* push 4 values onto stack: 0, 0, 0, extra_args *)
   (* get function pointer and codeptr *)
   (* caught = wasicaml_try4(f, env, extra_args, codeptr, fp - depth) *)
   (* if (caught): accu = Caml_state->exn_bucket; jump lab *)
@@ -1680,11 +1701,11 @@ let trap gpad fpad trylabel catchlabel depth =
   let sexpl_stack =
     (push_const 0l |> pop_to_stack fpad (-depth-1))
     @ (push_const 0l |> pop_to_stack fpad (-depth-2))
-    @ (push_local "env" |> pop_to_stack fpad (-depth-3))
+    @ (push_const 0l |> pop_to_stack fpad (-depth-3))
     @ (push_local "extra_args" |> pop_to_stack fpad (-depth-4)) in
   let sexpl_try =
     push_wasmptr gpad trylabel
-    @ push_local "env"
+    @ push_local "envptr"
     @ push_local "extra_args"
     @ push_codeptr gpad trylabel
     @ push_local "fp"
@@ -1696,8 +1717,6 @@ let trap gpad fpad trylabel catchlabel depth =
         L [ K "local.set"; ID local ];
       ]
     (* @ debug2 30 1 *)
-    @ push_stack fpad (-depth-3)
-    @ pop_to_local "env"
     @ [ L [ K "local.get"; ID local ];
         L [ K "if";
             L [ K "then";
@@ -1743,14 +1762,13 @@ let rec emit_instr gpad fpad instr =
     | Walloc arg ->
         copy fpad arg.src arg.dest (Some arg.descr)
     | Wenv arg ->
-        push_field "env" arg.field
+        push_env
+        @ load_offset (4 * arg.field)
         @ pop_to_local "accu"
     | Wcopyenv arg ->
-        push_local "env"
+        push_env
         @ ( if arg.offset > 0 then
-              [ L [ K "i32.const"; N (I32 (Int32.of_int arg.offset)) ];
-                L [ K "i32.add" ]
-              ]
+              add_offset (4 * arg.offset)
             else
               []
           )
@@ -1839,7 +1857,7 @@ let rec emit_instr gpad fpad instr =
                 @ [ L [ K "return" ]]
         )
     | Wgrab arg ->
-        grab arg.numargs
+        grab fpad arg.numargs
     | Wclosurerec arg ->
         closurerec gpad fpad arg.descr arg.src arg.dest
     | Wraise arg ->
@@ -1887,11 +1905,7 @@ let emit_fblock gpad fpad fblock =
   let instrs =
     Wc_unstack.transl_fblock fpad.lpad fblock
     |> emit_instrs gpad fpad in
-  [ L [ K "local.get"; ID "fp" ];
-    L [ K "i32.const"; N (I32 (Int32.of_int (4 * maxdepth))) ];
-    L [ K "i32.sub" ];
-    L [ K "local.set"; ID "bp" ];
-  ]
+  set_bp fpad
   @ instrs
 
 let get_funcmapping scode =
@@ -2007,7 +2021,7 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
     ]
     @ (subfunc_sexpl
        |> cond_section
-            fpad.need_appterm_common "appterm_common" appterm_common
+            fpad.need_appterm_common "appterm_common" (appterm_common fpad)
        |> cond_loop
             fpad.need_appterm_common "startover"
        |> cond_section
@@ -2029,7 +2043,7 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
             ID func_name;
           ]
           @ (if export_flag then [ L [ K "export"; S func_name ]] else [])
-          @ [ L [ K "param"; ID "env"; K "i32" ];
+          @ [ L [ K "param"; ID "envptr"; K "i32" ];
               L [ K "param"; ID "extra_args"; K "i32" ];
               L [ K "param"; ID "codeptr"; K "i32" ];
               L [ K "param"; ID "fp"; K "i32" ];
@@ -2045,12 +2059,23 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
                )
                locals
             )
-           (* @ debug2 0 letrec_label
-              @ debug2_var 10 "fp"
-              @ debug2_var 11 "env"
-              @ debug2_var 12 "codeptr"
-              @ debug2_var 13 "extra_args"
-            *)
+          (* @ debug2 0 letrec_label
+             @ debug2_var 10 "fp"
+             @ debug2_var 11 "envptr"
+             @ debug2_var 12 "codeptr"
+             @ debug2_var 13 "extra_args"
+             @ [ L [ K "local.get"; ID "envptr" ];   (* print 14: env, if possible *)
+              L [ K "i32.const"; N (I32 (-1l)) ];
+              L [ K "i32.ne" ];
+              L [ K "if";
+                  L ( [ K "then";
+                        L [ K "i32.const"; N (I32 14l) ]]
+                      @ push_env
+                      @ [ L [ K "call"; ID "debug2" ]]
+                    )
+                ]
+            ]
+           *)
           @ sexpl
           @ [ L [ K "unreachable" ]]
         )
@@ -2071,7 +2096,7 @@ let generate_main scode gpad =
     try Hashtbl.find gpad.subfunctions letrec_label
     with Not_found -> assert false in
   assert(subfunc_labels <> []);
-  let func_name = "mainfunc" in
+  let func_name = "letrec_main" in
   generate_function scode gpad letrec_label func_name subfunc_labels true
 
 

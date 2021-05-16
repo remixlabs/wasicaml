@@ -52,6 +52,10 @@ type store =
    and set this when an incompatibility is found.
  *)
 
+(* maybe also add RBool as representations - with only 0 and 1 as values,
+   after a comparison. Converting RBool to RValue is a bit cheaper
+   (can use "select" instruction)
+ *)
 
 type global = Global of int
 type label = Label of int | Loop of int
