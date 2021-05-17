@@ -33,6 +33,15 @@ type state =
     (* number of args pf the current function - first set after Kgrab *)
   }
 
+(* IDEA: there is sometimes code setting the accu, but then the accu
+   is not accessed. Add to state:
+
+   accu_used : bool ref option
+
+   which is in particular set by straighten_accu. The ref is set to true
+   whenever there is a read access of state.accu.
+ *)
+
 type lpad =  (* local pad *)
   { locals : (string, repr) Hashtbl.t;
     (* IDEA: maybe switch to (string, repr * bool ref) Hashtbl.t. The bool

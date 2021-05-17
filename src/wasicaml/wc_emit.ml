@@ -53,6 +53,8 @@ type gpad =  (* global pad *)
     (* maps letrec_label to list of subfunction labels *)
     wasmindex : (int, int) Hashtbl.t;
     (* maps letrec label to the (relative) index in the table of functions *)
+    mutable need_reset_frame : bool;
+    mutable need_reset_frame_k : ISet.t;
   }
 
 type fpad =  (* function pad *)
@@ -749,6 +751,134 @@ let reset_frame =
         L [ K "return" ]
       ];
   ]
+
+let reset_frame_k new_num_args =
+  [ L ( [ K "func";
+          ID (sprintf "reset_frame_%d" new_num_args);
+          L [ K "param"; ID "fp"; K "i32" ];
+          L [ K "param"; ID "depth"; K "i32" ];
+          L [ K "param"; ID "old_num_args"; K "i32" ];  (* >= 1 *)
+          BR;
+          L [ K "result"; C "out_fp"; K "i32" ];
+          L [ K "local"; ID "i"; K "i32" ];
+          L [ K "local"; ID "bp"; K "i32" ];
+          L [ K "local"; ID "new_fp"; K "i32" ];
+
+          (* new_fp = fp + old_num_args - new_num_args *)
+          L [ K "local.get"; ID "fp" ];
+          L [ K "local.get"; ID "old_num_args" ];
+          L [ K "i32.const"; N (I32 (Int32.of_int new_num_args)) ];
+          L [ K "i32.sub" ];
+          L [ K "i32.const"; N (I32 2l) ];
+          L [ K "i32.shl" ];
+          L [ K "i32.add" ];
+          L [ K "local.set"; ID "new_fp" ];
+
+          (* bp = fp - depth *)
+          L [ K "local.get"; ID "fp" ];
+          L [ K "local.get"; ID "depth" ];
+          L [ K "i32.const"; N (I32 2l) ];
+          L [ K "i32.shl" ];
+          L [ K "i32.sub" ];
+          L [ K "local.set"; ID "bp" ];
+        ]
+        @ ( Wc_util.enum 0 new_num_args
+            |> List.map
+                 (fun j ->
+                   let i = new_num_args - 1 - j in
+
+                   [ (* new_fp[i] = ... *)
+                     L [ K "local.get"; ID "new_fp" ];
+
+                     (* bp[i)] *)
+                     L [ K "local.get"; ID "bp" ];
+                     L [ K "i32.load";
+                         K (sprintf "offset=0x%x" i);
+                         K "align=2"
+                       ];
+
+                     (* assign *)
+                     L [ K "i32.store";
+                         K (sprintf "offset=0x%x" i);
+                         K "align=2"
+                       ];
+                   ]
+                 )
+            |> List.flatten
+          )
+        @ [ L [ K "local.get"; ID "new_fp" ];
+            L [ K "return" ]
+          ]
+      )
+  ]
+
+let appterm_helper =
+  [ L ( [ [ K "func";
+            ID "appterm_helper";
+            L [ K "param"; ID "envptr"; K "i32" ];
+            L [ K "param"; ID "codeptr"; K "i32" ];
+            L [ K "param"; ID "accu"; K "i32" ];
+            L [ K "param"; ID "extra_args"; K "i32" ];
+            L [ K "param"; ID "new_num_args"; K "i32" ];
+            BR;
+            L [ K "result"; C "out_codeptr"; K "i32" ];
+          ];
+          if !enable_multireturn then
+            [L [ K "result"; C "out_extra_args"; K "i32" ]]
+          else [];
+          [ L [ K "local"; ID "out_codeptr"; K "i32" ]];
+
+          push_local "extra_args";
+          push_local "new_num_args";
+          [ L [ K "i32.add" ]];
+          pop_to_local "extra_args";
+
+          (push_local "accu" |> pop_to_field "envptr" 0);
+
+          push_field "accu" 0;
+          pop_to_local "out_codeptr";
+
+          [ L [ K "local.get"; ID "out_codeptr" ];
+            L [ K "i32.const"; N (I32 code_pointer_letrec_mask) ];
+            L [ K "i32.and" ];
+            L [ K "local.get"; ID "codeptr" ];
+            L [ K "i32.const"; N (I32 code_pointer_letrec_mask) ];
+            L [ K "i32.and" ];
+            L [ K "i32.eq" ];
+            L [ K "if";
+                L ( [ K "then" ;
+                      (* same letrec: we can jump! *)
+                      L [ K "local.get"; ID "out_codeptr" ];
+                      L [ K "local.get"; ID "extra_args" ];
+                      L [ K "i32.const"; N (I32 1l) ];
+                      L [ K "i32.sub" ]
+                    ]
+                    @ (if !enable_multireturn then [] else
+                         [ L [ K "global.set"; ID "retval2" ] ]
+                      )
+                    @ [ L [ K "return" ] ]
+                  );
+                L ( [ K "else";
+                      (* different letrec: call + return. *)
+                      L [ K "i32.const"; N (I32 0l) ];
+                      L [ K "local.get"; ID "extra_args" ]
+                    ]
+                    @ (if !enable_multireturn then [] else
+                         [ L [ K "global.set"; ID "retval2" ] ]
+                      )
+                    @ [ L [ K "return" ]]
+                  )
+              ];
+            L [ K "unreachable" ]
+          ]
+        ] |> List.flatten
+      )
+  ]
+
+let call_appterm_helper =
+  [ L [ K "call"; ID "appterm_helper" ]]
+  @ if !enable_multireturn then [] else
+      [ L [ K "global.get"; ID "retval2" ]]
 
 let wasicaml_get_data =
   [ L [ K "func";
@@ -1539,7 +1669,9 @@ let grab fpad num =
   sexpl
 
 let return =
-  (* NB. don't use bp here *)
+  (* NB. don't use bp here.
+     codeptr is already destroyed when coming from appterm_common
+   *)
   [ C "$return";
     L [ K "local.get"; ID "extra_args" ];
     L [ K "if";
@@ -1627,65 +1759,54 @@ let apply fpad numargs depth =
 
 let appterm_common fpad =
   (* NB. don't use bp here *)
-  let sexpl_frame =
-    (* TODO: for small num, expand reset_frame *)
-    (* debug2_var 40 "accu" *)
-    push_local "fp"
-    @ push_local "appterm_depth"
-    @ push_local "appterm_old_num_args"
-    @ push_local "appterm_new_num_args"
-    @ [ L [ K "call"; ID "reset_frame" ] ]
-    @ pop_to_local "fp"   (* no need to set bp here *)
-  in
-  let sexpl_regs =
-    push_local "extra_args"
-    @ push_local "appterm_new_num_args"
-    @ [ L [ K "i32.add" ]]
-    @ pop_to_local "extra_args"
-    @ (push_local "accu" |> pop_to_field "envptr" 0)
-    @ push_field "accu" 0
-    @ pop_to_local "appterm_codeptr" in
-  let sexpl_call =
-    [ L [ K "local.get"; ID "appterm_codeptr" ];
-      L [ K "i32.const"; N (I32 code_pointer_letrec_mask) ];
-      L [ K "i32.and" ];
-      L [ K "local.get"; ID "codeptr" ];
-      L [ K "i32.const"; N (I32 code_pointer_letrec_mask) ];
-      L [ K "i32.and" ];
-      L [ K "i32.eq" ];
+  [ C "$appterm_common";
+    L [ K "local.get"; ID "envptr" ];
+    L [ K "local.get"; ID "codeptr" ];
+    L [ K "local.get"; ID "accu" ];
+    L [ K "local.get"; ID "extra_args" ];
+    L [ K "local.get"; ID "appterm_new_num_args" ];
+  ]
+  @ call_appterm_helper
+  @ [ L [ K "local.set"; ID "extra_args" ];
+      L [ K "local.tee"; ID "codeptr" ];
       L [ K "if";
-          L [ K "then" ;
+          L [ K "then";
               (* same letrec: we can jump! *)
-              L [ K "local.get"; ID "extra_args" ];
-              L [ K "i32.const"; N (I32 1l) ];
-              L [ K "i32.sub" ];
-              L [ K "local.set"; ID "extra_args" ];
-              L [ K "local.get"; ID "appterm_codeptr" ];
-              L [ K "local.set"; ID "codeptr" ];
               L [ K "br"; ID "startover" ]
             ];
-          L ( [ K "else";
-                (* different letrec: call + return. In the future,
-                   this can be turned to a tailcall *)
-                (* we can jump to $return *)
-              ]
-              @ [ L [ K "br"; ID "return" ] ]
-            )
+          L [ K "else";
+              (* different letrec: call + return. In the future,
+                 this can be turned to a tailcall *)
+              (* we can jump to $return *)
+              L [ K "br"; ID "return" ]
+            ]
         ]
-    ] in
-  [ C "$appterm_common" ]
-  @ sexpl_frame @ sexpl_regs @ sexpl_call
+    ]
 
-
-let appterm fpad numargs oldnumargs depth =
+let appterm gpad fpad numargs oldnumargs depth =
   let sexpl =
-    push_const (Int32.of_int depth)
-    @ pop_to_local "appterm_depth"
-    @ push_const (Int32.of_int oldnumargs)
-    @ pop_to_local "appterm_old_num_args"
-    @ push_const (Int32.of_int numargs)
-    @ pop_to_local "appterm_new_num_args"
-    @ [ L [ K "br"; ID "appterm_common" ] ] in
+    if numargs <= 10 then (
+      gpad.need_reset_frame_k <- ISet.add numargs gpad.need_reset_frame_k;
+      push_local "fp"
+      @ push_const (Int32.of_int depth)
+      @ push_const (Int32.of_int oldnumargs)
+      @ [ L [ K "call"; ID (sprintf "reset_frame_%d" numargs) ] ]
+      @ pop_to_local "fp"   (* no need to set bp here *)
+      @ push_const (Int32.of_int numargs)
+      @ pop_to_local "appterm_new_num_args"
+      @ [ L [ K "br"; ID "appterm_common" ] ]
+     ) else (
+      gpad.need_reset_frame <- true;
+      push_local "fp"
+      @ push_const (Int32.of_int depth)
+      @ push_const (Int32.of_int oldnumargs)
+      @ push_const (Int32.of_int numargs)
+      @ [ L [ K "call"; ID "reset_frame" ] ]
+      @ pop_to_local "fp"   (* no need to set bp here *)
+      @ push_const (Int32.of_int numargs)
+      @ pop_to_local "appterm_new_num_args"
+      @ [ L [ K "br"; ID "appterm_common" ] ]
+    ) in
   fpad.need_appterm_common <- true;
   fpad.need_return <- true;
   sexpl
@@ -1844,7 +1965,7 @@ let rec emit_instr gpad fpad instr =
     | Wapply arg ->
         apply fpad arg.numargs arg.depth
     | Wappterm arg ->
-        appterm fpad arg.numargs arg.oldnumargs arg.depth
+        appterm gpad fpad arg.numargs arg.oldnumargs arg.depth
     | Wreturn arg ->
         ( match repr_of_store arg.src with
             | RValue ->
@@ -2029,10 +2150,7 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
       ) in
 
   if fpad.need_appterm_common then (
-    Hashtbl.add fpad.lpad.locals "appterm_depth" RInt;
-    Hashtbl.add fpad.lpad.locals "appterm_old_num_args" RInt;
     Hashtbl.add fpad.lpad.locals "appterm_new_num_args" RInt;
-    Hashtbl.add fpad.lpad.locals "appterm_codeptr" RInt;
   );
 
   let locals =
@@ -2205,6 +2323,8 @@ let generate scode exe get_defname =
       primitives = Hashtbl.create 7;
       wasmindex;
       letrec_name;
+      need_reset_frame = false;
+      need_reset_frame_k = ISet.empty;
     } in
 
   let sexpl_code =
@@ -2296,8 +2416,17 @@ let generate scode exe get_defname =
   @ alloc_decr
   @ alloc_slow
   @ grab_helper gpad
+  @ appterm_helper
   @ restart_helper gpad
-  @ reset_frame
+  @ (if gpad.need_reset_frame then
+       reset_frame
+     else
+       []
+    )
+  @ (ISet.elements gpad.need_reset_frame_k
+     |> List.map reset_frame_k
+     |> List.flatten
+    )
   @ sexpl_code
 (* Only PIC:
   @ [ L ( [ K "elem";
