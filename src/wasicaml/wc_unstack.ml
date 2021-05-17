@@ -55,7 +55,7 @@ let empty_state =
   { camlstack = [];
     camldepth = 0;
     realstack = ISet.empty;
-    accu = RealAccu;
+    accu = RealAccu { no_function = false };
     realaccu = ISet.empty;
     arity = 1;
   }
@@ -82,7 +82,8 @@ let realdepth state =
 
 let stack_descr state =
   let stack_save_accu =
-    state.realaccu <> ISet.empty || state.accu = RealAccu in
+    state.realaccu <> ISet.empty ||
+      ( match state.accu with RealAccu _ -> true | _ -> false) in
   { stack_init = state.realstack;
     stack_depth = realdepth state;
     stack_save_accu
@@ -115,7 +116,7 @@ let pop_camlstack state =
             else
               state.realstack
         }
-    | RealAccu :: tl ->
+    | RealAccu _ :: tl ->
         { state with
           camlstack = tl;
           camldepth = cd - 1;
@@ -145,7 +146,7 @@ let push_camlstack store state =
                       else
                         state.realstack;
         }
-    | RealAccu ->
+    | RealAccu _ ->
         { state with
           camlstack = store :: state.camlstack;
           camldepth = cd + 1;
@@ -164,7 +165,7 @@ let flush_accu lpad state =
     ISet.fold
       (fun pos instr_acc ->
         let instr =
-          Wcopy { src=RealAccu; dest=RealStack pos } in
+          Wcopy { src=RealAccu { no_function=false }; dest=RealStack pos } in
         instr :: instr_acc
       )
       state.realaccu
@@ -195,12 +196,12 @@ let straighten_accu lpad state =
    *)
   let state, instrs_flush = flush_accu lpad state in
   match state.accu with
-    | RealAccu ->
+    | RealAccu _ ->
         (state, instrs_flush)
     | store ->
         let instr =
-          Wcopy { src=store; dest=RealAccu } in
-        let state = { state with accu = RealAccu } in
+          Wcopy { src=store; dest=RealAccu { no_function=false } } in
+        let state = { state with accu = RealAccu { no_function=false } } in
         (state, instrs_flush @ [instr])
 
 let straighten_accu_when_on_stack lpad state =
@@ -291,7 +292,7 @@ let straighten_stack_at lpad state pos =
   let k = pos + state.camldepth in
   let store = List.nth state.camlstack k in
   match store with
-    | RealAccu ->
+    | RealAccu _ ->
         assert(ISet.mem pos state.realaccu);
         flush_accu lpad state
     | RealStack p when p = pos ->
@@ -318,9 +319,14 @@ let straighten_stack_multi lpad state pos_list =
       pos_list in
   (state, List.rev rev_acc)
 
+let accu_is_realaccu state =
+  match state.accu with
+    | RealAccu _ -> true
+    | _ -> false
+
 let straighten_all lpad state =
   let state, instrs1 = straighten_accu lpad state in
-  assert(state.accu = RealAccu && state.realaccu = ISet.empty);
+  assert(accu_is_realaccu state && state.realaccu = ISet.empty);
   let cd = state.camldepth in
   let pos_list =
     state.camlstack
@@ -334,17 +340,16 @@ let straighten_all lpad state =
                  [-cd+i]
          ) in
   let state, instrs2 = straighten_stack_multi lpad state pos_list in
-  assert(state.accu = RealAccu && state.realaccu = ISet.empty);
   (state, instrs1 @ instrs2)
 
-let unary_operation lpad state op_repr op_code =
+let unary_operation ?(no_function=false) lpad state op_repr op_code =
   let src1 = state.accu in
   match op_repr with
     | RValue ->
         (* result goes into accu *)
         let state, instrs_flush = flush_accu lpad state in
-        let state = { state with accu = RealAccu } in
-        let instrs_op = [ Wunary { op=op_code; src1; dest=RealAccu }] in
+        let state = { state with accu = RealAccu { no_function } } in
+        let instrs_op = [ Wunary { op=op_code; src1; dest=RealAccu { no_function } }] in
         (state, instrs_flush @ instrs_op)
     | _ ->
         let dest_name = new_local lpad op_repr in
@@ -359,7 +364,7 @@ let unary_effect lpad state op_code =
   let instrs_op = [ Wunaryeffect { op=op_code; src1 }] in
   (state, instrs_op)
 
-let binary_operation lpad state op_repr op_code =
+let binary_operation ?(no_function=false) lpad state op_repr op_code =
   let src1 = state.accu in
   let src2 = List.hd state.camlstack in
   match op_repr with
@@ -367,9 +372,9 @@ let binary_operation lpad state op_repr op_code =
         (* result goes into accu *)
         let state, instrs_flush = flush_accu lpad state in
         let state =
-          { state with accu = RealAccu }
+          { state with accu = RealAccu { no_function } }
           |> pop_camlstack in
-        let instrs_op = [ Wbinary { op=op_code; src1; src2; dest=RealAccu }] in
+        let instrs_op = [ Wbinary { op=op_code; src1; src2; dest=RealAccu { no_function } }] in
         (state, instrs_flush @ instrs_op)
     | _ ->
         let dest_name = new_local lpad op_repr in
@@ -441,14 +446,14 @@ let transl_instr lpad state instr =
         (state, instrs_flush @ instrs_copy)
     | Kenvacc field ->
         let state, instrs_flush = flush_accu lpad state in
-        let state = { state with accu = RealAccu } in
+        let state = { state with accu = RealAccu { no_function=false } } in
         let instrs_op = [ Wenv { field } ] in
         (state, instrs_flush @ instrs_op)
     | Kgetglobal ident ->
         let offset = global_offset ident in
         assert(offset >= 0);
         let state, instrs_flush = flush_accu lpad state in
-        let state = { state with accu = RealAccu } in
+        let state = { state with accu = RealAccu { no_function=false } } in
         let instrs_op = [ Wgetglobal { src=Global offset } ] in
         (state, instrs_flush @ instrs_op)
     | Knegint ->
@@ -526,9 +531,9 @@ let transl_instr lpad state instr =
         let instrs =
           instrs_flush
           @ [ Wunary { op=Pgetfloatfield field; src1; dest=temp; };
-              Walloc { src=temp; dest=RealAccu; descr }
+              Walloc { src=temp; dest=RealAccu { no_function=true }; descr }
             ] in
-        let state = { state with accu = RealAccu } in
+        let state = { state with accu = RealAccu { no_function=true } } in
         (state, instrs)
     | Kmakeblock(0, tag) ->
         let state = { state with accu = Atom tag } in
@@ -542,7 +547,7 @@ let transl_instr lpad state instr =
           instrs_flush
           @ [ Wmakeblock { tag; src; descr } ] in
         let state =
-          { state with accu = RealAccu }
+          { state with accu = RealAccu { no_function=true }}
           |> popn_camlstack (size-1) in
         (state, instrs)
     | Kmakefloatblock size ->
@@ -555,7 +560,7 @@ let transl_instr lpad state instr =
           instrs_flush
           @ [ Wmakefloatblock { src; descr } ] in
         let state =
-          { state with accu = RealAccu }
+          { state with accu = RealAccu { no_function=true } }
           |> popn_camlstack (size-1) in
         (state, instrs)
     | Kccall (name, num) when num <= 5 ->
@@ -566,8 +571,9 @@ let transl_instr lpad state instr =
         let instrs =
           instrs_flush
           @ [ Wccall { name; src; descr } ] in
+        let no_function = Hashtbl.mem Wc_prims.prims_non_func_result name in
         let state =
-          { state with accu = RealAccu }
+          { state with accu = RealAccu { no_function }}
           |> popn_camlstack (num-1) in
         (state, instrs)
     | Kccall (name, num) ->
@@ -577,8 +583,9 @@ let transl_instr lpad state instr =
         let instrs =
           instrs_str
           @ [ Wccall_vector { name; numargs=num; depth; descr }] in
+        let no_function = Hashtbl.mem Wc_prims.prims_non_func_result name in
         let state =
-          { state with accu = RealAccu }
+          { state with accu = RealAccu { no_function }}
           |> popn_camlstack (num-1) in
         (state, instrs)
     | Kbranch label ->
@@ -613,7 +620,7 @@ let transl_instr lpad state instr =
           @ [ Wcopy { src=Const 0; dest=RealStack(-cd+num-3) };
               Wcopy { src=Const 0; dest=RealStack(-cd+num-2) };
               Wcopy { src=Const 0; dest=RealStack(-cd+num-1) };
-              Wapply { numargs=num; depth=cd+3; src=RealAccu }
+              Wapply { numargs=num; depth=cd+3; src=RealAccu { no_function=false } }
             ] in
         let state = state |> popn_camlstack num in
         (state, instrs)
@@ -621,7 +628,7 @@ let transl_instr lpad state instr =
         let state, instrs_str = straighten_all lpad state in
         let instrs =
           instrs_str
-          @ [ Wapply { numargs=num; depth=state.camldepth; src=RealAccu }
+          @ [ Wapply { numargs=num; depth=state.camldepth; src=RealAccu { no_function=false } }
             ] in
         let state = state |> popn_camlstack (num+3) in
         (state, instrs)
@@ -653,9 +660,9 @@ let transl_instr lpad state instr =
         let descr = stack_descr state in
         let instrs =
           instrs_flush
-          @ [ Wclosurerec { src; dest=[ RealAccu, lab ]; descr }] in
+          @ [ Wclosurerec { src; dest=[ RealAccu { no_function=false }, lab ]; descr }] in
         let state =
-          { state with accu = RealAccu }
+          { state with accu = RealAccu { no_function=false } }
           |> popn_camlstack (max (num-1) 0) in
         (state, instrs)
     | Kclosurerec(funcs, num) ->
@@ -688,7 +695,7 @@ let transl_instr lpad state instr =
         (state, instrs)
     | Koffsetclosure offset ->
         let state, instrs_flush = flush_accu lpad state in
-        let state = { state with accu = RealAccu } in
+        let state = { state with accu = RealAccu { no_function=false } } in
         let instrs =
           instrs_flush
           @ [ Wcopyenv { offset } ] in
@@ -738,7 +745,7 @@ let transl_fblock lpad fblock =
       assert(ISet.max_elt state.realstack = (-1));
       assert(ISet.cardinal state.realstack = d);
     );
-    assert(state.accu = RealAccu);
+    assert(accu_is_realaccu state);
     assert(state.realaccu = ISet.empty) in
 
   let update_state_table state labels =
@@ -786,7 +793,7 @@ let transl_fblock lpad fblock =
                 (next_state, List.rev_append (comment :: instrs) acc)
             | Trap { trylabel; catchlabel } ->
                 let state, instrs_str = straighten_all lpad state in
-                let state = { state with accu = RealAccu } in
+                let state = { state with accu = RealAccu { no_function=false } } in
                 let instrs =
                   [ Wcomment (sprintf "***Trap(try=%d,catch=%d)" trylabel catchlabel) ]
                   @ instrs_str

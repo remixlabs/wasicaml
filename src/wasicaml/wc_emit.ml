@@ -140,12 +140,18 @@ let empty_fpad() =
 let new_local fpad repr =
   Wc_unstack.new_local fpad.lpad repr
 
-let set_bp fpad =
-  [ L [ K "local.get"; ID "fp" ];
-    L [ K "i32.const"; N (I32 (Int32.of_int (4 * fpad.maxdepth))) ];
+let set_bp_1 fpad =
+  [ L [ K "i32.const"; N (I32 (Int32.of_int (4 * fpad.maxdepth))) ];
     L [ K "i32.sub" ];
     L [ K "local.set"; ID "bp" ];
   ]
+
+let set_bp fpad =
+  if fpad.maxdepth = 0 then
+    []
+  else
+    [ L [ K "local.get"; ID "fp" ] ]
+    @ set_bp_1 fpad
 
 let push_const n =
   [ L [ K "i32.const"; N (I32 n) ]]
@@ -157,8 +163,11 @@ let pop_to_local var =
   [ L [ K "local.set"; ID var ]]
 
 let pop_to_fp fpad =
-  pop_to_local "fp"
-  @ set_bp fpad
+  if fpad.maxdepth = 0 then
+    pop_to_local "fp"
+  else
+    [ L [ K "local.tee"; ID "fp" ]]
+    @ set_bp_1 fpad
 
 let load_offset offset =
   if offset >= 0 then
@@ -520,11 +529,6 @@ let grab_helper gpad =
             L [ K "result"; K "i32" ];
             L [ K "local"; ID "accu"; K "i32" ];
             L [ K "local"; ID "i"; K "i32" ];
-            L [ K "local"; ID "bp"; K "i32" ];
-          ];
-
-          [ L [ K "local.get"; ID "fp" ];
-            L [ K "local.set"; ID "bp" ]  (* used in setup_for_gc *)
           ];
 
           setup_for_gc fpad descr;
@@ -574,7 +578,13 @@ let grab_helper gpad =
               ]
           ];
 
-          (push_local "codeptr" |> pop_to_field "accu" 0);
+          ( (push_local "codeptr" @
+               [ L [ K "i32.const"; N (I32 1l) ];  (* restart flag *)
+                 L [ K "i32.or" ]
+               ]
+            )
+            |> pop_to_field "accu" 0
+          );
           (push_const 5l |> pop_to_field "accu" 1);
 
           push_local "accu";
@@ -812,6 +822,48 @@ let reinit_frame_k new_num_args =
       )
   ]
 
+let return_helper =
+  [ L ( [ [ K "func";
+            ID "return_helper";
+            L [ K "param"; ID "envptr"; K "i32" ];
+            L [ K "param"; ID "extra_args"; K "i32" ];
+            L [ K "param"; ID "fp"; K "i32" ];
+            L [ K "param"; ID "accu"; K "i32" ];
+            BR;
+            L [ K "result"; K "i32" ];
+            L [ K "local"; ID "codeptr"; K "i32" ];
+          ];
+          ( push_local "accu"
+            |> pop_to_field "envptr" 0
+          );
+          [ L [ K "local.get"; ID "envptr" ];
+            L [ K "local.get"; ID "extra_args" ];
+            L [ K "i32.const"; N (I32 1l) ];
+            L [ K "i32.sub" ];
+          ];
+          push_field "accu" 0;
+          [ L [ K "local.tee"; ID "codeptr" ] ];
+
+          [ L [ K "local.get"; ID "fp" ];
+            L [ K "local.get"; ID "codeptr" ];
+            L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
+            L [ K "i32.shr_u" ];
+
+            (* TODO: use a tail call *)
+            L [ K "call_indirect";
+                N (I32 0l);    (* table *)
+                L [ K "param"; K "i32" ];
+                L [ K "param"; K "i32" ];
+                L [ K "param"; K "i32" ];
+                L [ K "param"; K "i32" ];
+                L [ K "result"; K "i32" ];
+              ];
+            L [ K "return" ]
+          ]
+        ] |> List.flatten
+      )
+  ]
+
 let appterm_helper =
   [ L ( [ [ K "func";
             ID "appterm_helper";
@@ -997,7 +1049,7 @@ let convert fpad repr_from repr_to descr_opt =
 let push fpad store =
   (* put the value in store onto the wasm stack *)
   match store with
-    | RealAccu ->
+    | RealAccu _ ->
         push_local "accu"
     | Local(repr, name) ->
         push_local name
@@ -1030,7 +1082,7 @@ let push_as fpad store req_repr =
 
 let pop_to fpad store repr descr_opt code_value =
   match store with
-    | RealAccu ->
+    | RealAccu _ ->
         code_value
         @ tovalue_alloc fpad repr descr_opt
         @ pop_to_local "accu"
@@ -1046,7 +1098,7 @@ let pop_to fpad store repr descr_opt code_value =
 
 let copy fpad src dest descr_opt =
   match dest with
-    | RealAccu ->
+    | RealAccu _ ->
         push_as fpad src RValue
         @ pop_to_local "accu"
     | Local(repr, name) ->
@@ -1633,11 +1685,13 @@ let grab fpad num =
               @ pop_to_fp fpad
               @ [ L [ K "local.set"; ID "extra_args" ];
 
-                  (* codeptr &= ~1 *)
+                  (* codeptr &= ~1 - I think this is not needed *)
+                  (*
                   L [ K "local.get"; ID "codeptr" ];
                   L [ K "i32.const"; N (I32 0xffff_fffel) ];
                   L [ K "i32.and" ];
                   L [ K "local.set"; ID "codeptr" ];
+                   *)
                 ]
             )
         ];
@@ -1657,8 +1711,6 @@ let grab fpad num =
               L [ K "local.get"; ID "envptr" ];
               L [ K "local.get"; ID "extra_args" ];
               L [ K "local.get"; ID "codeptr" ];
-              L [ K "i32.const"; N (I32 1l) ];
-              L [ K "i32.or" ];  (* codeptr of RESTART *)
               L [ K "local.get"; ID "fp" ];
               L [ K "call"; ID "grab_helper" ];
               (* L ( K "block" :: debug2 1 0); *)
@@ -1675,41 +1727,16 @@ let return =
   [ C "$return";
     L [ K "local.get"; ID "extra_args" ];
     L [ K "if";
-        L ( [ K "then" ]
-            @ ( push_local "accu"
-                |> pop_to_field "envptr" 0
-              )
-            @ [ L [ K "local.get"; ID "envptr" ];
-                L [ K "local.get"; ID "extra_args" ];
-                L [ K "i32.const"; N (I32 1l) ];
-                L [ K "i32.sub" ];
-              ]
-            @ push_field "accu" 0
-            @ [ L [ K "local.tee"; ID "codeptr" ];
-
-                (* L [ K "i32.const"; N (I32 4l) ];
-                   L [K "local.get"; ID "codeptr" ];
-                   L [K "call"; ID "debug2" ];
-                 *)
-
-                L [ K "local.get"; ID "fp" ];
-                L [ K "local.get"; ID "codeptr" ];
-                L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
-                L [ K "i32.shr_u" ];
-                L [ K "call_indirect";
-                    N (I32 0l);    (* table *)
-                    L [ K "param"; K "i32" ];
-                    L [ K "param"; K "i32" ];
-                    L [ K "param"; K "i32" ];
-                    L [ K "param"; K "i32" ];
-                    L [ K "result"; K "i32" ];
-                  ];
-                L [ K "return" ]
-              ]
-          )
+        L [ K "then";
+            L [ K "local.get"; ID "envptr" ];
+            L [ K "local.get"; ID "extra_args" ];
+            L [ K "local.get"; ID "fp" ];
+            L [ K "local.get"; ID "accu" ];
+            L [ K "call"; ID "return_helper" ];  (* TODO: use tail call *)
+            L [ K "return" ]
+          ]
       ];
     L [ K "local.get"; ID "accu" ];
-    (* L ( K "block" :: debug2 1 1); *)
     L [ K "return" ];
   ]
 
@@ -1967,15 +1994,18 @@ let rec emit_instr gpad fpad instr =
     | Wappterm arg ->
         appterm gpad fpad arg.numargs arg.oldnumargs arg.depth
     | Wreturn arg ->
-        ( match repr_of_store arg.src with
-            | RValue ->
-                (* return value could be another closure *)
-                fpad.need_return <- true;
-                push_as fpad arg.src RValue
-                @ [ L [ K "br"; ID "return" ]]
-            | _ ->
-                push_as fpad arg.src RValue
-                @ [ L [ K "return" ]]
+        let no_function =
+          match arg.src with
+            | RealAccu { no_function } -> no_function
+            | _ -> repr_of_store arg.src <> RValue in
+        if no_function then
+          push_as fpad arg.src RValue
+          @ [ L [ K "return" ]]
+        else (
+          (* return value could be another closure *)
+          fpad.need_return <- true;
+          push_as fpad arg.src RValue
+          @ [ L [ K "br"; ID "return" ]]
         )
     | Wgrab arg ->
         grab fpad arg.numargs
@@ -2019,10 +2049,10 @@ and emit_instrs gpad fpad instrs =
   |> List.rev
 
 let emit_fblock gpad fpad fblock =
-  let maxdepth = Wc_tracestack.max_stack_depth_of_fblock fblock + 2 in
+  let maxdepth = Wc_tracestack.max_stack_depth_of_fblock fblock in
   (* make maxdepth a bit larger than stricly necessary to completely avoid
      bp[k] with k<0 *)
-  fpad.maxdepth <- maxdepth;
+  fpad.maxdepth <- if maxdepth > 0 then maxdepth + 2 else 0;
   let instrs =
     Wc_unstack.transl_fblock fpad.lpad fblock
     |> emit_instrs gpad fpad in
@@ -2416,6 +2446,7 @@ let generate scode exe get_defname =
   @ alloc_decr
   @ alloc_slow
   @ grab_helper gpad
+  @ return_helper
   @ appterm_helper
   @ restart_helper gpad
   @ (if gpad.need_reinit_frame then

@@ -20,8 +20,12 @@ type repr =
 type store =
   | RealStack of int
     (* it's on the real OCaml stack at the given position, i.e. at fp[pos] *)
-  | RealAccu
-    (* stored in the accu variable as RValue *)
+  | RealAccu of { no_function : bool;
+                }
+    (* stored in the accu variable as RValue.
+       no_function: if true, it is guaranteed that the value is not a closure.
+       So far used for optimizing returns after C calls.
+     *)
   | Const of int
     (* it's a constant *)
   | Local of repr * string
@@ -138,6 +142,7 @@ type winstruction =
   | Wswitch of { labels_int:label array; labels_blk:label array; src:store }
   | Wapply of { numargs:int; depth:int; src:store }
   | Wappterm of { numargs:int; oldnumargs:int; depth:int } (* src=accu *)
+    (* CHECK: maybe also pass args individually to appterm *)
   | Wreturn of { src:store }
   | Wgrab of { numargs:int }
   | Wclosurerec of { src:store list; dest:(store * int) list;
@@ -153,7 +158,7 @@ let repr_of_store =
   | RealStack _ -> RValue
   | Const _ -> RInt
   | Local(repr, _) -> repr
-  | RealAccu -> RValue
+  | RealAccu _ -> RValue
   | Atom _ -> RValue
 
 let empty_descr =
@@ -165,7 +170,7 @@ let empty_descr =
 let string_of_store =
   function
   | RealStack pos -> sprintf "fp[%d]" pos
-  | RealAccu -> "accu"
+  | RealAccu _ -> "accu"
   | Const k -> sprintf "%d" k
   | Local(repr, name) -> name
   | Atom k -> sprintf "atom%d" k
