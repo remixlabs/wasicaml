@@ -53,8 +53,8 @@ type gpad =  (* global pad *)
     (* maps letrec_label to list of subfunction labels *)
     wasmindex : (int, int) Hashtbl.t;
     (* maps letrec label to the (relative) index in the table of functions *)
-    mutable need_reset_frame : bool;
-    mutable need_reset_frame_k : ISet.t;
+    mutable need_reinit_frame : bool;
+    mutable need_reinit_frame_k : ISet.t;
   }
 
 type fpad =  (* function pad *)
@@ -692,9 +692,9 @@ let call_restart_helper =
   @ if !enable_multireturn then [] else
       [ L [ K "global.get"; ID "retval2" ]]
 
-let reset_frame =
+let reinit_frame =
   [ L [ K "func";
-        ID "reset_frame";
+        ID "reinit_frame";
         L [ K "param"; ID "fp"; K "i32" ];
         L [ K "param"; ID "depth"; K "i32" ];
         L [ K "param"; ID "old_num_args"; K "i32" ];  (* >= 1 *)
@@ -752,9 +752,9 @@ let reset_frame =
       ];
   ]
 
-let reset_frame_k new_num_args =
+let reinit_frame_k new_num_args =
   [ L ( [ K "func";
-          ID (sprintf "reset_frame_%d" new_num_args);
+          ID (sprintf "reinit_frame_%d" new_num_args);
           L [ K "param"; ID "fp"; K "i32" ];
           L [ K "param"; ID "depth"; K "i32" ];
           L [ K "param"; ID "old_num_args"; K "i32" ];  (* >= 1 *)
@@ -1786,22 +1786,22 @@ let appterm_common fpad =
 let appterm gpad fpad numargs oldnumargs depth =
   let sexpl =
     if numargs <= 10 then (
-      gpad.need_reset_frame_k <- ISet.add numargs gpad.need_reset_frame_k;
+      gpad.need_reinit_frame_k <- ISet.add numargs gpad.need_reinit_frame_k;
       push_local "fp"
       @ push_const (Int32.of_int depth)
       @ push_const (Int32.of_int oldnumargs)
-      @ [ L [ K "call"; ID (sprintf "reset_frame_%d" numargs) ] ]
+      @ [ L [ K "call"; ID (sprintf "reinit_frame_%d" numargs) ] ]
       @ pop_to_local "fp"   (* no need to set bp here *)
       @ push_const (Int32.of_int numargs)
       @ pop_to_local "appterm_new_num_args"
       @ [ L [ K "br"; ID "appterm_common" ] ]
      ) else (
-      gpad.need_reset_frame <- true;
+      gpad.need_reinit_frame <- true;
       push_local "fp"
       @ push_const (Int32.of_int depth)
       @ push_const (Int32.of_int oldnumargs)
       @ push_const (Int32.of_int numargs)
-      @ [ L [ K "call"; ID "reset_frame" ] ]
+      @ [ L [ K "call"; ID "reinit_frame" ] ]
       @ pop_to_local "fp"   (* no need to set bp here *)
       @ push_const (Int32.of_int numargs)
       @ pop_to_local "appterm_new_num_args"
@@ -2323,8 +2323,8 @@ let generate scode exe get_defname =
       primitives = Hashtbl.create 7;
       wasmindex;
       letrec_name;
-      need_reset_frame = false;
-      need_reset_frame_k = ISet.empty;
+      need_reinit_frame = false;
+      need_reinit_frame_k = ISet.empty;
     } in
 
   let sexpl_code =
@@ -2418,13 +2418,13 @@ let generate scode exe get_defname =
   @ grab_helper gpad
   @ appterm_helper
   @ restart_helper gpad
-  @ (if gpad.need_reset_frame then
-       reset_frame
+  @ (if gpad.need_reinit_frame then
+       reinit_frame
      else
        []
     )
-  @ (ISet.elements gpad.need_reset_frame_k
-     |> List.map reset_frame_k
+  @ (ISet.elements gpad.need_reinit_frame_k
+     |> List.map reinit_frame_k
      |> List.flatten
     )
   @ sexpl_code
