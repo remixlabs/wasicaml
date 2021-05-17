@@ -361,46 +361,65 @@ let alloc_atom fpad tag =
     L [ K "i32.add" ];
   ]
 
-let alloc_decr =
-  [ L [ K "func";
-        ID "alloc_decr";
-        L [ K "param"; ID "size"; K "i32" ];
-        BR;
-        L [ K "result"; C "ptr"; K "i32" ];
-        L [ K "local"; ID "x"; K "i32" ];
-
-        (* Caml_state_field(young_ptr) = ... *)
-        L [ K "global.get"; ID "wasicaml_domain_state" ];
-
-        (* Caml_state_field(young_ptr) - Whsize_wosize (wosize) *)
-        L [ K "global.get"; ID "wasicaml_domain_state" ];
-        L [ K "i32.load";
-            K (sprintf "offset=0x%lx" (Int32.of_int (8 * domain_field_young_ptr)));
-            K "align=2"
-          ];
-        L [ K "local.get"; ID "size" ];
-        L [ K "i32.sub" ];
-        L [ K "local.tee"; ID "x" ];
-
-        L [ K "i32.store";
-            K (sprintf "offset=0x%lx" (Int32.of_int (8 * domain_field_young_ptr)));
-            K "align=2"
+let alloc_fast =
+  [ L ( [ [ K "func";
+            ID "alloc_fast";
+            L [ K "param"; ID "bhsize"; K "i32" ];
+            L [ K "param"; ID "header"; K "i32" ];
+            BR;
+            L [ K "result"; C "ptr"; K "i32" ];
+            L [ K "local"; ID "ptr"; K "i32" ];
           ];
 
-        L [ K "local.get"; ID "x" ];
-        L [ K "return" ]
-      ]
+          (* ptr = Caml_state_field(young_ptr) - Whsize_wosize (wosize) *)
+          push_domain_field domain_field_young_ptr;
+          push_local "bhsize";
+          [ L [ K "i32.sub" ];
+            L [ K "local.tee"; ID "ptr" ];
+          ];
+
+          (* Caml_state_field(young_ptr) = ptr *)
+          ( push_local "ptr"
+            |> pop_to_domain_field domain_field_young_ptr
+          );
+
+          (* if (ptr < Caml_state_field(young_limit)) return 0 *)
+          push_domain_field domain_field_young_limit;
+          [ L [ K "i32.lt_u" ] ];
+          [ L [ K "if";
+                L [ K "then";
+                    L [ K "i32.const"; N (I32 0l) ];
+                    L [ K "return" ]
+                  ]
+              ]
+          ];
+
+          (* *ptr = header *)
+          ( push_local "header"
+            |> pop_to_field "ptr" 0
+          );
+
+          (* return ptr+1 *)
+          push_local "ptr";
+          push_const 4l;
+          [ L [ K "i32.add" ];
+            L [ K "return" ]
+          ]
+        ] |> List.flatten
+      )
   ]
 
 let alloc_slow =
   [ L ( [ [ K "func";
             ID "alloc_slow";
-            L [ K "param"; ID "size"; K "i32" ];
+            L [ K "param"; ID "wosize"; K "i32" ];
+            L [ K "param"; ID "header"; K "i32" ];
             L [ K "param"; ID "fp"; K "i32" ];
             L [ K "param"; ID "stackdepth"; K "i32" ];
             L [ K "param"; ID "accu"; K "i32" ];
             BR;
             L [ K "result"; C "ptr"; K "i32" ];
+            L [ K "local"; ID "ptr"; K "i32" ];
           ];
           if !enable_multireturn then [
               L [ K "result"; C "out_accu"; K "i32" ];
@@ -411,25 +430,30 @@ let alloc_slow =
               L [ K "i32.const"; N (I32 4l) ];  (* for the accu *)
               L [ K "i32.sub" ];
               L [ K "local.tee"; ID "fp" ];
-
-             (* L [ K "local.tee"; ID "h.i32" ];
-                L ( K "block" :: debug2_var 20 "h.i32");
-              *)
             ]
             |> pop_to_domain_field domain_field_extern_sp
           )
           @ (push_local "accu" |> pop_to_field "fp" 0);
 
-          (* caml_alloc_small_dispatch(size, CAML_FROM_C, 1, NULL); *)
-          [ L [ K "local.get"; ID "size" ];
-            L [ K "i32.const"; N (I32 (Int32.of_int caml_from_c)) ];
-            L [ K "i32.const"; N (I32 1l) ];
-            L [ K "i32.const"; N (I32 0l) ];
-            L [ K "call"; ID "caml_alloc_small_dispatch" ];
-          ];
+          (* caml_alloc_small_dispatch(wosize, CAML_FROM_C, 1, NULL) *)
+          push_local "wosize";
+          push_const (Int32.of_int caml_from_c);
+          push_const 1l;
+          push_const 0l;
+          [ L [ K "call"; ID "caml_alloc_small_dispatch" ]];
 
-          (* return Caml_state_field(young_ptr) *)
           push_domain_field domain_field_young_ptr;
+          pop_to_local "ptr";
+
+          (* *ptr = header *)
+          ( push_local "header"
+            |> pop_to_field "ptr" 0
+          );
+
+          (* return ptr+1 *)
+          push_local "ptr";
+          push_const 4l;
+          [ L [ K "i32.add" ] ];
 
           (* return saved accu *)
           push_field "fp" 0;
@@ -451,65 +475,59 @@ let call_alloc_slow =
 
 
 let alloc_non_atom fpad descr size tag =
-  (* TODO: use new push/pop functions *)
   let ptr = new_local fpad RValue in
   let young = size <= max_young_wosize in
   let code =
     if young then
-      [ [ L [ K "i32.const";
-              N (I32 (Int32.of_int (4 * (size+1))));
-            ];
-          L [ K "call"; ID "alloc_decr" ];
+      [ push_const (Int32.of_int (4 * (size+1)));
+        push_const (Int32.of_int (make_header size tag));
+        [ L [ K "call"; ID "alloc_fast" ];
           L [ K "local.tee"; ID ptr ];
         ];
 
-        (* if (ptr < Caml_state_field(young_limit)) *)
-        push_domain_field domain_field_young_limit;
-        [ L [ K "i32.lt_u" ] ];
+        (* if (ptr == NULL) *)
+        [ L [ K "i32.eqz" ]];
         [ L [ K "if";
               L ( [ [
                       K "then";
                     ];
                     stack_init fpad descr;
                     push_const (Int32.of_int size);
+                    push_const (Int32.of_int (make_header size tag));
                     push_local "fp";
                     push_const (Int32.of_int (4 * descr.stack_depth));
                     push_local "accu";
                     call_alloc_slow;
                     pop_to_local "accu";
                     pop_to_local ptr;
-                ] |> List.flatten
-              );
-          ];
-
-        L [ K "local.get"; ID ptr ];
-        L [ K "i32.const";
-            N (I32 (Int32.of_int (make_header size tag)))
-          ];
-        L [ K "i32.store"; K "align=2" ];
-        L [ K "local.get"; ID ptr ];
-        L [ K "i32.const"; N (I32 4l) ];
-        L [ K "i32.add" ];
-      ] ] |> List.flatten
+                  ] |> List.flatten
+                )
+            ];
+        ];
+        debug2_var 100 ptr;
+      ] |> List.flatten
     else
       [ L [ K "i32.const"; N (I32 (Int32.of_int size)) ];
         L [ K "i32.const"; N (I32 (Int32.of_int tag)) ];
         L [ K "call"; ID "caml_alloc_shr" ];
+        L [ K "local.set"; ID ptr ];
       ] in
   (code, ptr, young)
 
 let alloc fpad descr size tag =
   if size = 0 then
-    let ptr = new_local fpad RValue in
-    let young = false in
-    (alloc_atom fpad tag, ptr, young)
+    alloc_atom fpad tag
   else
-    alloc_non_atom fpad descr size tag
+    let (code, ptr, _) = alloc_non_atom fpad descr size tag in
+    code @ push_local ptr
 
 let alloc_set fpad descr size tag =
-  let (code, ptr, young) = alloc fpad descr size tag in
-  let code = code @ [ L [ K "local.set"; ID ptr ]] in
-  (code, ptr, young)
+  if size = 0 then
+    let ptr = new_local fpad RValue in
+    let young = false in
+    (alloc_atom fpad tag @ push_local ptr, ptr, young)
+  else
+    alloc_non_atom fpad descr size tag
 
 let grab_helper gpad =
   (* generates a helper function:
@@ -992,7 +1010,7 @@ let tovalue_alloc fpad repr descr_opt =
         ( match descr_opt with
             | None -> failwith "cannot convert to double w/o stack descr"
             | Some descr ->
-                let (instrs_alloc, _, _) =
+                let instrs_alloc =
                   alloc fpad descr double_size double_tag in
                 let local = new_local fpad RFloat in
                 let instrs =
@@ -2443,7 +2461,7 @@ let generate scode exe get_defname =
   @ wasicaml_init
   @ wasicaml_get_data
   @ wasicaml_get_data_size (String.length data)
-  @ alloc_decr
+  @ alloc_fast
   @ alloc_slow
   @ grab_helper gpad
   @ return_helper
