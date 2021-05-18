@@ -427,7 +427,7 @@ let transl_instr lpad state instr =
         (state, [])
     | Kpush ->
         let state = push_camlstack state.accu state in
-        (state, [])
+        (state, [ Wcomment (sprintf "(depth=%d)" state.camldepth) ])
     | Kpush_retaddr lab ->
         let state = push_camlstack (Const 0) state in
         let state = push_camlstack (Const 0) state in
@@ -436,7 +436,7 @@ let transl_instr lpad state instr =
     | Kpop num ->
         let state, instrs = pop_real_stack lpad state num in
         let state = popn_camlstack num state in
-        (state, instrs)
+        (state, instrs @ [ Wcomment (sprintf "(depth=%d)" state.camldepth) ])
     | Kassign sp ->
         let cd = state.camldepth in
         let state, instrs_flush =
@@ -775,8 +775,9 @@ let transl_fblock lpad fblock =
           match instr with
             | Label label ->
                 (* eprintf "LABEL %d\n" label; *)
-                let comment = Wcomment (sprintf "Label %d" label) in
-                (get_state label, comment :: acc)
+                let state = get_state label in
+                let comment = Wcomment (sprintf "Label %d (depth=%d)" label state.camldepth) in
+                (state, comment :: acc)
             | Simple i ->
                 lpad.loops <- upd_loops;
                 let next_state, instrs = transl_instr lpad state i in
@@ -791,7 +792,7 @@ let transl_fblock lpad fblock =
                 let comment =
                   Wcomment ("***" ^ Wc_util.string_of_kinstruction i) in
                 (next_state, List.rev_append (comment :: instrs) acc)
-            | Trap { trylabel; catchlabel } ->
+            | Trap { trylabel; catchlabel; poplabel } ->
                 let state, instrs_str = straighten_all lpad state in
                 let state = { state with accu = RealAccu { no_function=false } } in
                 let instrs =
@@ -800,8 +801,10 @@ let transl_fblock lpad fblock =
                   @ [ Wtrap { trylabel;
                               catchlabel;
                               depth=state.camldepth
-                            }
+                            };
+                      Wbranch { label=Label poplabel }
                     ] in
+                update_state_table state [ catchlabel; poplabel ];
                 (state, List.rev_append instrs acc)
             | TryReturn ->
                 let instrs =

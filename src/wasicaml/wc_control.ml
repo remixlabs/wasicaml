@@ -20,7 +20,7 @@ type structured_code =
    | Block of block
    | Label of int
    | Simple of I.instruction
-   | Trap of { trylabel: int; catchlabel: int }
+   | Trap of { trylabel: int; catchlabel: int; poplabel: int }
    | TryReturn
 
  and cfg_scope =
@@ -30,7 +30,7 @@ type structured_code =
   }
 
 type trap_info =
-  | Trap_push of int
+  | Trap_push of int * int
   | Trap_pop of int * int
 
 type try_info =
@@ -247,7 +247,7 @@ let create_cfg code labels =
       pushtraps := IMap.add (start + !n) start !pushtraps;
     let cfg_trap =
       if is_pushtrap then
-        Some (Trap_push (start + !n))
+        Some (Trap_push (start + !n, -1))
       else if is_poptrap then
         match popfrom with
           | None ->
@@ -261,6 +261,11 @@ let create_cfg code labels =
               let push_node = IMap.find push_label !nodes in
               let push_node' =
                 { push_node with
+                  cfg_trap = ( match push_node.cfg_trap with
+                                 | Some (Trap_push(try_label, _)) ->
+                                     Some (Trap_push(try_label, start))
+                                 | _ -> assert false
+                             );
                   cfg_succ = start :: List.tl push_node.cfg_succ
                 } in
               nodes := IMap.add push_label push_node' !nodes;
@@ -423,8 +428,8 @@ let recover_structure ctx =
                    match instr with
                      | I.Kpushtrap catchlabel ->
                          ( match node.cfg_trap with
-                             | Some(Trap_push trylabel) ->
-                                 Trap { trylabel; catchlabel }
+                             | Some(Trap_push(trylabel, poplabel)) ->
+                                 Trap { trylabel; catchlabel; poplabel }
                              | _ ->
                                  assert false
                          )

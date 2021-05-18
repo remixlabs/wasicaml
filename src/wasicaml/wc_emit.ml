@@ -6,10 +6,10 @@ open Wc_instruct
 
 (* TODO:
    - do a stack check at the beginning of a function (but no realloc)
-   - use helper functions for Kapply?
    - check that subfunc fits into codeptr (10 bits)
    - helper functions for "makeblock"
    - check whether the accu needs to survive branches
+   - prevent that the stack can be reallocated
  *)
 
 (* OCaml functions are translated to Wasm functions with parameters:
@@ -504,7 +504,6 @@ let alloc_non_atom fpad descr size tag =
                 )
             ];
         ];
-        debug2_var 100 ptr;
       ] |> List.flatten
     else
       [ L [ K "i32.const"; N (I32 (Int32.of_int size)) ];
@@ -2030,13 +2029,13 @@ let rec emit_instr gpad fpad instr =
     | Wclosurerec arg ->
         closurerec gpad fpad arg.descr arg.src arg.dest
     | Wraise arg ->
-        push_as fpad arg.src RValue
-        @ [ L [ K "global.get"; ID "wasicaml_domain_state" ];
-            L [ K "i32.load";
-                K (sprintf "offset=0x%lx" (Int32.of_int (8 * domain_field_exn_bucket)));
-                K "align=2"
-              ];
-            L [ K "call"; ID "wasicaml_throw" ];
+        ( push_as fpad arg.src RValue
+          |> pop_to_domain_field domain_field_exn_bucket
+        )
+        @ ( push_local "fp"
+            |> pop_to_domain_field domain_field_extern_sp
+          )
+        @ [ L [ K "call"; ID "wasicaml_throw" ];
             L [ K "unreachable" ]
           ]
     | Wtrap arg ->
@@ -2225,7 +2224,7 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
                )
                locals
             )
-          (* @ debug2 0 letrec_label
+           (* @ debug2 0 letrec_label
              @ debug2_var 10 "fp"
              @ debug2_var 11 "envptr"
              @ debug2_var 12 "codeptr"
@@ -2241,7 +2240,7 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
                     )
                 ]
             ]
-           *)
+            *)
           @ sexpl
           @ [ L [ K "unreachable" ]]
         )

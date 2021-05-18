@@ -48,7 +48,7 @@ type structured_code =
    | Block of block
    | Label of int   (* precedes a sequence of Simple instructions *)
    | Simple of I.instruction
-   | Trap of { trylabel: int; catchlabel: int }
+   | Trap of { trylabel: int; catchlabel: int; poplabel: int }
    | TryReturn
 
  and cfg_scope =
@@ -62,7 +62,7 @@ type structured_code =
   }
 
 type trap_info =
-  | Trap_push of int
+  | Trap_push of int * int
   | Trap_pop of int * int
 
 type try_info =
@@ -73,7 +73,7 @@ type try_info =
 
    outer_1_label:
      Kpushtrap catch_label;
-     cfg_trap = Trap_push try_label;
+     cfg_trap = Trap_push (try_label, pop_label);
      cfg_succ = [ outer_2_label; catch_label ]
    try_label:
      cfg_try = Try_entry exit_label
@@ -81,7 +81,7 @@ type try_info =
    exit_label:
      cfg_try = Try_exit
      no instructions (symbolic node)
-   outer_2_label:
+   pop_label:
      Kpoptrap;
      cfg_trap = Trap_pop(try_label, exit_label)
  *)
