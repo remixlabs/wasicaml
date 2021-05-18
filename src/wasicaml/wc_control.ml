@@ -164,7 +164,8 @@ let create_cfg code labels =
     labels := ISet.add label !labels;
     max_label := label;
     label in
-  let nodes = ref IMap.empty in
+  let nodes = Hashtbl.create 7 in
+  let queued = Hashtbl.create 7 in
   let pushtraps = ref IMap.empty in
   let todo = Queue.create() in
   let m = ref 0 in
@@ -176,7 +177,7 @@ let create_cfg code labels =
   Queue.add (init_scope, None, 0) todo;
   let add where scope popfrom start =
     try
-      let node = IMap.find start !nodes in
+      let node = Hashtbl.find nodes start in
       if node.cfg_scope <> scope then (
         eprintf "[DEBUG] where=%d start=%d ex_scope=%s new_scope=%s\n%!"
                 where
@@ -186,11 +187,15 @@ let create_cfg code labels =
         failwith "bad scoping";
       )
     with Not_found ->
-      Queue.add (scope, popfrom, start) todo in
+      if not (Hashtbl.mem queued start) then (
+        Queue.add (scope, popfrom, start) todo;
+        Hashtbl.add queued start ();
+      ) in
   while not (Queue.is_empty todo) do
     let (cfg_scope, popfrom, start) = Queue.take todo in
+    Hashtbl.remove queued start;
     if start > !m then (
-      printf "start=%d\n%!" start;
+      (* printf "start=%d\n%!" start; *)
       m := start;
     );
     let n = ref 0 in
@@ -240,7 +245,7 @@ let create_cfg code labels =
                 cfg_length = 0;
                 cfg_final = None;
               } in
-            nodes := IMap.add exit_label exit_node !nodes;
+            Hashtbl.replace nodes exit_label exit_node;
             Some (Try_entry exit_label)
         | _ -> None in
     if is_pushtrap then
@@ -258,7 +263,7 @@ let create_cfg code labels =
               let push_label =
                 try IMap.find lab !pushtraps
                 with Not_found -> assert false in
-              let push_node = IMap.find push_label !nodes in
+              let push_node = Hashtbl.find nodes push_label in
               let push_node' =
                 { push_node with
                   cfg_trap = ( match push_node.cfg_trap with
@@ -268,8 +273,8 @@ let create_cfg code labels =
                              );
                   cfg_succ = start :: List.tl push_node.cfg_succ
                 } in
-              nodes := IMap.add push_label push_node' !nodes;
-              let try_node = IMap.find lab !nodes in
+              Hashtbl.replace nodes push_label push_node';
+              let try_node = Hashtbl.find nodes lab in
               let exit_node =
                 match try_node.cfg_try with
                   | Some (Try_entry l) -> l
@@ -287,7 +292,7 @@ let create_cfg code labels =
         cfg_length = !n;
         cfg_final;
       } in
-    nodes := IMap.add start cfg_node !nodes;
+    Hashtbl.replace nodes start cfg_node;
     if not last_no_cont then (
       let next = start + !n in
       let scope =
@@ -322,16 +327,17 @@ let create_cfg code labels =
    *)
   let map_label lab =
     try
-      let n = IMap.find lab !nodes in
+      let n = Hashtbl.find nodes lab in
       match n.cfg_trap with
         | Some (Trap_pop(_, exit_label)) ->
             exit_label
         | _ ->
             lab
     with Not_found -> lab in
-  nodes :=
-    IMap.mapi
-      (fun label node ->
+  let nodemap = ref IMap.empty in
+  Hashtbl.iter
+    (fun label node ->
+      let node =
         match node.cfg_trap with
           | Some (Trap_push _) ->
               (* there's only the Kpushtrap in it, which needs not to be
@@ -345,12 +351,13 @@ let create_cfg code labels =
                                 | Some instr ->
                                     Some (Wc_reader.map_label_in_instr map_label instr)
                             );
-              }
-      )
-      !nodes;
+              } in
+      nodemap := IMap.add label node !nodemap
+    )
+    nodes;
   let code = Array.map (Wc_reader.map_label_in_instr map_label) code in
   let cfg =
-    { nodes = !nodes;
+    { nodes = !nodemap;
       code;
       labels = !labels;
     } in
