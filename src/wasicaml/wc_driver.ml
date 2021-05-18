@@ -15,6 +15,9 @@ let main() =
   Arg.parse
     [ "-o", Arg.Set_string out,
       "<file>   Set the output file";
+
+      "-enable-multivalue", Arg.Set Wc_emit.enable_multireturn,
+      "   enable Wasm feature: multi-value returns (EXPERIMENTAL)";
     ]
     (fun arg ->
       if !inp <> None then

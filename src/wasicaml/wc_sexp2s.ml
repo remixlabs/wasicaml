@@ -222,14 +222,13 @@ let write_func_body f func_name locals_table sexpl =
   next [] 0 sexpl
 
 let rec remove_stuff l =
-  List.filter_map
-    (function
+  let rec f =
+    function
      | BR -> None
      | C _ -> None
      | L l -> Some (L (remove_stuff l))
-     | other -> Some other
-    )
-    l
+     | other -> Some other in
+  List.filter_map f l
 
 let write_file f filename sexpl =
   let import sym mod_name obj_name =

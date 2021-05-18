@@ -7,9 +7,9 @@ open Wc_instruct
 (* TODO:
    - do a stack check at the beginning of a function (but no realloc)
    - check that subfunc fits into codeptr (10 bits)
-   - helper functions for "makeblock"
-   - check whether the accu needs to survive branches
+   - helper functions for "makeblock": field initialization
    - prevent that the stack can be reallocated
+   - division by zero check for div, mod
  *)
 
 (* OCaml functions are translated to Wasm functions with parameters:
@@ -83,6 +83,7 @@ type fpad =  (* function pad *)
 
 let enable_multireturn = ref false
 (* whether Wasm code can use multivalue returns *)
+(* NB. This seems to be broken in llvm-11 *)
 
 let code_pointer_shift = 12
   (* OCaml code pointers:
@@ -409,7 +410,7 @@ let alloc_fast =
       )
   ]
 
-let alloc_slow =
+let alloc_slow() =
   [ L ( [ [ K "func";
             ID "alloc_slow";
             L [ K "param"; ID "wosize"; K "i32" ];
@@ -419,11 +420,12 @@ let alloc_slow =
             L [ K "param"; ID "accu"; K "i32" ];
             BR;
             L [ K "result"; C "ptr"; K "i32" ];
-            L [ K "local"; ID "ptr"; K "i32" ];
           ];
           if !enable_multireturn then [
               L [ K "result"; C "out_accu"; K "i32" ];
             ] else [];
+          [ L [ K "local"; ID "ptr"; K "i32" ]
+          ];
           ( [ L [ K "local.get"; ID "fp" ];
               L [ K "local.get"; ID "stackdepth" ];
               L [ K "i32.sub" ];
@@ -468,7 +470,7 @@ let alloc_slow =
       )
   ]
 
-let call_alloc_slow =
+let call_alloc_slow() =
   [ L [ K "call"; ID "alloc_slow" ]]
   @ if !enable_multireturn then [] else
       [ L [ K "global.get"; ID "retval2" ] ]
@@ -497,7 +499,7 @@ let alloc_non_atom fpad descr size tag =
                     push_local "fp";
                     push_const (Int32.of_int (4 * descr.stack_depth));
                     push_local "accu";
-                    call_alloc_slow;
+                    call_alloc_slow();
                     pop_to_local "accu";
                     pop_to_local ptr;
                   ] |> List.flatten
@@ -714,7 +716,7 @@ let restart_helper gpad =
       )
   ]
 
-let call_restart_helper =
+let call_restart_helper() =
   [ L [ K "call"; ID "restart_helper" ]]
   @ if !enable_multireturn then [] else
       [ L [ K "global.get"; ID "retval2" ]]
@@ -881,7 +883,7 @@ let return_helper =
       )
   ]
 
-let appterm_helper =
+let appterm_helper() =
   [ L ( [ [ K "func";
             ID "appterm_helper";
             L [ K "param"; ID "envptr"; K "i32" ];
@@ -944,7 +946,7 @@ let appterm_helper =
       )
   ]
 
-let call_appterm_helper =
+let call_appterm_helper() =
   [ L [ K "call"; ID "appterm_helper" ]]
   @ if !enable_multireturn then [] else
       [ L [ K "global.get"; ID "retval2" ]]
@@ -1076,6 +1078,8 @@ let push fpad store =
         push_stack fpad pos
     | Atom tag ->
         alloc_atom fpad tag
+    | Invalid ->
+        assert false
 
 let push_alloc_as fpad store req_repr descr_opt =
   match store, req_repr with
@@ -1337,28 +1341,29 @@ let emit_binary fpad op src1 src2 dest =
           fpad src1 src2 dest
           [ L [ K "i32.shr_s" ] ]
     | (Pintcomp cmp | Puintcomp cmp) ->
-        let wasm_op, force_int =
+        let wasm_op =
           match op with
-            | Pintcomp Ceq | Puintcomp Ceq -> "i32.eq", false
-            | Pintcomp Cne | Puintcomp Cne -> "i32.ne", false
-            | Pintcomp Clt -> "i32.lt_s", true
-            | Pintcomp Cle -> "i32.le_s", true
-            | Pintcomp Cgt -> "i32.gt_s", true
-            | Pintcomp Cge -> "i32.ge_s", true
-            | Puintcomp Clt -> "i32.lt_u", true
-            | Puintcomp Cle -> "i32.le_u", true
-            | Puintcomp Cgt -> "i32.gt_u", true
-            | Puintcomp Cge -> "i32.ge_u", true
+            | Pintcomp Ceq | Puintcomp Ceq -> "i32.eq"
+            | Pintcomp Cne | Puintcomp Cne -> "i32.ne"
+            | Pintcomp Clt -> "i32.lt_s"
+            | Pintcomp Cle -> "i32.le_s"
+            | Pintcomp Cgt -> "i32.gt_s"
+            | Pintcomp Cge -> "i32.ge_s"
+            | Puintcomp Clt -> "i32.lt_u"
+            | Puintcomp Cle -> "i32.le_u"
+            | Puintcomp Cgt -> "i32.gt_u"
+            | Puintcomp Cge -> "i32.ge_u"
             | _ -> assert false in
-        if force_int || repr_of_store src1 <> repr_of_store src2 then
-          emit_int_binary
-            fpad src1 src2 dest
-            [ L [ K wasm_op ]]
-        else (* repr doesn't matter *)
+        if repr_comparable_as_i32 (repr_of_store src1) (repr_of_store src2) then
+          (* repr doesn't matter *)
           ( push fpad src1
             @ push fpad src2
             @ [ L [ K wasm_op ]]
           ) |> pop_to fpad dest RInt None
+        else
+          emit_int_binary
+            fpad src1 src2 dest
+            [ L [ K wasm_op ]]
     | Pgetvectitem ->
         ( push_as fpad src1 RValue
           @ ( match src2, repr_of_store src2 with
@@ -1698,7 +1703,7 @@ let grab fpad num =
                 L [ K "local.get"; ID "extra_args" ];
                 L [ K "local.get"; ID "fp" ];
               ]
-              @ call_restart_helper
+              @ call_restart_helper()
               @ pop_to_fp fpad
               @ [ L [ K "local.set"; ID "extra_args" ];
 
@@ -1810,7 +1815,7 @@ let appterm_common fpad =
     L [ K "local.get"; ID "extra_args" ];
     L [ K "local.get"; ID "appterm_new_num_args" ];
   ]
-  @ call_appterm_helper
+  @ call_appterm_helper()
   @ [ L [ K "local.set"; ID "extra_args" ];
       L [ K "local.tee"; ID "codeptr" ];
       L [ K "if";
@@ -1922,6 +1927,8 @@ let rec emit_instr gpad fpad instr =
                     )
                 ]
         )
+    | Wcond { cond; ontrue; onfalse } ->
+        emit_instr gpad fpad (if !cond then ontrue else onfalse)
     | Wcopy arg ->
         copy fpad arg.src arg.dest None
     | Walloc arg ->
@@ -1981,29 +1988,25 @@ let rec emit_instr gpad fpad instr =
         c_call_vector gpad fpad arg.descr arg.numargs arg.depth arg.name
     | Wbranch arg ->
         [ L [ K "br"; ID (string_label arg.label) ]]
-    | Wbranchif arg ->
+    | Wif arg ->
         ( match repr_of_store arg.src with
             | RInt ->
                 push_as fpad arg.src RInt
+                @ (if arg.neg then [ L [ K "i32.eqz" ]] else [])
             | _ ->
                 push_as fpad arg.src RIntVal
                 @ [ L [ K "i32.const"; N (I32 1l) ];
-                    L [ K "i32.gt_u" ]
+                    L [ K (if arg.neg then "i32.le_u" else "i32.gt_u") ]
                   ]
         )
-        @ [ L [ K "br_if"; ID (string_label arg.label) ]]
-    | Wbranchifnot arg ->
-        ( match repr_of_store arg.src with
-            | RInt ->
-                push_as fpad arg.src RInt
-                @ [ L [ K "i32.eqz" ]]
-            | _ ->
-                push_as fpad arg.src RIntVal
-                @ [ L [ K "i32.const"; N (I32 1l) ];
-                    L [ K "i32.le_u" ]
-                  ]
-        )
-        @ [ L [ K "br_if"; ID (string_label arg.label) ]]
+        @ [ L [ K "if";
+                L ( K "then" ::
+                      ( List.map (emit_instr gpad fpad) arg.body
+                        |> List.flatten
+                      )
+                  )
+              ]
+          ]
     | Wswitch arg ->
         switch fpad arg.src arg.labels_int arg.labels_blk
     | Wapply arg ->
@@ -2022,6 +2025,7 @@ let rec emit_instr gpad fpad instr =
           (* return value could be another closure *)
           fpad.need_return <- true;
           push_as fpad arg.src RValue
+          @ pop_to_local "accu"
           @ [ L [ K "br"; ID "return" ]]
         )
     | Wgrab arg ->
@@ -2052,6 +2056,8 @@ let rec emit_instr gpad fpad instr =
           (* L ( K "block" :: debug2 1 2); *)
           L [ K "return" ]
         ]
+    | Wnop ->
+        []
 
 and emit_instrs gpad fpad instrs =
   List.fold_left
@@ -2224,7 +2230,8 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
                )
                locals
             )
-           (* @ debug2 0 letrec_label
+            (*
+             @ debug2 0 letrec_label
              @ debug2_var 10 "fp"
              @ debug2_var 11 "envptr"
              @ debug2_var 12 "codeptr"
@@ -2240,7 +2247,7 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
                     )
                 ]
             ]
-            *)
+             *)
           @ sexpl
           @ [ L [ K "unreachable" ]]
         )
@@ -2265,7 +2272,7 @@ let generate_main scode gpad =
   generate_function scode gpad letrec_label func_name subfunc_labels true
 
 
-let globals =
+let globals() =
   [ "wasicaml_global_data", true, TI32;
     "wasicaml_domain_state", true, TI32;
     "wasicaml_atom_table", true, TI32;
@@ -2451,7 +2458,7 @@ let generate scode exe get_defname =
             @ zero_expr_of_vtype vtype
           )
       )
-      globals in
+      (globals()) in
 
   sexpl_memory
   @ sexpl_functions
@@ -2461,10 +2468,10 @@ let generate scode exe get_defname =
   @ wasicaml_get_data
   @ wasicaml_get_data_size (String.length data)
   @ alloc_fast
-  @ alloc_slow
+  @ alloc_slow()
   @ grab_helper gpad
   @ return_helper
-  @ appterm_helper
+  @ appterm_helper()
   @ restart_helper gpad
   @ (if gpad.need_reinit_frame then
        reinit_frame

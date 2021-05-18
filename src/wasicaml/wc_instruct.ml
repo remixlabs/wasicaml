@@ -20,8 +20,7 @@ type repr =
 type store =
   | RealStack of int
     (* it's on the real OCaml stack at the given position, i.e. at fp[pos] *)
-  | RealAccu of { no_function : bool;
-                }
+  | RealAccu of { no_function : bool }
     (* stored in the accu variable as RValue.
        no_function: if true, it is guaranteed that the value is not a closure.
        So far used for optimizing returns after C calls.
@@ -34,7 +33,9 @@ type store =
        repr=RValue is forbidden.
      *)
   | Atom of int
-     (* an atom with this tag *)
+    (* an atom with this tag *)
+  | Invalid
+    (* an uninitialized value *)
 
 (* how to include unboxing for float/int32/int64:
 
@@ -116,6 +117,7 @@ type terneffect =
 type winstruction =
   | Wcomment of string
   | Wblock of { label:label; body:winstruction list }
+  | Wcond of { cond:bool ref; ontrue:winstruction; onfalse:winstruction }
   | Wcopy of { src:store; dest:store }   (* only non-allocating copies *)
   | Walloc of { src:store; dest:store; descr:stack_descriptor }
   | Wenv of { field:int }         (* dest is always RealAccu *)
@@ -137,8 +139,7 @@ type winstruction =
                        descr:stack_descriptor }
     (* more than 5 args; dest is always RealAccu *)
   | Wbranch of { label:label }
-  | Wbranchif of { label:label; src:store }
-  | Wbranchifnot of { label:label; src:store }
+  | Wif of { src:store; neg:bool; body:winstruction list }
   | Wswitch of { labels_int:label array; labels_blk:label array; src:store }
   | Wapply of { numargs:int; depth:int; src:store }
   | Wappterm of { numargs:int; oldnumargs:int; depth:int } (* src=accu *)
@@ -152,6 +153,13 @@ type winstruction =
   | Wtrap of { trylabel:int; catchlabel:int; depth:int }
   | Wtryreturn of { src:store }
   | Wstop
+  | Wnop
+
+let repr_comparable_as_i32 r1 r2 =
+  match r1, r2 with
+    | (RValue | RIntVal), (RValue | RIntVal) -> true
+    | (RInt | RNatInt | RInt32), (RInt | RNatInt | RInt32) -> true
+    | _ -> false
 
 let repr_of_store =
   function
@@ -160,6 +168,7 @@ let repr_of_store =
   | Local(repr, _) -> repr
   | RealAccu _ -> RValue
   | Atom _ -> RValue
+  | Invalid -> assert false
 
 let empty_descr =
   { stack_init = ISet.empty;
@@ -174,6 +183,7 @@ let string_of_store =
   | Const k -> sprintf "%d" k
   | Local(repr, name) -> name
   | Atom k -> sprintf "atom%d" k
+  | Invalid -> "invalid"
 
 let string_label =
   function
@@ -183,7 +193,7 @@ let string_label =
 
 
 
-let string_of_winstruction =
+let rec string_of_winstruction =
   function
   | Wcomment s -> s
   | Wblock arg ->
@@ -193,6 +203,8 @@ let string_of_winstruction =
           | Loop k ->
               sprintf "Wblock(loop%d, ...)" k
       )
+  | Wcond { cond; ontrue; onfalse } ->
+      string_of_winstruction (if !cond then ontrue else onfalse)
   | Wcopy arg ->
       sprintf "Wcopy(%s = %s)"
               (string_of_store arg.dest) (string_of_store arg.src)
@@ -240,12 +252,11 @@ let string_of_winstruction =
               arg.name (-arg.depth) (-arg.depth+arg.numargs-1)
   | Wbranch arg ->
       sprintf "Wbranch(%s)" (string_label arg.label)
-  | Wbranchif arg ->
-      sprintf "Wbranch(%s if %s)"
-              (string_label arg.label) (string_of_store arg.src)
-  | Wbranchifnot arg ->
-      sprintf "Wbranch(%s ifnot %s)"
-              (string_label arg.label) (string_of_store arg.src)
+  | Wif arg ->
+      sprintf "Wif(if%s %s -> %s )"
+              (if arg.neg then "not" else "")
+              (string_of_store arg.src)
+              (List.map string_of_winstruction arg.body |> String.concat ", ")
   | Wswitch arg ->
       let s1 =
         Array.to_list arg.labels_int
@@ -286,3 +297,5 @@ let string_of_winstruction =
       sprintf "Wtryreturn(%s)" (string_of_store arg.src)
   | Wstop ->
       "Wstop"
+  | Wnop ->
+      "Wnop"

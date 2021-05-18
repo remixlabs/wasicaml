@@ -47,15 +47,30 @@ type lpad =  (* local pad *)
     (* IDEA: maybe switch to (string, repr * bool ref) Hashtbl.t. The bool
        is set to true when the local is actually used.
      *)
+
     mutable loops : ISet.t;
     (* which labels are loop labels *)
+
+    indegree : (int, int) Hashtbl.t;
+    (* how many nodes jump to this node (identified by label). A negative
+       indegree means that no optimizations must be done for this label.
+     *)
+
+    state_table : (int, state) Hashtbl.t;
+    (* the start state by label *)
   }
+
+let real_accu =
+  RealAccu { no_function = false }
+
+let real_accu_no_func =
+  RealAccu { no_function = true }
 
 let empty_state =
   { camlstack = [];
     camldepth = 0;
     realstack = ISet.empty;
-    accu = RealAccu { no_function = false };
+    accu = Invalid;
     realaccu = ISet.empty;
     arity = 1;
   }
@@ -63,6 +78,8 @@ let empty_state =
 let empty_lpad() =
   { locals = Hashtbl.create 7;
     loops = ISet.empty;
+    indegree = Hashtbl.create 7;
+    state_table = Hashtbl.create 7;
   }
 
 let new_local lpad repr =
@@ -116,13 +133,13 @@ let pop_camlstack state =
             else
               state.realstack
         }
-    | RealAccu _ :: tl ->
+    | (RealAccu _):: tl ->
         { state with
           camlstack = tl;
           camldepth = cd - 1;
           realaccu = ISet.remove cpos state.realaccu;
         }
-    | (Const _ | Local _ | Atom _) :: tl ->
+    | (Const _ | Local _ | Atom _ | Invalid) :: tl ->
         { state with camlstack = tl; camldepth = cd - 1 }
     | [] ->
         assert false
@@ -157,6 +174,8 @@ let push_camlstack store state =
           camlstack = store :: state.camlstack;
           camldepth = cd + 1;
         }
+    | Invalid ->
+        assert false
 
 let flush_accu lpad state =
   (* If the accu is not yet saved, do this now. This function needs to be called
@@ -165,7 +184,7 @@ let flush_accu lpad state =
     ISet.fold
       (fun pos instr_acc ->
         let instr =
-          Wcopy { src=RealAccu { no_function=false }; dest=RealStack pos } in
+          Wcopy { src=real_accu; dest=RealStack pos } in
         instr :: instr_acc
       )
       state.realaccu
@@ -176,9 +195,9 @@ let flush_accu lpad state =
     List.mapi
       (fun i old ->
         let pos = (-state.camldepth+i) in
-        if ISet.mem pos state.realaccu then
+        if ISet.mem pos state.realaccu then (
           RealStack pos
-        else
+        ) else
           old
       )
       state.camlstack in
@@ -196,12 +215,13 @@ let straighten_accu lpad state =
    *)
   let state, instrs_flush = flush_accu lpad state in
   match state.accu with
+    | Invalid ->
+        (state, [])
     | RealAccu _ ->
         (state, instrs_flush)
     | store ->
-        let instr =
-          Wcopy { src=store; dest=RealAccu { no_function=false } } in
-        let state = { state with accu = RealAccu { no_function=false } } in
+        let instr = Wcopy { src=store; dest=real_accu } in
+        let state = { state with accu=real_accu } in
         (state, instrs_flush @ [instr])
 
 let straighten_accu_when_on_stack lpad state =
@@ -213,6 +233,13 @@ let straighten_accu_when_on_stack lpad state =
     | (RealStack _) ->
         straighten_accu lpad state
     | _ ->
+        (state, [])
+
+let straighten_accu_for_branch lpad state =
+  match state.accu with
+    | RealStack _ | Const _ | Atom _ ->
+        straighten_accu lpad state
+    | Local _ | RealAccu _ | Invalid ->
         (state, [])
 
 let pop_real_stack lpad state num =
@@ -286,6 +313,44 @@ let flush_real_stack_at lpad state pos =
     } in
   (state, instrs1 @ instrs2)
 
+(*
+let flush_real_stack_intval_at lpad state pos =
+  (* additionally assumes that the stack contains an integer value at pos *)
+  let cd = state.camldepth in
+  let state, instrs1 =
+    flush_real_stack_only_accu_at lpad state pos in
+  let local = new_local lpad RIntVal in
+  let _, positions =
+    List.fold_left
+      (fun (q, acc) store ->
+        match store with
+          | RealStack p when p = pos && q <> p ->
+              assert(p > q);
+              let acc' = ISet.add q acc in
+              (q+1, acc')
+          | _ ->
+              (q+1, acc)
+      )
+      (-cd, ISet.empty)
+      state.camlstack in
+  let src = RealStack pos in
+  let instrs2 =
+    [ Wcopy { src; dest=Local(RIntVal, local)} ] in
+  let camlstack =
+    List.mapi
+      (fun i old ->
+        let q = -cd + i in
+        if ISet.mem q positions then
+          Local(RIntVal, local)
+        else
+          old
+      )
+      state.camlstack in
+  let state =
+    { state with camlstack } in
+  (state, instrs1 @ instrs2)
+ *)
+
 let straighten_stack_at lpad state pos =
   (* ensure that the caml stack for pos is set to the real stack *)
   assert(pos < 0);
@@ -324,9 +389,13 @@ let accu_is_realaccu state =
     | RealAccu _ -> true
     | _ -> false
 
-let straighten_all lpad state =
-  let state, instrs1 = straighten_accu lpad state in
-  assert(accu_is_realaccu state && state.realaccu = ISet.empty);
+let accu_is_realaccu_or_invalid state =
+  match state.accu with
+    | RealAccu _ | Invalid -> true
+    | _ -> false
+
+let straighten_stack lpad state =
+  let state, instrs1 = flush_accu lpad state in
   let cd = state.camldepth in
   let pos_list =
     state.camlstack
@@ -342,14 +411,35 @@ let straighten_all lpad state =
   let state, instrs2 = straighten_stack_multi lpad state pos_list in
   (state, instrs1 @ instrs2)
 
+let straighten_all lpad state =
+  let state, instrs1 = straighten_accu lpad state in
+  assert(accu_is_realaccu_or_invalid state && state.realaccu = ISet.empty);
+  let state, instrs2 = straighten_stack lpad state in
+  (state, instrs1 @ instrs2)
+
+let localize_accu lpad state repr =
+  match state.accu with
+    | RealStack _ | RealAccu _ ->
+        let local = new_local lpad repr in
+        let lstore = Local(repr, local) in
+        let instrs = [ Wcopy { src=state.accu; dest=lstore } ] in
+        let camlstack =
+          List.map
+            (fun st -> if st = state.accu then lstore else st)
+            state.camlstack in
+        let state = { state with accu = lstore; camlstack } in
+        (state, instrs)
+    | _ ->
+        (state, [])
+
 let unary_operation ?(no_function=false) lpad state op_repr op_code =
   let src1 = state.accu in
   match op_repr with
     | RValue ->
         (* result goes into accu *)
         let state, instrs_flush = flush_accu lpad state in
-        let state = { state with accu = RealAccu { no_function } } in
-        let instrs_op = [ Wunary { op=op_code; src1; dest=RealAccu { no_function } }] in
+        let state = { state with accu = real_accu } in
+        let instrs_op = [ Wunary { op=op_code; src1; dest=real_accu }] in
         (state, instrs_flush @ instrs_op)
     | _ ->
         let dest_name = new_local lpad op_repr in
@@ -372,9 +462,9 @@ let binary_operation ?(no_function=false) lpad state op_repr op_code =
         (* result goes into accu *)
         let state, instrs_flush = flush_accu lpad state in
         let state =
-          { state with accu = RealAccu { no_function } }
+          { state with accu = real_accu }
           |> pop_camlstack in
-        let instrs_op = [ Wbinary { op=op_code; src1; src2; dest=RealAccu { no_function } }] in
+        let instrs_op = [ Wbinary { op=op_code; src1; src2; dest=real_accu }] in
         (state, instrs_flush @ instrs_op)
     | _ ->
         let dest_name = new_local lpad op_repr in
@@ -411,6 +501,79 @@ let make_label lpad label =
   else
     Label label
 
+let validate state =
+  let d = state.camldepth in
+  List.iteri
+    (fun i st ->
+      match st with
+        | RealStack pos -> assert(pos = (-d+i))
+        | _ -> assert false
+    )
+    state.camlstack;
+  if d = 0 then
+    assert(state.realstack = ISet.empty)
+  else (
+    assert(ISet.min_elt state.realstack = (-d));
+    assert(ISet.max_elt state.realstack = (-1));
+    assert(ISet.cardinal state.realstack = d);
+  );
+  assert(match state.accu with
+           | RealAccu _ | Local _ | Invalid -> true
+           | _ -> false
+        );
+  assert(state.realaccu = ISet.empty)
+
+let update_state_table lpad state label =
+  try
+    let s = Hashtbl.find lpad.state_table label in
+    assert(s.camldepth = state.camldepth)
+  with
+    | Not_found ->
+        Hashtbl.add lpad.state_table label state
+
+let branch lpad state label =
+  let instr_br = Wbranch { label=make_label lpad label } in
+  try
+    let dest_state = Hashtbl.find lpad.state_table label in
+    validate dest_state;
+    let (state, instrs1) = straighten_accu_for_branch lpad state in
+    let (state, instrs2) = straighten_stack lpad state in
+    validate state;
+    assert(state.camldepth = dest_state.camldepth);
+    (* state and dest_state can at most differ in accu *)
+    let instrs =
+      if state.accu = dest_state.accu || dest_state.accu = Invalid then
+        instrs1 @ instrs2 @ [ instr_br ]
+      else
+        instrs1
+        @ instrs2
+        @ [ Wcopy { src=state.accu; dest=dest_state.accu };
+            instr_br
+          ] in
+    (state, instrs)
+  with
+    | Not_found -> (* from Hashtbl.find *)
+        let n = try Hashtbl.find lpad.indegree label with Not_found -> 0 in
+        if n < 0 then (
+          let state, instrs1 = straighten_all lpad state in
+          let state =
+            if n = (-2) then (* it's a loop *)
+              { state with accu = Invalid }
+            else
+              state in
+          Hashtbl.add lpad.state_table label state;
+          (state, instrs1 @ [ instr_br ])
+        ) else if n <= 1 then (
+          let (state, instrs1) = straighten_accu_for_branch lpad state in
+          Hashtbl.add lpad.state_table label state;
+          (state, instrs1 @ [ instr_br ])
+        ) else (
+          let (state, instrs1) = straighten_accu_for_branch lpad state in
+          let (state, instrs2) = straighten_stack lpad state in
+          Hashtbl.add lpad.state_table label state;
+          (state, instrs1 @ instrs2 @ [ instr_br ])
+        )
+
 let transl_instr lpad state instr =
   match instr with
     | I.Klabel _ -> assert false
@@ -441,19 +604,25 @@ let transl_instr lpad state instr =
         let cd = state.camldepth in
         let state, instrs_flush =
           flush_real_stack_at lpad state (-cd+sp) in
+        let state =
+          { state with
+            camlstack = set_camlstack (-cd+sp) (RealStack (-cd+sp)) state
+          } in
         let instrs_copy =
           [ Wcopy { src=state.accu; dest=RealStack (-cd+sp) } ] in
         (state, instrs_flush @ instrs_copy)
     | Kenvacc field ->
         let state, instrs_flush = flush_accu lpad state in
-        let state = { state with accu = RealAccu { no_function=false } } in
+        let accu = real_accu in
+        let state = { state with accu } in
         let instrs_op = [ Wenv { field } ] in
         (state, instrs_flush @ instrs_op)
     | Kgetglobal ident ->
         let offset = global_offset ident in
         assert(offset >= 0);
         let state, instrs_flush = flush_accu lpad state in
-        let state = { state with accu = RealAccu { no_function=false } } in
+        let accu = real_accu in
+        let state = { state with accu } in
         let instrs_op = [ Wgetglobal { src=Global offset } ] in
         (state, instrs_flush @ instrs_op)
     | Knegint ->
@@ -461,7 +630,11 @@ let transl_instr lpad state instr =
     | Kboolnot ->
         unary_operation lpad state RIntVal Pboolnot
     | Koffsetint offset ->
-        unary_operation lpad state RIntVal (Poffsetint offset)
+        (* localize_accu is beneficial for "for" loops *)
+        let (state, instrs1) = localize_accu lpad state RIntVal in
+        let (state, instrs2) =
+          unary_operation lpad state RIntVal (Poffsetint offset) in
+        (state, instrs1 @ instrs2)
     | Koffsetref offset ->
         unary_effect lpad state (Poffsetref offset)
     | Kisint ->
@@ -528,12 +701,13 @@ let transl_instr lpad state instr =
         let temp_name = new_local lpad RFloat in
         let temp = Local(RFloat, temp_name) in
         let descr = stack_descr state in
+        let accu = real_accu_no_func in
         let instrs =
           instrs_flush
           @ [ Wunary { op=Pgetfloatfield field; src1; dest=temp; };
-              Walloc { src=temp; dest=RealAccu { no_function=true }; descr }
+              Walloc { src=temp; dest=accu; descr }
             ] in
-        let state = { state with accu = RealAccu { no_function=true } } in
+        let state = { state with accu } in
         (state, instrs)
     | Kmakeblock(0, tag) ->
         let state = { state with accu = Atom tag } in
@@ -543,11 +717,12 @@ let transl_instr lpad state instr =
         let src1 = state.accu in
         let src = src1 :: list_prefix (size-1) state.camlstack in
         let descr = stack_descr state in
+        let accu = real_accu_no_func in
         let instrs =
           instrs_flush
           @ [ Wmakeblock { tag; src; descr } ] in
         let state =
-          { state with accu = RealAccu { no_function=true }}
+          { state with accu}
           |> popn_camlstack (size-1) in
         (state, instrs)
     | Kmakefloatblock size ->
@@ -559,8 +734,9 @@ let transl_instr lpad state instr =
         let instrs =
           instrs_flush
           @ [ Wmakefloatblock { src; descr } ] in
+        let accu = real_accu_no_func in
         let state =
-          { state with accu = RealAccu { no_function=true } }
+          { state with accu }
           |> popn_camlstack (size-1) in
         (state, instrs)
     | Kccall (name, num) when num <= 5 ->
@@ -589,20 +765,20 @@ let transl_instr lpad state instr =
           |> popn_camlstack (num-1) in
         (state, instrs)
     | Kbranch label ->
-        let state, instrs_str = straighten_all lpad state in
-        (state, instrs_str @ [ Wbranch{label=make_label lpad label} ])
+        branch lpad state label
     | Kbranchif label ->
-        let state, instrs_str = straighten_all lpad state in
-        let src = state.accu in
-        (state, instrs_str @ [ Wbranchif{label=make_label lpad label; src} ])
+        let (br_state, instrs) = branch lpad state label in
+        (state, [ Wif { src=state.accu; neg=false; body=instrs }])
     | Kbranchifnot label ->
-        let state, instrs_str = straighten_all lpad state in
-        let src = state.accu in
-        (state, instrs_str @ [ Wbranchifnot{label=make_label lpad label; src} ])
+        let (br_state, instrs) = branch lpad state label in
+        (state, [ Wif { src=state.accu; neg=true; body=instrs }])
     | Kswitch (labels_int, labels_blk) ->
+        let state, instrs_str = straighten_all lpad state in
+        validate state;
+        Array.iter (update_state_table lpad state) labels_int;
+        Array.iter (update_state_table lpad state) labels_blk;
         let labels_int = Array.map (make_label lpad) labels_int in
         let labels_blk = Array.map (make_label lpad) labels_blk in
-        let state, instrs_str = straighten_all lpad state in
         let src = state.accu in
         (state, instrs_str @ [ Wswitch{labels_int; labels_blk; src} ])
     | Kapply num when num <= 3 ->
@@ -620,7 +796,7 @@ let transl_instr lpad state instr =
           @ [ Wcopy { src=Const 0; dest=RealStack(-cd+num-3) };
               Wcopy { src=Const 0; dest=RealStack(-cd+num-2) };
               Wcopy { src=Const 0; dest=RealStack(-cd+num-1) };
-              Wapply { numargs=num; depth=cd+3; src=RealAccu { no_function=false } }
+              Wapply { numargs=num; depth=cd+3; src=real_accu }
             ] in
         let state = state |> popn_camlstack num in
         (state, instrs)
@@ -628,7 +804,7 @@ let transl_instr lpad state instr =
         let state, instrs_str = straighten_all lpad state in
         let instrs =
           instrs_str
-          @ [ Wapply { numargs=num; depth=state.camldepth; src=RealAccu { no_function=false } }
+          @ [ Wapply { numargs=num; depth=state.camldepth; src=real_accu }
             ] in
         let state = state |> popn_camlstack (num+3) in
         (state, instrs)
@@ -658,11 +834,12 @@ let transl_instr lpad state instr =
           else
             state.accu :: list_prefix (num-1) state.camlstack in
         let descr = stack_descr state in
+        let accu = real_accu in
         let instrs =
           instrs_flush
-          @ [ Wclosurerec { src; dest=[ RealAccu { no_function=false }, lab ]; descr }] in
+          @ [ Wclosurerec { src; dest=[ accu, lab ]; descr }] in
         let state =
-          { state with accu = RealAccu { no_function=false } }
+          { state with accu }
           |> popn_camlstack (max (num-1) 0) in
         (state, instrs)
     | Kclosurerec(funcs, num) ->
@@ -695,7 +872,8 @@ let transl_instr lpad state instr =
         (state, instrs)
     | Koffsetclosure offset ->
         let state, instrs_flush = flush_accu lpad state in
-        let state = { state with accu = RealAccu { no_function=false } } in
+        let accu = real_accu in
+        let state = { state with accu } in
         let instrs =
           instrs_flush
           @ [ Wcopyenv { offset } ] in
@@ -723,47 +901,53 @@ let local_branch_labels =
 
 let transl_fblock lpad fblock =
   let open Wc_control in
+  let indegree = Hashtbl.create 7 in
   let state_table = Hashtbl.create 7 in
+  let lpad = { lpad with indegree; state_table } in
+
+  let incr_indegree lab =
+    let n = try Hashtbl.find indegree lab with Not_found -> 0 in
+    if n >= 0 then
+      Hashtbl.replace indegree lab (n+1) in
+
+  let disable_indegree lab =
+    Hashtbl.replace indegree lab (-1) in
+
+  let loop_indegree lab =
+    Hashtbl.replace indegree lab (-2) in
+
+  let rec count_indegree block =
+    ( match block.loop_label with
+        | Some lab -> loop_indegree lab
+        | None -> ()
+    );
+    Array.iter
+      (function
+       | Block b ->
+           count_indegree b
+       | Trap { catchlabel } ->
+           incr_indegree catchlabel
+       | Simple i ->
+           (match i with
+              | (I.Kbranch lab | Kbranchif lab | Kbranchifnot lab) ->
+                  incr_indegree lab
+              | Kswitch (la1, la2) ->
+                  Array.iter disable_indegree la1;
+                  Array.iter disable_indegree la2;
+              | _ ->
+                  ()
+             )
+       | Label _ | TryReturn ->
+           ()
+      )
+      block.instructions in
 
   let get_state label =
     try  Hashtbl.find state_table label
     with Not_found -> empty_state in
 
-  let validate state =
-    let d = state.camldepth in
-    List.iteri
-      (fun i st ->
-        match st with
-          | RealStack pos -> assert(pos = (-d+i))
-          | _ -> assert false
-      )
-      state.camlstack;
-    if d = 0 then
-      assert(state.realstack = ISet.empty)
-    else (
-      assert(ISet.min_elt state.realstack = (-d));
-      assert(ISet.max_elt state.realstack = (-1));
-      assert(ISet.cardinal state.realstack = d);
-    );
-    assert(accu_is_realaccu state);
-    assert(state.realaccu = ISet.empty) in
-
-  let update_state_table state labels =
-    if labels <> [] then
-      validate state;
-    List.iter
-      (fun label ->
-        try
-          let s = Hashtbl.find state_table label in
-          assert(s.camldepth = state.camldepth)
-        with
-          | Not_found ->
-              Hashtbl.add state_table label state
-      )
-      labels in
-
   let rec transl_block block loops =
-    let state = { empty_state with accu = Const 0 } in
+    let state = empty_state in
     (* eprintf "BLOCK\n%!";*)
     let upd_loops =
       match block.loop_label with
@@ -781,8 +965,6 @@ let transl_fblock lpad fblock =
             | Simple i ->
                 lpad.loops <- upd_loops;
                 let next_state, instrs = transl_instr lpad state i in
-                let labels = local_branch_labels i in
-                update_state_table next_state labels;
                 (*
                 eprintf "%s predepth=%d postdepth=%d\n%!"
                         (Wc_util.string_of_instruction i)
@@ -794,7 +976,8 @@ let transl_fblock lpad fblock =
                 (next_state, List.rev_append (comment :: instrs) acc)
             | Trap { trylabel; catchlabel; poplabel } ->
                 let state, instrs_str = straighten_all lpad state in
-                let state = { state with accu = RealAccu { no_function=false } } in
+                let accu = real_accu in
+                let state = { state with accu } in
                 let instrs =
                   [ Wcomment (sprintf "***Trap(try=%d,catch=%d)" trylabel catchlabel) ]
                   @ instrs_str
@@ -804,7 +987,8 @@ let transl_fblock lpad fblock =
                             };
                       Wbranch { label=Label poplabel }
                     ] in
-                update_state_table state [ catchlabel; poplabel ];
+                update_state_table lpad state catchlabel;
+                update_state_table lpad state poplabel;
                 (state, List.rev_append instrs acc)
             | TryReturn ->
                 let instrs =
@@ -827,5 +1011,6 @@ let transl_fblock lpad fblock =
           [ Wblock { label=Label label; body=instrs } ]
       | None, None ->
           instrs in
+  count_indegree fblock.block;
   transl_block fblock.block ISet.empty
 

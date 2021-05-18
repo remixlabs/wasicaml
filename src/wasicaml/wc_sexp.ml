@@ -46,6 +46,7 @@ let rec string_of_sexp sexp =
     | L l ->
         let l = List.filter (fun e -> e <> BR) l in
         "(" ^ string_of_sexp_list l ^ ")"
+
 and string_of_sexp_list l =
   List.map string_of_sexp l |> String.concat " "
 
