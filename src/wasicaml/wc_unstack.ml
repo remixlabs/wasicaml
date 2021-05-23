@@ -423,11 +423,21 @@ let localize_accu lpad state repr =
         let local = new_local lpad repr in
         let lstore = Local(repr, local) in
         let instrs = [ Wcopy { src=state.accu; dest=lstore } ] in
-        let camlstack =
-          List.map
-            (fun st -> if st = state.accu then lstore else st)
-            state.camlstack in
-        let state = { state with accu = lstore; camlstack } in
+        let cd = state.camldepth in
+        let positions =
+          List.mapi
+            (fun i st -> if st = state.accu then i else (-1))
+            state.camlstack
+          |> List.filter (fun i -> i >= 0)
+          |> List.map (fun i -> -cd + i) in
+        let state =
+          List.fold_left
+            (fun state pos ->
+              { state with camlstack = set_camlstack pos lstore state }
+            )
+            state
+            positions in
+        let state = { state with accu = lstore } in
         (state, instrs)
     | _ ->
         (state, [])
