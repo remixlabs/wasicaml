@@ -1,0 +1,35 @@
+#! /bin/sh
+
+prefix=~/.wasicaml
+
+run_test() {
+    set -e
+    printf "Test %s: " "$t"
+    "$prefix"/bin/ocamlc -g -use-runtime ./testruntime -I testprint -o t_byte testprint.cma "$t"
+    ../src/wasicaml/wasicaml -q -o t_wasm -cclib "testprint/libtestprint.a" t_byte
+    printf "build OK\n"
+    ./testruntime t_byte >t_byte.out
+    ./t_wasm >t_wasm.out
+    set +e
+    if ! cmp t_byte.out t_wasm.out; then
+        printf "Test %s: DIFFERENT RESULTS\n" "$t";
+        return 1
+    fi
+    printf "Test %s: results OK\n" "$t"
+}
+
+bad=0
+if [ $# -eq 0 ]; then
+    for t in $(ls *.ml); do
+        run_test "$t" || bad=1
+    done
+else
+    for t in "$@"; do
+        run_test "$t" || bad=1
+    done
+fi
+
+if [ $bad -gt 0 ]; then
+    echo "ERRORS EXIST\n" >&2
+    exit 1
+fi
