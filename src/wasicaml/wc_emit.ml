@@ -1303,7 +1303,7 @@ let emit_binary fpad op src1 src2 dest =
         (* CHECK: is this the right remainder function? Needs to be like % in C *)
         emit_int_binary
           fpad src1 src2 dest
-          [ L [ K "i32.mod_s" ] ]
+          [ L [ K "i32.rem_s" ] ]
     | Pandint ->
         emit_intval_binary
           fpad src1 src2 dest
@@ -1390,14 +1390,13 @@ let emit_binary fpad op src1 src2 dest =
           @ ( match src2 with
                 | Const c ->
                     [ L [ K "i32.load8_u";
-                          K "align=2";
                           K (sprintf "offset=0x%x" c)
                         ]
                     ]
                 | _ ->
                     push_as fpad src2 RInt
                     @ [ L [ K "i32.add" ];
-                        L [ K "i32.load8_u"; K "align=2" ]
+                        L [ K "i32.load8_u" ]
                       ]
             )
         ) |> pop_to fpad dest RInt None
@@ -1451,7 +1450,7 @@ let emit_ternaryeffect fpad op src1 src2 src3 =
                     ]
           )
         @ push_as fpad src3 RValue
-        @ [ L [ K "caml_modify" ]]
+        @ [ L [ K "call"; ID "caml_modify" ]]
     | Psetbyteschar ->
         push_as fpad src1 RValue
         @ ( match src2 with
@@ -2340,13 +2339,16 @@ let generate scode exe get_defname =
   let letrec_name = Hashtbl.create 7 in
   Hashtbl.iter
     (fun letrec_label _ ->
-      let suffix =
-        try
-          let defname = get_defname letrec_label in
-          "_" ^ sanitize defname
-        with
-          | Not_found -> "" in
-      Hashtbl.add letrec_name letrec_label (sprintf "letrec%d%s" letrec_label suffix)
+      if letrec_label = 0 then
+        Hashtbl.add letrec_name letrec_label "letrec_main"
+      else
+        let suffix =
+          try
+            let defname = get_defname letrec_label in
+            "_" ^ sanitize defname
+          with
+            | Not_found -> "" in
+        Hashtbl.add letrec_name letrec_label (sprintf "letrec%d%s" letrec_label suffix)
     )
     subfunctions;
 
@@ -2358,9 +2360,7 @@ let generate scode exe get_defname =
       (fun letrec_label _ acc ->
         Hashtbl.add wasmindex letrec_label !nextindex;
         incr nextindex;
-        let name =
-          if letrec_label = 0 then "mainfunc" else
-            Hashtbl.find letrec_name letrec_label in
+        let name = Hashtbl.find letrec_name letrec_label in
         (ID name) :: acc
       )
       subfunctions

@@ -127,6 +127,15 @@ let write_func_body f func_name locals_table sexpl =
             with Not_found -> bad() in
           fprintf f "\t%s%s 0x%x:p2align=%d\n" indent instr offset align;
           next labels depth rest
+      | L (K ("i32.load8_u" | "i32.load8_s" | "i32.store8"
+                                              as instr) ::  inner) :: rest ->
+          let offset, align =
+            try extract_load_store_params inner
+            with Not_found -> bad() in
+          if align <> 0 then
+            bad();
+          fprintf f "\t%s%s 0x%x\n" indent instr offset;
+          next labels depth rest
       | L (K ("br"|"br_if"|"br_table" as instr) :: inner) :: rest ->
           let lab_names =
             List.map
