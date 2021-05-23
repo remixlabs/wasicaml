@@ -48,7 +48,7 @@ type structured_code =
    | Block of block
    | Label of int   (* precedes a sequence of Simple instructions *)
    | Simple of I.instruction
-   | Trap of { trylabel: int; catchlabel: int; poplabel: int }
+   | Trap of { trylabel: int; catchlabel: int; poplabel: int option }
    | TryReturn
 
  and cfg_scope =
@@ -62,7 +62,7 @@ type structured_code =
   }
 
 type trap_info =
-  | Trap_push of int * int
+  | Trap_push of int * int option
   | Trap_pop of int * int
 
 type try_info =

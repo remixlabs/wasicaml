@@ -154,6 +154,7 @@ type winstruction =
   | Wtryreturn of { src:store }
   | Wstop
   | Wnop
+  | Wunreachable
 
 let repr_comparable_as_i32 r1 r2 =
   match r1, r2 with
@@ -299,3 +300,5 @@ let rec string_of_winstruction =
       "Wstop"
   | Wnop ->
       "Wnop"
+  | Wunreachable ->
+      "Wunreachable"

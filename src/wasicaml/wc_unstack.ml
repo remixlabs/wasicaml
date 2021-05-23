@@ -985,10 +985,18 @@ let transl_fblock lpad fblock =
                               catchlabel;
                               depth=state.camldepth
                             };
-                      Wbranch { label=Label poplabel }
+                      ( match poplabel with
+                          | None ->
+                              (* e.g. "try raise Foo with Foo -> ..." *)
+                              Wunreachable
+                          | Some pop ->
+                              Wbranch { label=Label pop }
+                      )
                     ] in
                 update_state_table lpad state catchlabel;
-                update_state_table lpad state poplabel;
+                Option.iter
+                  (update_state_table lpad state)
+                  poplabel;
                 (state, List.rev_append instrs acc)
             | TryReturn ->
                 let instrs =

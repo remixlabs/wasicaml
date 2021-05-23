@@ -20,7 +20,7 @@ type structured_code =
    | Block of block
    | Label of int
    | Simple of I.instruction
-   | Trap of { trylabel: int; catchlabel: int; poplabel: int }
+   | Trap of { trylabel: int; catchlabel: int; poplabel: int option }
    | TryReturn
 
  and cfg_scope =
@@ -30,7 +30,7 @@ type structured_code =
   }
 
 type trap_info =
-  | Trap_push of int * int
+  | Trap_push of int * int option
   | Trap_pop of int * int
 
 type try_info =
@@ -252,7 +252,7 @@ let create_cfg code labels =
       pushtraps := IMap.add (start + !n) start !pushtraps;
     let cfg_trap =
       if is_pushtrap then
-        Some (Trap_push (start + !n, -1))
+        Some (Trap_push (start + !n, None))
       else if is_poptrap then
         match popfrom with
           | None ->
@@ -268,7 +268,7 @@ let create_cfg code labels =
                 { push_node with
                   cfg_trap = ( match push_node.cfg_trap with
                                  | Some (Trap_push(try_label, _)) ->
-                                     Some (Trap_push(try_label, start))
+                                     Some (Trap_push(try_label, Some start))
                                  | _ -> assert false
                              );
                   cfg_succ = start :: List.tl push_node.cfg_succ

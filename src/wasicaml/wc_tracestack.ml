@@ -82,7 +82,8 @@ let rec dump block indent =
      | Simple i ->
          eprintf "%s%s\n" istr (string_of_kinstruction i)
      | Trap { trylabel; catchlabel; poplabel } ->
-         eprintf "%sTrap try=%d catch=%d pop=%d\n" istr trylabel catchlabel poplabel
+         eprintf "%sTrap try=%d catch=%d pop=%s\n" istr trylabel catchlabel
+                 (Option.map string_of_int poplabel |> Option.value ~default:"")
      | TryReturn ->
          eprintf "%sTryReturn\n" istr
      | Block inner ->
@@ -127,8 +128,11 @@ let max_stack_depth_of_fblock fblock =
               update_depth_table depth labels;
               let depth' = trace_stack_instr depth i in
               (max depth' max_depth, depth')
-          | Trap { catchlabel; poplabel } ->
-              update_depth_table depth [ catchlabel; poplabel ];
+          | Trap { catchlabel; poplabel=Some pop } ->
+              update_depth_table depth [ catchlabel; pop ];
+              (max_depth, depth)
+          | Trap { catchlabel; poplabel=None } ->
+              update_depth_table depth [ catchlabel ];
               (max_depth, depth)
           | TryReturn ->
               (max_depth, depth)

@@ -2058,6 +2058,8 @@ let rec emit_instr gpad fpad instr =
         ]
     | Wnop ->
         []
+    | Wunreachable ->
+        [ L [ K "unreachable" ]]
 
 and emit_instrs gpad fpad instrs =
   List.fold_left
