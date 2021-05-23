@@ -9,12 +9,13 @@ open Wc_emit;;
 open Wc_sexp;;
 open Printf;;
 #print_length 20000;;
-let exec = read_executable "t";;
+let exec = read_executable "wasicaml";;
 let code, labels, maplab = decode exec;;
 eprintf "Number instructions: %d\n" (Array.length code);;
 eprintf "Number labels: %d\n%!" (ISet.cardinal labels);;
 let cfg = create_cfg code labels;;
 eprintf "Number nodes: %d\n%!" (IMap.cardinal cfg.nodes);;
+(*
 let s = recover_structure cfg;;
 eprintf "Number functions: %d\n%!" (IMap.cardinal s.functions);;
 validate s;;
@@ -27,7 +28,7 @@ let print() =
   let f = open_out "t.s" in
   Wc_sexp2s.write_file f "t.s" sexpl;
   close_out f;
-
+ *)
   (*
 ~/.wasicaml/bin/wasi_cc -c t.s
 ~/.wasicaml/bin/wasi_cc -o caml.wasm lib/initruntime.o lib/prims.o src/wasicaml/t.o ~/.wasicaml/lib/ocaml/libcamlrun.a

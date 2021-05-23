@@ -305,18 +305,12 @@ let debug2_var x0 var =
 
 let stack_init fpad descr =
   (* put zeros into the uninitialized stack positions *)
-  let rec gen_init k =
-    if k >= 1 then
-      let pos = -k in
-      let is_used = ISet.mem pos descr.stack_init in
-      ( if not is_used then
-          pop_to_stack fpad pos (push_const 1l)
-        else
-          []
-      ) @ gen_init (k-1)
-    else
-      [] in
-  gen_init descr.stack_depth
+  List.map
+    (fun pos ->
+      pop_to_stack fpad pos (push_const 1l)
+    )
+    descr.stack_uninit
+  |> List.flatten
 
 let setup_for_gc fpad descr =
   let sp_decr =

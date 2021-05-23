@@ -67,7 +67,7 @@ type label = Label of int | Loop of int
 (* only local labels *)
 
 type stack_descriptor =
-  { stack_init : ISet.t;
+  { stack_uninit : int list;
     stack_depth : int;
     stack_save_accu : bool;
   }
@@ -172,7 +172,7 @@ let repr_of_store =
   | Invalid -> assert false
 
 let empty_descr =
-  { stack_init = ISet.empty;
+  { stack_uninit = [];
     stack_depth = 0;
     stack_save_accu = false;
   }

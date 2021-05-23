@@ -20,8 +20,6 @@ type state =
      *)
     camldepth : int;
     (* = List.length camlstack *)
-    realstack : ISet.t;
-    (* which real stack positions have been initialized *)
     accu : store;
     (* where the accu is stored *)
     realaccu : ISet.t;
@@ -69,7 +67,6 @@ let real_accu_no_func =
 let empty_state =
   { camlstack = [];
     camldepth = 0;
-    realstack = ISet.empty;
     accu = Invalid;
     realaccu = ISet.empty;
     arity = 1;
@@ -88,21 +85,35 @@ let new_local lpad repr =
   Hashtbl.add lpad.locals s repr;
   s
 
-let realdepth state =
-  (* how many stack positions are really used, counted from the bottom? *)
-  match ISet.min_elt_opt state.realstack with
-    | None ->
-        0
-    | Some pos ->
-        assert(pos < 0);
-        -pos
-
 let stack_descr state =
+  let cd = state.camldepth in
+  let rd = ref 0 in
+  let stack = Array.make cd false in
+  List.iter
+    (fun st ->
+      match st with
+        | RealStack pos ->
+            assert(pos >= (-cd));
+            if pos < 0 then (
+              stack.(pos + cd) <- true;
+              rd := max !rd (-pos)
+            )
+        | _ ->
+            ()
+    )
+    state.camlstack;
+  let uninit = ref [] in
+  Array.iteri
+    (fun i used ->
+      if not used then
+        uninit := (-cd+i) :: !uninit
+    )
+    stack;
   let stack_save_accu =
     state.realaccu <> ISet.empty ||
       ( match state.accu with RealAccu _ -> true | _ -> false) in
-  { stack_init = state.realstack;
-    stack_depth = realdepth state;
+  { stack_uninit = !uninit;
+    stack_depth = !rd;
     stack_save_accu
   }
 
@@ -127,11 +138,6 @@ let pop_camlstack state =
         { state with
           camlstack = tl;
           camldepth = cd - 1;
-          realstack =
-            if pos = cpos || not(List.mem (RealStack pos) tl) then
-              ISet.remove pos state.realstack
-            else
-              state.realstack
         }
     | (RealAccu _):: tl ->
         { state with
@@ -158,10 +164,6 @@ let push_camlstack store state =
         { state with
           camlstack = store :: state.camlstack;
           camldepth = cd + 1;
-          realstack = if pos < 0 then
-                        ISet.add pos state.realstack
-                      else
-                        state.realstack;
         }
     | RealAccu _ ->
         { state with
@@ -205,7 +207,6 @@ let flush_accu lpad state =
     { state with
       camlstack;
       realaccu = ISet.empty;
-      realstack = ISet.union state.realstack state.realaccu;
     } in
   (state, instrs)
 
@@ -309,7 +310,6 @@ let flush_real_stack_at lpad state pos =
   let state =
     { state with
       camlstack;
-      realstack = ISet.union positions state.realstack
     } in
   (state, instrs1 @ instrs2)
 
@@ -359,7 +359,8 @@ let straighten_stack_at lpad state pos =
   match store with
     | RealAccu _ ->
         assert(ISet.mem pos state.realaccu);
-        flush_accu lpad state
+        let state, instrs = flush_accu lpad state in
+        (state, instrs)
     | RealStack p when p = pos ->
         (state, [])
     | _ ->
@@ -368,7 +369,6 @@ let straighten_stack_at lpad state pos =
         let state =
           { state with
             camlstack = set_camlstack pos (RealStack pos) state;
-            realstack = ISet.add pos state.realstack;
           } in
         (state, instrs)
 
@@ -520,13 +520,6 @@ let validate state =
         | _ -> assert false
     )
     state.camlstack;
-  if d = 0 then
-    assert(state.realstack = ISet.empty)
-  else (
-    assert(ISet.min_elt state.realstack = (-d));
-    assert(ISet.max_elt state.realstack = (-1));
-    assert(ISet.cardinal state.realstack = d);
-  );
   assert(match state.accu with
            | RealAccu _ | Local _ | Invalid -> true
            | _ -> false
