@@ -144,7 +144,7 @@ type winstruction =
   | Wapply of { numargs:int; depth:int; src:store }
   | Wappterm of { numargs:int; oldnumargs:int; depth:int } (* src=accu *)
     (* CHECK: maybe also pass args individually to appterm *)
-  | Wreturn of { src:store }
+  | Wreturn of { src:store; arity:int }
   | Wgrab of { numargs:int }
   | Wclosurerec of { src:store list; dest:(store * int) list;
                      descr:stack_descriptor (* also "accu" can be used *)

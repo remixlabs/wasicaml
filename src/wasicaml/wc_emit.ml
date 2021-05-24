@@ -87,12 +87,14 @@ let enable_multireturn = ref false
 
 let code_pointer_shift = 12
   (* OCaml code pointers:
-      - Bit 0: whether to run RESTART
-      - Bit 1 - code_pointer_shift-1: subfunction of the letrec
+      - Bit 0: always 1
+      - Bit 1: whether to run RESTART
+      - Bit 2 - code_pointer_shift-1: subfunction of the letrec
       - Bit code_pointer_shift-31: the Wasm function index
    *)
-let code_pointer_subfunc_mask = 0xffel
+let code_pointer_subfunc_mask = 0xffcl
 let code_pointer_letrec_mask = 0xffff_f000l
+let code_pointer_restart_mask = 2l
 
 (* TODO: grab the following values from C: *)
 (* Note that the domain fields are 8-aligned, even on 32 bit systems *)
@@ -592,7 +594,8 @@ let grab_helper gpad =
           ];
 
           ( (push_local "codeptr" @
-               [ L [ K "i32.const"; N (I32 1l) ];  (* restart flag *)
+               [ L [ K "i32.const"; N (I32 code_pointer_restart_mask) ];
+                   (* restart flag *)
                  L [ K "i32.or" ]
                ]
             )
@@ -1329,7 +1332,10 @@ let emit_binary fpad op src1 src2 dest =
     | Plsrint ->
         emit_int_binary
           fpad src1 src2 dest
-          [ L [ K "i32.shr_u" ] ]
+          [ L [ K "i32.shr_u" ];
+            L [ K "i32.const"; N (I32 0x3fff_ffffl) ];
+            L [ K "i32.and" ]
+          ]
     | Pasrint ->
         emit_int_binary
           fpad src1 src2 dest
@@ -1544,14 +1550,11 @@ let push_codeptr gpad lab =
   let wasmindex, letrec_label, subfunc = lookup_label gpad lab in
   push_wasmptr gpad lab
   @ [ L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
-      L [ K "i32.shl" ]
+      L [ K "i32.shl" ];
+      L [ K "i32.const"; N (I32 (Int32.of_int ((subfunc lsl 2)+1))) ];
+      L [ K "i32.or" ];
     ]
-  @ (if subfunc <> 0 then
-      [ L [ K "i32.const"; N (I32 (Int32.of_int (subfunc lsl 1))) ];
-        L [ K "i32.or" ];
-      ]
-     else [])
-  
+
 let closurerec gpad fpad descr src_list dest_list =
   let nfuncs = List.length dest_list in
   let envofs = nfuncs * 3 - 1 in
@@ -1564,7 +1567,7 @@ let closurerec gpad fpad descr src_list dest_list =
               []
           )
           @ [ MB_code (push_codeptr gpad label) ]
-          @ [ MB_store (Const ((envofs lsl 1) + 1)) ]
+          @ [ MB_store (Const (((envofs - 3*i) lsl 1) + 1)) ]
         )
         dest_list
       |> List.flatten
@@ -1575,7 +1578,7 @@ let closurerec gpad fpad descr src_list dest_list =
       (fun i (dest, _) ->
         ( [ L [ K "local.get"; ID ptr ] ]
           @ (if i > 0 then
-               [ L [ K "i32.const"; N (I32 (Int32.of_int (3*i-1))) ];
+               [ L [ K "i32.const"; N (I32 (Int32.of_int (12*i))) ];
                  L [ K "i32.add" ]
                ]
              else
@@ -1686,7 +1689,7 @@ let grab fpad num =
   let sexpl =
     [ (* if (codeptr & 1) *)
       L [ K "local.get"; ID "codeptr" ];
-      L [ K "i32.const"; N (I32 1l) ];
+      L [ K "i32.const"; N (I32 code_pointer_restart_mask) ];
       L [ K "i32.and" ];
       L [ K "if";
           L ( [ K "then";
@@ -1932,7 +1935,7 @@ let rec emit_instr gpad fpad instr =
         @ pop_to_local "accu"
     | Wcopyenv arg ->
         push_env
-        @ ( if arg.offset > 0 then
+        @ ( if arg.offset <> 0 then
               add_offset (4 * arg.offset)
             else
               []
@@ -2019,6 +2022,8 @@ let rec emit_instr gpad fpad instr =
           fpad.need_return <- true;
           push_as fpad arg.src RValue
           @ pop_to_local "accu"
+          @ push_field_addr "fp" arg.arity
+          @ pop_to_local "fp"
           @ [ L [ K "br"; ID "return" ]]
         )
     | Wgrab arg ->
@@ -2179,7 +2184,7 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
             [ L [ K "local.get"; ID "codeptr" ];
               L [ K "i32.const"; N (I32 code_pointer_subfunc_mask) ];
               L [ K "i32.and" ];
-              L [ K "i32.const"; N (I32 1l) ];
+              L [ K "i32.const"; N (I32 2l) ];
               L [ K "i32.shr_u" ];
               L ( [ K "br_table" ] @ labels )
             ] in

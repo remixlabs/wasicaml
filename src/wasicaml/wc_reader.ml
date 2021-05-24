@@ -142,13 +142,13 @@ let instructions exec =
         let n = args.(0) in
         [I.Kclosurerec(Array.sub args 2 n |> Array.to_list, args.(1))]
       );
-    O.opOFFSETCLOSUREM3, [], (fun args -> [I.Koffsetclosure 3]);
+    O.opOFFSETCLOSUREM3, [], (fun args -> [I.Koffsetclosure (-3)]);
     O.opOFFSETCLOSURE0, [], (fun args -> [I.Koffsetclosure 0]);
-    O.opOFFSETCLOSURE3, [], (fun args -> [I.Koffsetclosure (-3)]);
+    O.opOFFSETCLOSURE3, [], (fun args -> [I.Koffsetclosure 3]);
     O.opOFFSETCLOSURE, [C], (fun args -> [I.Koffsetclosure args.(0)]);
-    O.opPUSHOFFSETCLOSUREM3, [], (fun args -> [I.Kpush; I.Koffsetclosure 3]);
+    O.opPUSHOFFSETCLOSUREM3, [], (fun args -> [I.Kpush; I.Koffsetclosure (-3)]);
     O.opPUSHOFFSETCLOSURE0, [], (fun args -> [I.Kpush; I.Koffsetclosure 0]);
-    O.opPUSHOFFSETCLOSURE3, [], (fun args -> [I.Kpush; I.Koffsetclosure (-3)]);
+    O.opPUSHOFFSETCLOSURE3, [], (fun args -> [I.Kpush; I.Koffsetclosure 3]);
     O.opPUSHOFFSETCLOSURE, [C], (fun args -> [I.Kpush; I.Koffsetclosure args.(0)]);
     O.opGETGLOBAL, [C], (fun args ->
       let ident = Ident.create_persistent (sprintf "%d" args.(0)) in

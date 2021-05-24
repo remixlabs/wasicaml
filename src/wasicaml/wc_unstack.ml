@@ -105,7 +105,7 @@ let stack_descr state =
   let uninit = ref [] in
   Array.iteri
     (fun i used ->
-      if not used then
+      if not used && i >= cd - !rd then
         uninit := (-cd+i) :: !uninit
     )
     stack;
@@ -785,6 +785,8 @@ let transl_instr lpad state instr =
         let src = state.accu in
         (state, instrs_str @ [ Wswitch{labels_int; labels_blk; src} ])
     | Kapply num when num <= 3 ->
+        (* TODO: the args don't need to be straightened - they are duplicated
+           anyway *)
         let state, instrs_str = straighten_all lpad state in
         let cd = state.camldepth in
         let instrs_move =
@@ -826,7 +828,7 @@ let transl_instr lpad state instr =
         (state, instrs)
     | Kreturn slots ->
         assert(state.camldepth + state.arity = slots);
-        (state, [ Wreturn { src=state.accu } ])
+        (state, [ Wreturn { src=state.accu; arity=state.arity } ])
     | Kgrab num ->
         ({state with arity = num+1}, [ Wgrab { numargs=num }])
     | Kclosure(lab, num) ->
