@@ -55,6 +55,7 @@ type gpad =  (* global pad *)
     (* maps letrec label to the (relative) index in the table of functions *)
     mutable need_reinit_frame : bool;
     mutable need_reinit_frame_k : ISet.t;
+    mutable need_mlookup : bool;
   }
 
 type fpad =  (* function pad *)
@@ -819,13 +820,13 @@ let reinit_frame_k new_num_args =
                      (* bp[i)] *)
                      L [ K "local.get"; ID "bp" ];
                      L [ K "i32.load";
-                         K (sprintf "offset=0x%x" i);
+                         K (sprintf "offset=0x%x" (4 * i));
                          K "align=2"
                        ];
 
                      (* assign *)
                      L [ K "i32.store";
-                         K (sprintf "offset=0x%x" i);
+                         K (sprintf "offset=0x%x" (4 * i));
                          K "align=2"
                        ];
                    ]
@@ -947,6 +948,162 @@ let call_appterm_helper() =
   [ L [ K "call"; ID "appterm_helper" ]]
   @ if !enable_multireturn then [] else
       [ L [ K "global.get"; ID "retval2" ]]
+
+let mlookup =
+  [ L ( [ [ K "func";
+            ID "mlookup";
+            L [ K "param"; ID "obj"; K "i32" ];
+            L [ K "param"; ID "tag"; K "i32" ];
+            L [ K "param"; ID "cache"; K "i32" ];
+            BR;
+            L [ K "result"; C "method"; K "i32" ];
+            L [ K "local"; ID "meths"; K "i32" ];
+            L [ K "local"; ID "ofs"; K "i32" ];
+            L [ K "local"; ID "li"; K "i32" ];
+            L [ K "local"; ID "hi"; K "i32" ];
+            L [ K "local"; ID "mi"; K "i32" ];
+          ];
+
+          (* get the descriptor: meths = obj[0] *)
+          [ L [ K "local.get"; ID "obj" ];
+            L [ K "i32.load"; K "align=2" ];
+            L [ K "local.set"; ID "meths" ];
+          ];
+
+          (* test the cache first, if any: *)
+          [ L [ K "local.get"; ID "cache" ];
+            L [ K "if";
+                L [ K "then";
+
+                    (* ofs = *cache & meths[1] *)
+                    L [ K "local.get"; ID "cache" ];
+                    L [ K "i32.load"; K "align=2" ];
+                    L [ K "local.get"; ID "meths" ];
+                    L [ K "i32.load"; K "offset=0x4"; K "align=2" ];
+                    L [ K "i32.and" ];
+                    L [ K "local.tee"; ID "ofs" ];
+
+                    (* get &meths[3] + ofs *)
+                    L [ K "local.get"; ID "meths" ];
+                    L [ K "i32.const"; N (I32 12l) ];
+                    L [ K "i32.add" ];
+                    L [ K "i32.add" ];
+
+                    (* load the tag there, and compare with [tag] *)
+                    L [ K "i32.load"; K "align=2" ];
+                    L [ K "local.get"; ID "tag" ];
+                    L [ K "i32.eq" ];
+
+                    (* if equal, found something *)
+                    L [ K "if";
+                        L [ K "then";
+
+                            (* get &meths[2] + ofs *)
+                            L [ K "local.get"; ID "meths" ];
+                            L [ K "i32.const"; N (I32 8l) ];
+                            L [ K "i32.add" ];
+                            L [ K "local.get"; ID "ofs" ];
+                            L [ K "i32.add" ];
+
+                            (* load it *)
+                            L [ K "i32.load"; K "align=2" ];
+                            L [ K "return" ];
+                          ]
+                      ]
+                  ]
+              ]
+          ];
+
+          (* li=3 *)
+          [ L [ K "i32.const"; N (I32 3l) ];
+            L [ K "local.set"; ID "li" ];
+          ];
+
+          (* hi=meths[0] *)
+          [ L [ K "local.get"; ID "meths" ];
+            L [ K "i32.load"; K "align=2" ];
+            L [ K "local.set"; ID "hi" ];
+          ];
+
+          (* loop *)
+          [ L [ K "block"; ID "loop_exit"; BR;
+                L [ K "loop"; ID "loop"; BR;
+
+                    (* if (li >= hi) break *)
+                    L [ K "local.get"; ID "li" ];
+                    L [ K "local.get"; ID "hi" ];
+                    L [ K "i32.ge_u" ];
+                    L [ K "br_if"; ID "loop_exit" ];
+
+                    (* mi = (li+hi) >> 1 | 1 *)
+                    L [ K "local.get"; ID "li" ];
+                    L [ K "local.get"; ID "hi" ];
+                    L [ K "i32.add" ];
+                    L [ K "i32.const"; N (I32 1l) ];
+                    L [ K "i32.shr_s" ];
+                    L [ K "i32.const"; N (I32 1l) ];
+                    L [ K "i32.or" ];
+                    L [ K "local.set"; ID "mi" ];
+
+                    (* if (tag < meths[mi]) *)
+                    L [ K "local.get"; ID "tag" ];
+                    L [ K "local.get"; ID "meths" ];
+                    L [ K "local.get"; ID "mi" ];
+                    L [ K "i32.const"; N (I32 2l) ];
+                    L [ K "i32.shl" ];
+                    L [ K "i32.add" ];
+                    L [ K "i32.load"; K "align=2" ];
+                    L [ K "i32.lt_s" ];
+                    L [ K "if";
+                        L [ K "then";
+                            (* hi = mi-2 *)
+                            L [ K "local.get"; ID "mi" ];
+                            L [ K "i32.const"; N (I32 2l) ];
+                            L [ K "i32.sub" ];
+                            L [ K "local.set"; ID "hi" ];
+                          ];
+                        L [ K "else";
+                            (* li = mi *)
+                            L [ K "local.get"; ID "mi" ];
+                            L [ K "local.set"; ID "li" ];
+                          ]
+                      ];
+                    L [ K "br"; ID "loop" ];
+                  ]
+              ]
+          ];
+
+          (* set cache *)
+          [ L [ K "local.get"; ID "cache" ];
+            L [ K "if";
+                L [ K "then";
+
+                    (* *cache = (li-3) * 4 *)
+                    L [ K "local.get"; ID "cache" ];
+                    L [ K "local.get"; ID "li" ];
+                    L [ K "i32.const"; N (I32 3l) ];
+                    L [ K "i32.sub" ];
+                    L [ K "i32.const"; N (I32 4l) ];
+                    L [ K "i32.mul" ];
+                    L [ K "i32.store"; K "align=2" ];
+                  ]
+              ]
+          ];
+
+          (* return meths[li-1] *)
+          [ L [ K "local.get"; ID "meths" ];
+            L [ K "local.get"; ID "li" ];
+            L [ K "i32.const"; N (I32 1l) ];
+            L [ K "i32.sub" ];
+            L [ K "i32.const"; N (I32 2l) ];
+            L [ K "i32.shl" ];
+            L [ K "i32.add" ];
+            L [ K "i32.load"; K "align=2" ];
+            L [ K "return" ];
+          ]
+        ] |> List.flatten
+      )
+  ]
 
 let wasicaml_get_data =
   [ L [ K "func";
@@ -1138,7 +1295,7 @@ let rec drop n l =
   else
     l
 
-let emit_unary fpad op src1 dest =
+let emit_unary gpad fpad op src1 dest =
   match op with
     | Pnegint ->
         ( push_as fpad src1 RIntVal
@@ -1224,8 +1381,16 @@ let emit_unary fpad op src1 dest =
               L [ K "i32.or" ];
             ]
         ) |> pop_to fpad dest RIntVal None
-    | Pgetpubmet k ->
-        assert false (* TODO *)
+    | Pgetpubmet tag ->
+        (* TODO: enable the cache: pass a unique pointer to a 4 byte mem block
+           instead of NULL (initialized to 0) *)
+        gpad.need_mlookup <- true;
+        ( (* mlookup(src1, tag, NULL) *)
+          push_as fpad src1 RValue
+          @ push_const (Int32.succ (Int32.shift_left (Int32.of_int tag) 1))
+          @ push_const 0l
+          @ [ L [ K "call"; ID "mlookup" ] ]
+        ) |> pop_to fpad dest RValue None
 
 let emit_unaryeffect fpad op src1 =
   match op with
@@ -1276,7 +1441,7 @@ let emit_intval_binary fpad src1 src2 dest instrs_int instrs_intval =
       @ instrs_intval
     ) |> pop_to fpad dest RIntVal None
 
-let emit_binary fpad op src1 src2 dest =
+let emit_binary gpad fpad op src1 src2 dest =
   match op with
     | Paddint ->
         emit_intval_binary
@@ -1426,9 +1591,25 @@ let emit_binary fpad op src1 src2 dest =
             )
         ) |> pop_to fpad dest RInt None
     | Pgetmethod ->
-        assert false (* TODO *)
+        gpad.need_mlookup <- true;
+        ( (* src2[0][src1] *)
+          push_as fpad src2 RValue
+          @ [ L [ K "i32.load"; K "align=2" ]]
+          @ push_as fpad src1 RInt
+          @ [ L [ K "i32.const"; N (I32 2l) ];
+              L [ K "i32.shl" ];
+              L [ K "i32.add" ];
+              L [ K "i32.load"; K "align=2" ]
+            ]
+        ) |> pop_to fpad dest RValue None
     | Pgetdynmet ->
-        assert false (* TODO *)
+        gpad.need_mlookup <- true;
+        ( (* mlookup(src2, arc1, NULL) *)
+          push_as fpad src2 RValue
+          @ push_as fpad src1 RValue
+          @ push_const 0l
+          @ [ L [ K "call"; ID "mlookup" ] ]
+        ) |> pop_to fpad dest RValue None
 
 let emit_binaryeffect fpad op src1 src2 =
   match op with
@@ -1937,6 +2118,7 @@ let rec emit_instr gpad fpad instr =
                       @ emit_instrs gpad fpad arg.body
                     )
                 ]
+            (* @ debug2 100 lab *)
             | Loop lab ->
                 [ L ( [ K "loop";
                         ID (sprintf "loop%d" lab);
@@ -1977,11 +2159,11 @@ let rec emit_instr gpad fpad instr =
         ]
         @ pop_to_local "accu"
     | Wunary arg ->
-        emit_unary fpad arg.op arg.src1 arg.dest
+        emit_unary gpad fpad arg.op arg.src1 arg.dest
     | Wunaryeffect arg ->
         emit_unaryeffect fpad arg.op arg.src1
     | Wbinary arg ->
-        emit_binary fpad arg.op arg.src1 arg.src2 arg.dest
+        emit_binary gpad fpad arg.op arg.src1 arg.src2 arg.dest
     | Wbinaryeffect arg ->
         emit_binaryeffect fpad arg.op arg.src1 arg.src2
     | Wternaryeffect arg ->
@@ -2405,6 +2587,7 @@ let generate scode exe get_defname =
       letrec_name;
       need_reinit_frame = false;
       need_reinit_frame_k = ISet.empty;
+      need_mlookup = false;
     } in
 
   let sexpl_code =
@@ -2501,6 +2684,11 @@ let generate scode exe get_defname =
   @ restart_helper gpad
   @ (if gpad.need_reinit_frame then
        reinit_frame
+     else
+       []
+    )
+  @ (if gpad.need_mlookup then
+       mlookup
      else
        []
     )

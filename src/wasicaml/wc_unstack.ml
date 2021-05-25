@@ -353,24 +353,26 @@ let flush_real_stack_intval_at lpad state pos =
 
 let straighten_stack_at lpad state pos =
   (* ensure that the caml stack for pos is set to the real stack *)
-  assert(pos < 0);
-  let k = pos + state.camldepth in
-  let store = List.nth state.camlstack k in
-  match store with
-    | RealAccu _ ->
-        assert(ISet.mem pos state.realaccu);
-        let state, instrs = flush_accu lpad state in
-        (state, instrs)
-    | RealStack p when p = pos ->
-        (state, [])
-    | _ ->
-        assert(not (List.mem (RealStack pos) state.camlstack));
-        let instrs = [ Wcopy { src=store; dest=RealStack pos } ] in
-        let state =
-          { state with
-            camlstack = set_camlstack pos (RealStack pos) state;
-          } in
-        (state, instrs)
+  if pos >= 0 then
+    (state, [ Wcomment (sprintf "****** STRANGE CASE: straighten_stack_at pos=%d *****" pos) ])
+  else
+    let k = pos + state.camldepth in
+    let store = List.nth state.camlstack k in
+    match store with
+      | RealAccu _ ->
+          assert(ISet.mem pos state.realaccu);
+          let state, instrs = flush_accu lpad state in
+          (state, instrs)
+      | RealStack p when p = pos ->
+          (state, [])
+      | _ ->
+          assert(not (List.mem (RealStack pos) state.camlstack));
+          let instrs = [ Wcopy { src=store; dest=RealStack pos } ] in
+          let state =
+            { state with
+              camlstack = set_camlstack pos (RealStack pos) state;
+            } in
+          (state, instrs)
 
 let straighten_stack_multi lpad state pos_list =
   (* TODO: this can be optimized by doing it in one go *)
@@ -650,6 +652,7 @@ let transl_instr lpad state instr =
     | Kvectlength ->
         unary_operation lpad state RIntVal Pvectlength
     | Kgetpubmet k ->
+        let state = push_camlstack state.accu state in
         unary_operation lpad state RValue (Pgetpubmet k)
     | Kaddint ->
         binary_operation lpad state RIntVal Paddint
@@ -688,8 +691,10 @@ let transl_instr lpad state instr =
     | Kgetbyteschar ->
         binary_operation lpad state RInt Pgetbyteschar
     | Kgetmethod ->
+        let state = push_camlstack (List.hd state.camlstack) state in
         binary_operation lpad state RValue Pgetmethod
     | Kgetdynmet ->
+        let state = push_camlstack (List.hd state.camlstack) state in
         binary_operation lpad state RValue Pgetdynmet
     | Ksetvectitem ->
         ternary_effect lpad state Psetvectitem
@@ -758,10 +763,11 @@ let transl_instr lpad state instr =
     | Kccall (name, num) ->
         let state, instrs_str = straighten_all lpad state in
         let descr = stack_descr state in
-        let depth = state.camldepth in
+        let depth = state.camldepth+1 in
         let instrs =
           instrs_str
-          @ [ Wccall_vector { name; numargs=num; depth; descr }] in
+          @ [ Wcopy { src=real_accu; dest=RealStack(-depth) };
+              Wccall_vector { name; numargs=num; depth; descr }] in
         let no_function = Hashtbl.mem Wc_prims.prims_non_func_result name in
         let state =
           { state with accu = RealAccu { no_function }}
