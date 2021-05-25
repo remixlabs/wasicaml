@@ -1008,14 +1008,16 @@ let tovalue_alloc fpad repr descr_opt =
         ( match descr_opt with
             | None -> failwith "cannot convert to double w/o stack descr"
             | Some descr ->
-                let instrs_alloc =
-                  alloc fpad descr double_size double_tag in
+                let (instrs_alloc, ptr, _) =
+                  alloc_set fpad descr double_size double_tag in
                 let local = new_local fpad RFloat in
                 let instrs =
                   [ L [ K "local.set"; ID local ] ]
                   @ instrs_alloc
-                  @ [ L [ K "local.get"; ID local ];
+                  @ [ L [ K "local.get"; ID ptr ];
+                      L [ K "local.get"; ID local ];
                       L [ K "f64.store"; K "align=2" ];
+                      L [ K "local.get"; ID ptr ];
                     ] in
                 instrs
         )
@@ -1117,13 +1119,13 @@ let pop_to fpad store repr descr_opt code_value =
 let copy fpad src dest descr_opt =
   match dest with
     | RealAccu _ ->
-        push_as fpad src RValue
+        push_alloc_as fpad src RValue descr_opt
         @ pop_to_local "accu"
     | Local(repr, name) ->
         push_as fpad src repr
         @ pop_to_local name
     | RealStack pos ->
-        push_as fpad src RValue
+        push_alloc_as fpad src RValue descr_opt
         |>  pop_to_stack fpad pos
     | _ ->
         assert false
@@ -1297,16 +1299,33 @@ let emit_binary fpad op src1 src2 dest =
           fpad src1 src2 dest
           [ L [ K "i32.mul" ] ]
     | Pdivint ->
-        (* TODO: div by zero *)
+        let local = new_local fpad RInt in
         emit_int_binary
           fpad src1 src2 dest
-          [ L [ K "i32.div_s" ] ]
+          [ L [ K "local.tee"; ID local ];
+            L [ K "i32.eqz" ];
+            L [ K "if";
+                L [ K "then";
+                    L [ K "call"; ID "caml_raise_zero_divide" ]
+                  ]
+              ];
+            L [ K "local.get"; ID local ];
+            L [ K "i32.div_s" ]
+          ]
     | Pmodint ->
-        (* TODO: div by zero *)
-        (* CHECK: is this the right remainder function? Needs to be like % in C *)
+        let local = new_local fpad RInt in
         emit_int_binary
           fpad src1 src2 dest
-          [ L [ K "i32.rem_s" ] ]
+          [ L [ K "local.tee"; ID local ];
+            L [ K "i32.eqz" ];
+            L [ K "if";
+                L [ K "then";
+                    L [ K "call"; ID "caml_raise_zero_divide" ]
+                  ]
+              ];
+            L [ K "local.get"; ID local ];
+            L [ K "i32.rem_s" ]
+          ]
     | Pandint ->
         emit_intval_binary
           fpad src1 src2 dest
@@ -1439,8 +1458,12 @@ let emit_ternaryeffect fpad op src1 src2 src3 =
   match op with
     | Psetvectitem ->
         push_as fpad src1 RValue
-        @ ( match repr_of_store src2 with
-              | RInt ->
+        @ ( match src2, repr_of_store src2 with
+              | Const c, _ ->
+                  [ L [ K "i32.const"; N (I32 (Int32.shift_left (Int32.of_int c) 2)) ];
+                    L [ K "i32.add" ]
+                  ]
+              | _, RInt ->
                   push_as fpad src2 RInt
                   @ [ L [ K "i32.const"; N (I32 2l) ];
                       L [ K "i32.shl" ];
@@ -2308,6 +2331,8 @@ let imp_functions =
     [ L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
     ];
+    "ocaml", "caml_raise_zero_divide",
+    [];
     "wasicaml", "wasicaml_try4",
     [ L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
