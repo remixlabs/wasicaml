@@ -1,8 +1,10 @@
 #include <stdio.h>
+#include <time.h>
 
 #include <caml/mlvalues.h>
 #include <caml/alloc.h>
 #include <caml/memory.h>
+#include <caml/fail.h>
 
 value testprint_string(value v_var, value v_str) {
     printf("%s=%s\n", String_val(v_var), String_val(v_str));
@@ -38,4 +40,14 @@ value testprint_vector(value v0, value v1, value v2, value v3, value v4, value v
 value testprint_vector_byte(value *argv, int n) {
     return testprint_vector(argv[0], argv[1], argv[2],
                             argv[3], argv[4], argv[5]);
+}
+
+value testprint_clock(value v0) {
+    struct timespec ts;
+    int r = clock_gettime(CLOCK_REALTIME, &ts);
+    if (r == -1) caml_failwith("testprint_clock");
+    value a = caml_alloc(2, 0);
+    Field(a, 0) = Val_long(ts.tv_sec);
+    Field(a, 1) = Val_long(ts.tv_nsec);
+    return a;
 }

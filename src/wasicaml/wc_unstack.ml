@@ -523,6 +523,7 @@ let validate state =
     )
     state.camlstack;
   assert(match state.accu with
+           | RealAccu { no_function = true } -> false
            | RealAccu _ | Local _ | Invalid -> true
            | _ -> false
         );
@@ -536,7 +537,15 @@ let update_state_table lpad state label =
     | Not_found ->
         Hashtbl.add lpad.state_table label state
 
+let norm_accu state =
+  match state.accu with
+    | RealAccu { no_function=true } ->
+        { state with accu = real_accu }
+    | _ ->
+        state
+
 let branch lpad state label =
+  let state = norm_accu state in
   let instr_br = Wbranch { label=make_label lpad label } in
   try
     let dest_state = Hashtbl.find lpad.state_table label in
@@ -679,7 +688,7 @@ let transl_instr lpad state instr =
     | Kintcomp cmp ->
         binary_operation lpad state RInt (Pintcomp cmp)
     | Kisout ->
-        binary_operation lpad state RInt (Puintcomp Cgt)
+        binary_operation lpad state RInt (Puintcomp Clt)
     | Ksetfield field ->
         binary_effect lpad state (Psetfield field)
     | Ksetfloatfield field ->

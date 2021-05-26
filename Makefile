@@ -55,18 +55,19 @@ configure-ocaml:
 		--disable-ocamldoc \
 		--host wasm32-unknown-wasi \
 		--prefix=$(prefix)
+	echo PRIMS_IR=true >> ocaml/Makefile.config
 
 lib/initwasi.o: src/initwasi.c
 	mkdir -p lib
 	./wasi-sdk/bin/clang --sysroot=wasi-sdk/share/wasi-sysroot \
 		-Iinclude \
-		-o lib/initwasi.o -c src/initwasi.c
+		-O -o lib/initwasi.o -c src/initwasi.c
 
 lib/initruntime.o: src/initruntime.c
 	mkdir -p lib
 	./wasi-sdk/bin/clang --sysroot=wasi-sdk/share/wasi-sysroot \
 		-Iocaml/runtime \
-		-o lib/initruntime.o -c src/initruntime.c
+		-O -o lib/initruntime.o -c src/initruntime.c
 
 src/prims.c:
 	~/.wasicaml/bin/ocamlrun -p > src/primitives

@@ -330,7 +330,7 @@ let setup_for_gc fpad descr =
             ID "fp";
           ]
       ]
-      @ (if sp_decr > 0 then
+      @ (if descr.stack_depth + sp_decr > 0 then
            [ L [ K "i32.const";
                  N (I32 (Int32.of_int ( 4 * (descr.stack_depth + sp_decr))));
                ];
@@ -1464,33 +1464,47 @@ let emit_binary gpad fpad op src1 src2 dest =
           fpad src1 src2 dest
           [ L [ K "i32.mul" ] ]
     | Pdivint ->
-        let local = new_local fpad RInt in
-        emit_int_binary
-          fpad src1 src2 dest
-          [ L [ K "local.tee"; ID local ];
-            L [ K "i32.eqz" ];
-            L [ K "if";
-                L [ K "then";
-                    L [ K "call"; ID "caml_raise_zero_divide" ]
+        ( match src2 with
+            | Const n when n <> 0 ->
+                emit_int_binary
+                  fpad src1 src2 dest
+                  [ L [ K "i32.div_s" ]]
+            | _ ->
+                let local = new_local fpad RInt in
+                emit_int_binary
+                  fpad src1 src2 dest
+                  [ L [ K "local.tee"; ID local ];
+                    L [ K "i32.eqz" ];
+                    L [ K "if";
+                        L [ K "then";
+                            L [ K "call"; ID "caml_raise_zero_divide" ]
+                          ]
+                      ];
+                    L [ K "local.get"; ID local ];
+                    L [ K "i32.div_s" ]
                   ]
-              ];
-            L [ K "local.get"; ID local ];
-            L [ K "i32.div_s" ]
-          ]
+        )
     | Pmodint ->
-        let local = new_local fpad RInt in
-        emit_int_binary
-          fpad src1 src2 dest
-          [ L [ K "local.tee"; ID local ];
-            L [ K "i32.eqz" ];
-            L [ K "if";
-                L [ K "then";
-                    L [ K "call"; ID "caml_raise_zero_divide" ]
+        ( match src2 with
+            | Const n when n <> 0 ->
+                emit_int_binary
+                  fpad src1 src2 dest
+                  [ L [ K "i32.rem_s" ]]
+            | _ ->
+                let local = new_local fpad RInt in
+                emit_int_binary
+                  fpad src1 src2 dest
+                  [ L [ K "local.tee"; ID local ];
+                    L [ K "i32.eqz" ];
+                    L [ K "if";
+                        L [ K "then";
+                            L [ K "call"; ID "caml_raise_zero_divide" ]
+                          ]
+                      ];
+                    L [ K "local.get"; ID local ];
+                    L [ K "i32.rem_s" ]
                   ]
-              ];
-            L [ K "local.get"; ID local ];
-            L [ K "i32.rem_s" ]
-          ]
+        )
     | Pandint ->
         emit_intval_binary
           fpad src1 src2 dest
@@ -1538,6 +1552,8 @@ let emit_binary gpad fpad op src1 src2 dest =
             | Puintcomp Cgt -> "i32.gt_u"
             | Puintcomp Cge -> "i32.ge_u"
             | _ -> assert false in
+        (* TODO: we miss some optimizations when one of the operands is a
+           constant *)
         if repr_comparable_as_i32 (repr_of_store src1) (repr_of_store src2) then
           (* repr doesn't matter *)
           ( push fpad src1
@@ -2063,7 +2079,7 @@ let appterm gpad fpad numargs oldnumargs depth =
 let trap gpad fpad trylabel catchlabel depth =
   (* push 4 values onto stack: 0, 0, 0, extra_args *)
   (* get function pointer and codeptr *)
-  (* caught = wasicaml_try4(f, env, extra_args, codeptr, fp - depth) *)
+  (* caught = wasicaml_wraptry4(f, env, extra_args, codeptr, fp - depth) *)
   (* if (caught): accu = Caml_state->exn_bucket; jump lab *)
   (* else: accu = global "exn_result" *)
   (* at end of try function: global "exn_result" = accu *)
@@ -2083,7 +2099,7 @@ let trap gpad fpad trylabel catchlabel depth =
         L [ K "i32.sub" ]
       ]
     (* @ debug2 30 0 *)
-    @ [ L [ K "call"; ID "wasicaml_try4" ];
+    @ [ L [ K "call"; ID "wasicaml_wraptry4" ];
         L [ K "local.set"; ID local ];
       ]
     (* @ debug2 30 1 *)
@@ -2489,52 +2505,52 @@ let globals() =
       ]
 
 let imp_functions =
-  [ "ocaml", "caml_alloc_small_dispatch",
+  [ "env", "caml_alloc_small_dispatch",
     [ L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
     ];
-    "ocaml", "caml_alloc_small",
-    [ L [ K "param"; K "i32" ];
-      L [ K "param"; K "i32" ];
-      L [ K "result"; K "i32" ]
-    ];
-    "ocaml", "caml_alloc_shr",
+    "env", "caml_alloc_small",
     [ L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
       L [ K "result"; K "i32" ]
     ];
-    "ocaml", "caml_initialize",
+    "env", "caml_alloc_shr",
+    [ L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "result"; K "i32" ]
+    ];
+    "env", "caml_initialize",
     [ L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
     ];
-    "ocaml", "caml_modify",
+    "env", "caml_modify",
     [ L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
     ];
-    "ocaml", "caml_raise_zero_divide",
+    "env", "caml_raise_zero_divide",
     [];
-    "wasicaml", "wasicaml_try4",
+    "env", "wasicaml_wraptry4",
     [ L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
       L [ K "result"; K "i32" ]
+    ];
+    "env", "wasicaml_get_global_data",
+    [ L [ K "result"; K "i32" ]];
+    "env", "wasicaml_get_domain_state",
+    [ L [ K "result"; K "i32" ]];
+    "env", "wasicaml_get_atom_table",
+    [ L [ K "result"; K "i32" ]];
+    "env", "debug2",
+    [ L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
     ];
     "wasicaml", "wasicaml_throw",
     [];
-    "wasicaml", "wasicaml_get_global_data",
-    [ L [ K "result"; K "i32" ]];
-    "wasicaml", "wasicaml_get_domain_state",
-    [ L [ K "result"; K "i32" ]];
-    "wasicaml", "wasicaml_get_atom_table",
-    [ L [ K "result"; K "i32" ]];
-    "wasicaml", "debug2",
-    [ L [ K "param"; K "i32" ];
-      L [ K "param"; K "i32" ];
-    ]
   ]
 
 let sanitize =
@@ -2641,7 +2657,7 @@ let generate scode exe get_defname =
     @ Hashtbl.fold
         (fun name typeuse acc ->
           ( L [ K "import";
-                S "ocaml";
+                S "env";
                 S name;
                 L ( [ K "func";
                       ID name;

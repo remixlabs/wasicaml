@@ -4,8 +4,6 @@ set -e
 
 root='%ROOT%'
 
-# -flto: add meta data for link-time optimizations
-
 init=""
 
 # figure out whether we create an executable
@@ -53,7 +51,7 @@ fi
 # Downsie: -flto implies -emit-llvm so the .o files are LLVM IR, and the
 # wasm code is first generated when the executable is created.
 
-"$root"/lib/wasicaml/wasi-sdk/bin/clang --sysroot="$root"/lib/wasicaml/wasi-sdk/share/wasi-sysroot -flto $init "$@"
+"$root"/lib/wasicaml/wasi-sdk/bin/clang --sysroot="$root"/lib/wasicaml/wasi-sdk/share/wasi-sysroot $init "$@"
 
 if [ $genwrapper -gt 0 -a -f "$out" ]; then
     wasm=`mktemp tmp.XXXXXX`

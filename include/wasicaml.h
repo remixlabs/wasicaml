@@ -12,7 +12,8 @@ __attribute__((import_name("wasicaml_try")))
 extern bool wasicaml_try(void (*f)(void *), void *ctx);
 // runs f(ctx) and catches any exceptions raised via wasicaml_throw.
 // Returns true if such an exception was caught, and false if f returns
-// normally.
+// normally. THIS CAN BE A HOST FUNCTION, AND IT DOESN'T NEED TO FIX UP
+// THE SHADOW STACK POINTER AFTER CATCHING THE EXCEPTION.
 
 __attribute__((import_module("wasicaml")))
 __attribute__((import_name("wasicaml_try4")))
@@ -20,6 +21,15 @@ extern bool wasicaml_try4(int32_t (*f)(void *, void *, void *, void *),
                           void *ctx1, void *ctx2, void *ctx3, void *ctx4);
 // Same but f is called with four context params:
 // f(ctx1,ctx2,ctx3,ctx4)
+
+__attribute__((export_name("wasicaml_wraptry")))
+extern bool wasicaml_wraptry(void (*f)(void *), void *ctx);
+
+__attribute__((export_name("wasicaml_wraptry4")))
+extern bool wasicaml_wraptry4(int32_t (*f)(void *, void *, void *, void *),
+                              void *ctx1, void *ctx2, void *ctx3, void *ctx4);
+// wrappers that call wasicaml_try/try4 and fix up the stack pointer
+// afterwards
 
 __attribute__((import_module("wasicaml")))
 __attribute__((import_name("wasicaml_throw")))

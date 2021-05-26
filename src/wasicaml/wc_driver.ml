@@ -13,6 +13,7 @@ let main() =
   let out = ref "a.out" in   (* let's be traditional *)
   let inp = ref None in
   let cclib = ref [] in
+  let cstack = ref (1024 * 1024) in
   let quiet = ref false in
   Arg.parse
     [ "-o", Arg.Set_string out,
@@ -20,6 +21,9 @@ let main() =
 
       "-cclib", Arg.String (fun s -> cclib := !cclib @ [s]),
       "<option>   pass this option to the linker";
+
+      "-cstack", Arg.Set_int cstack,
+      (sprintf "<numbytes>   set the size of the C shadow stack (default %d)" !cstack);
 
       "-q", Arg.Set quiet,
       "   quiet: reduce verbosity";
@@ -97,8 +101,8 @@ let main() =
   if not !quiet then
     eprintf "* link...\n%!";
   let cmd =
-    sprintf "%s/bin/wasi_cc -o %s %s/lib/initruntime.o %s -L %s/lib/ocaml %s -lcamlrun"
-            prefix !out prefix (inp ^ ".o") prefix
+    sprintf "%s/bin/wasi_cc -Wl,-z,stack-size=%d -o %s %s/lib/initruntime.o %s -L %s/lib/ocaml %s -lcamlrun"
+            prefix !cstack !out prefix (inp ^ ".o") prefix
             (List.map Filename.quote !cclib |> String.concat " ") in
   if not !quiet then
     eprintf "+ %s\n%!" cmd;

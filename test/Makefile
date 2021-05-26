@@ -15,3 +15,8 @@ testprint/libtestprint.a: testprint/testprint_c.c
 
 testprint/testprint.cma: testprint/libtestprint.a testprint/testprint.ml
 	cd testprint && $(prefix)/bin/ocamlc -a -o testprint.cma -cclib -ltestprint testprint.ml
+
+clean:
+	rm -f testprint/*.{cmi,cmo,cma,o,a}
+	rm -f *.{cmi,cmo,cma,o,a}
+	rm -f testruntime
