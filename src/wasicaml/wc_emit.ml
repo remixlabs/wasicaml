@@ -64,6 +64,9 @@ type fpad =  (* function pad *)
     mutable need_appterm_common : bool;
     mutable need_return : bool;
     mutable need_panic : bool;
+    mutable need_tmp1_i32 : bool;
+    mutable need_tmp1_f64 : bool;
+    mutable need_xalloc : bool;
   }
 
 (* Stack layout of a function with N arguments:
@@ -85,6 +88,9 @@ type fpad =  (* function pad *)
 let enable_multireturn = ref false
 (* whether Wasm code can use multivalue returns *)
 (* NB. This seems to be broken in llvm-11 *)
+
+let enable_deadbeef_check = ref false
+(* debugging: check that there is no uninitialized memory on the stack *)
 
 let code_pointer_shift = 12
   (* OCaml code pointers:
@@ -139,15 +145,39 @@ let empty_fpad() =
     need_appterm_common = false;
     need_return = false;
     need_panic = false;
+    need_tmp1_i32 = false;
+    need_tmp1_f64 = false;
+    need_xalloc = false;
   }
 
 let new_local fpad repr =
   Wc_unstack.new_local fpad.lpad repr
 
+let req_tmp1_i32 fpad =
+  if fpad.lpad.avoid_locals then (
+    fpad.need_tmp1_i32 <- true;
+    "tmp1_i32"
+  )
+  else new_local fpad RInt
+
+let req_tmp1_f64 fpad =
+  if fpad.lpad.avoid_locals then (
+    fpad.need_tmp1_f64 <- true;
+    "tmp1_f64"
+  )
+  else new_local fpad RFloat
+
 let set_bp_1 fpad =
   [ L [ K "i32.const"; N (I32 (Int32.of_int (4 * fpad.maxdepth))) ];
     L [ K "i32.sub" ];
-    L [ K "local.set"; ID "bp" ];
+    L [ K "local.tee"; ID "bp" ];
+    L [ K "global.get"; ID "wasicaml_stack_threshold" ];
+    L [ K "i32.lt_u" ];
+    L [ K "if";
+        L [ K "then";
+            L [ K "call"; ID "caml_raise_stack_overflow" ];
+          ]
+      ]
   ]
 
 let set_bp fpad =
@@ -306,6 +336,97 @@ let debug2_var x0 var =
     L [ K "call"; ID "debug2" ]
   ]
 
+let deadbeef_init =
+  (* IBM mainframes used to initialize fresh memory with 0xdeadbeef *)
+  [ L ( [ [ K "func";
+            ID "deadbeef_init";
+            L [ K "param"; ID "bp"; K "i32" ];
+            L [ K "param"; ID "fp"; K "i32" ];
+          ];
+
+          (* loop *)
+          [ L [ K "block"; ID "loop_exit"; BR;
+                L [ K "loop"; ID "loop"; BR;
+
+                    (* if (bp >= fp) break *)
+                    L [ K "local.get"; ID "bp" ];
+                    L [ K "local.get"; ID "fp" ];
+                    L [ K "i32.ge_u" ];
+                    L [ K "br_if"; ID "loop_exit" ];
+
+                    (* *bp = 0xdeadbeef *)
+                    L [ K "local.get"; ID "bp" ];
+                    L [ K "i32.const"; N (I32 0xdeadbeefl) ];
+                    L [ K "i32.store" ];
+
+                    (* bp++ *)
+                    L [ K "local.get"; ID "bp" ];
+                    L [ K "i32.const"; N (I32 4l) ];
+                    L [ K "i32.add" ];
+                    L [ K "local.set"; ID "bp" ];
+
+                    L [ K "br"; ID "loop" ]
+                  ]
+              ]
+          ]
+        ] |> List.flatten
+      )
+  ]
+
+let deadbeef_check =
+  (* now check that there's no dead beef on the stack! *)
+  [ L ( [ [ K "func";
+            ID "deadbeef_check";
+            L [ K "param"; ID "ptr"; K "i32" ];
+            L [ K "param"; ID "fp"; K "i32" ];
+          ];
+
+          (* assert (ptr <= fp) *)
+          push_local "ptr";
+          push_local "fp";
+          [ L [ K "i32.gt_u" ];
+            L [ K "if";
+                L [ K "then";
+                    L [ K "unreachable" ]
+                  ]
+              ]
+          ];
+
+          (* loop *)
+          [ L [ K "block"; ID "loop_exit"; BR;
+                L [ K "loop"; ID "loop"; BR;
+
+                    (* if (ptr >= fp) break *)
+                    L [ K "local.get"; ID "ptr" ];
+                    L [ K "local.get"; ID "fp" ];
+                    L [ K "i32.ge_u" ];
+                    L [ K "br_if"; ID "loop_exit" ];
+
+                    (* assert( *bp != 0xdeadbeef) *)
+                    L [ K "local.get"; ID "ptr" ];
+                    L [ K "i32.load" ];
+                    L [ K "i32.const"; N (I32 0xdeadbeefl) ];
+                    L [ K "i32.eq" ];
+                    L [ K "if";
+                        L [ K "then";
+                            L [ K "unreachable" ]
+                          ]
+                      ];
+
+                    (* ptr++ *)
+                    L [ K "local.get"; ID "ptr" ];
+                    L [ K "i32.const"; N (I32 4l) ];
+                    L [ K "i32.add" ];
+                    L [ K "local.set"; ID "ptr" ];
+
+                    L [ K "br"; ID "loop" ]
+                  ]
+              ]
+          ]
+        ] |> List.flatten
+      )
+  ]
+
 let stack_init fpad descr =
   (* put zeros into the uninitialized stack positions *)
   List.map
@@ -341,7 +462,16 @@ let setup_for_gc fpad descr =
         )
     )
     |> pop_to_domain_field domain_field_extern_sp in
-  sexpl_stack @ sexpl_accu @ sexpl_extern_sp
+  let sexpl_check =
+    ( if !enable_deadbeef_check then
+        push_domain_field domain_field_extern_sp
+        @ [ L [ K "local.get"; ID "fp" ];
+            L [ K "call"; ID "deadbeef_check" ]
+          ]
+      else
+        []
+    ) in
+  sexpl_stack @ sexpl_accu @ sexpl_extern_sp @ sexpl_check
 
 let restore_after_gc fpad descr =
   if descr.stack_save_accu then
@@ -421,18 +551,29 @@ let alloc_slow() =
           if !enable_multireturn then [
               L [ K "result"; C "out_accu"; K "i32" ];
             ] else [];
-          [ L [ K "local"; ID "ptr"; K "i32" ]
+          [ L [ K "local"; ID "ptr"; K "i32" ];
+            L [ K "local"; ID "sp"; K "i32" ]
           ];
+
           ( [ L [ K "local.get"; ID "fp" ];
               L [ K "local.get"; ID "stackdepth" ];
               L [ K "i32.sub" ];
               L [ K "i32.const"; N (I32 4l) ];  (* for the accu *)
               L [ K "i32.sub" ];
-              L [ K "local.tee"; ID "fp" ];
+              L [ K "local.tee"; ID "sp" ];
             ]
             |> pop_to_domain_field domain_field_extern_sp
           )
-          @ (push_local "accu" |> pop_to_field "fp" 0);
+          @ (push_local "accu" |> pop_to_field "sp" 0);
+
+          ( if !enable_deadbeef_check then
+              push_domain_field domain_field_extern_sp
+              @ [ L [ K "local.get"; ID "fp" ];
+                  L [ K "call"; ID "deadbeef_check" ]
+                ]
+            else
+              []
+          );
 
           (* caml_alloc_small_dispatch(wosize, CAML_FROM_C, 1, NULL) *)
           push_local "wosize";
@@ -455,7 +596,7 @@ let alloc_slow() =
           [ L [ K "i32.add" ] ];
 
           (* return saved accu *)
-          push_field "fp" 0;
+          push_field "sp" 0;
 
           if !enable_multireturn then [] else
             [ L [ K "global.set"; ID "retval2" ];
@@ -474,7 +615,8 @@ let call_alloc_slow() =
 
 
 let alloc_non_atom fpad descr size tag =
-  let ptr = new_local fpad RValue in
+  fpad.need_xalloc <- true;
+  let ptr = "xalloc" (* new_local fpad RValue *) in
   let young = size <= max_young_wosize in
   let code =
     if young then
@@ -520,11 +662,12 @@ let alloc fpad descr size tag =
     code @ push_local ptr
 
 let alloc_set fpad descr size tag =
-  if size = 0 then
-    let ptr = new_local fpad RValue in
+  if size = 0 then (
+    fpad.need_xalloc <- true;
+    let ptr = "xalloc" (* new_local fpad RValue *) in
     let young = false in
     (alloc_atom fpad tag @ push_local ptr, ptr, young)
-  else
+  ) else
     alloc_non_atom fpad descr size tag
 
 let grab_helper gpad =
@@ -1140,6 +1283,12 @@ let wasicaml_init =
         L [ K "global.set"; ID "wasicaml_domain_state" ];
         L [ K "call"; ID "wasicaml_get_atom_table" ];
         L [ K "global.set"; ID "wasicaml_atom_table" ];
+        L [ K "global.get"; ID "wasicaml_domain_state" ];
+        L [ K "i32.load";
+            K (sprintf "offset=0x%lx" (Int32.of_int (8 * domain_field_stack_threshold)));
+            K "align=2";
+          ];
+        L [ K "global.set"; ID "wasicaml_stack_threshold" ];
         L [ K "return" ]
       ]
   ]
@@ -1167,7 +1316,7 @@ let tovalue_alloc fpad repr descr_opt =
             | Some descr ->
                 let (instrs_alloc, ptr, _) =
                   alloc_set fpad descr double_size double_tag in
-                let local = new_local fpad RFloat in
+                let local = req_tmp1_f64 fpad in
                 let instrs =
                   [ L [ K "local.set"; ID local ] ]
                   @ instrs_alloc
@@ -1356,7 +1505,7 @@ let emit_unary gpad fpad op src1 dest =
         )
     | Pvectlength ->
         (* CHECK: this is long enough for a helper function *)
-        let local = new_local fpad RInt in
+        let local = req_tmp1_i32 fpad in
         ( push_as fpad src1 RValue
           @ [ L [ K "i32.const"; N (I32 4l) ];
               L [ K "i32.sub" ];
@@ -1395,7 +1544,7 @@ let emit_unary gpad fpad op src1 dest =
 let emit_unaryeffect fpad op src1 =
   match op with
     | Poffsetref offset ->
-        let local = new_local fpad RInt in
+        let local = req_tmp1_i32 fpad in
         push_as fpad src1 RIntVal
         @ [ L [ K "local.tee"; ID local ];
             L [ K "local.get"; ID local ];
@@ -1407,6 +1556,7 @@ let emit_unaryeffect fpad op src1 =
             L [ K "i32.store";  K "align=2" ];
           ]
     | Psetglobal (Global index) ->
+        (* let local = new_local fpad RValue in *)
         [ L [ K "global.get";
               ID "wasicaml_global_data";
             ];
@@ -1416,6 +1566,13 @@ let emit_unaryeffect fpad op src1 =
             ];
           L [ K "i32.add" ]
         ]
+        (*
+        @ debug2 150 index
+        @ [ L [ K "local.tee"; ID local ]]
+        @ debug2_var 151 local
+        @ [ L [ K "local.get"; ID local ]]
+         *)
+
         @ push_as fpad src1 RValue
         @ [ L [ K "call";
                 ID "caml_modify";
@@ -1470,7 +1627,7 @@ let emit_binary gpad fpad op src1 src2 dest =
                   fpad src1 src2 dest
                   [ L [ K "i32.div_s" ]]
             | _ ->
-                let local = new_local fpad RInt in
+                let local = req_tmp1_i32 fpad in
                 emit_int_binary
                   fpad src1 src2 dest
                   [ L [ K "local.tee"; ID local ];
@@ -1491,7 +1648,7 @@ let emit_binary gpad fpad op src1 src2 dest =
                   fpad src1 src2 dest
                   [ L [ K "i32.rem_s" ]]
             | _ ->
-                let local = new_local fpad RInt in
+                let local = req_tmp1_i32 fpad in
                 emit_int_binary
                   fpad src1 src2 dest
                   [ L [ K "local.tee"; ID local ];
@@ -1695,12 +1852,15 @@ let emit_ternaryeffect fpad op src1 src2 src3 =
 
 type mb_elem =
   | MB_store of store
+  | MB_const of int32
   | MB_code of sexp list
 
 let push_mb_elem fpad =
   function
   | MB_store src ->
       push_as fpad src RValue
+  | MB_const n ->
+      push_const n
   | MB_code code ->
       code
 
@@ -1782,12 +1942,12 @@ let closurerec gpad fpad descr src_list dest_list =
     ( List.mapi
         (fun i (_, label) ->
           ( if i > 0 then
-              [ MB_store (Const (make_header (3*i) infix_tag)) ]
+              [ MB_const (Int32.of_int (make_header (3*i) infix_tag)) ]
             else
               []
           )
           @ [ MB_code (push_codeptr gpad label) ]
-          @ [ MB_store (Const (((envofs - 3*i) lsl 1) + 1)) ]
+          @ [ MB_const (Int32.of_int (((envofs - 3*i) lsl 1) + 1)) ]
         )
         dest_list
       |> List.flatten
@@ -1860,7 +2020,7 @@ let string_label =
 
 let switch fpad src labls_ints labls_blocks =
   fpad.need_panic <- true;
-  let value = new_local fpad RValue in
+  let value = req_tmp1_i32 fpad in
   push_as fpad src RValue
   @ pop_to_local value
   @ [ (* if (!Is_block(value)) *)
@@ -1980,7 +2140,7 @@ let return =
 
 let apply fpad numargs depth =
   let env_pos = (-depth + numargs + 1) in
-  let codeptr = new_local fpad RValue in
+  let codeptr = req_tmp1_i32 fpad in
   ( push_local "accu"
     |> pop_to_stack fpad env_pos
   )
@@ -1988,6 +2148,16 @@ let apply fpad numargs depth =
   @ [ L [ K "i32.const"; N (I32 (Int32.of_int (numargs-1))) ];
     ]
   @ push_field "accu" 0
+  @ (if !enable_deadbeef_check then
+       [ L [ K "local.get"; ID "fp" ];
+         L [ K "i32.const"; N (I32 (Int32.of_int (4 * depth))) ];
+         L [ K "i32.sub" ];
+         L [ K "local.get"; ID "fp" ];
+         L [ K "call"; ID "deadbeef_check" ]
+       ]
+     else
+       []
+    )
   @ [ L [ K "local.tee"; ID codeptr ];
 
       (*
@@ -2083,12 +2253,22 @@ let trap gpad fpad trylabel catchlabel depth =
   (* if (caught): accu = Caml_state->exn_bucket; jump lab *)
   (* else: accu = global "exn_result" *)
   (* at end of try function: global "exn_result" = accu *)
-  let local = new_local fpad RValue in
+  let local = req_tmp1_i32 fpad in
   let sexpl_stack =
     (push_const 0l |> pop_to_stack fpad (-depth-1))
     @ (push_const 0l |> pop_to_stack fpad (-depth-2))
     @ (push_const 0l |> pop_to_stack fpad (-depth-3))
-    @ (push_local "extra_args" |> pop_to_stack fpad (-depth-4)) in
+    @ (push_local "extra_args" |> pop_to_stack fpad (-depth-4))
+    @ (if !enable_deadbeef_check then
+         [ L [ K "local.get"; ID "fp" ];
+           L [ K "i32.const"; N (I32 (Int32.of_int (4 * (depth + 4)))) ];
+           L [ K "i32.sub" ];
+           L [ K "local.get"; ID "fp" ];
+           L [ K "call"; ID "deadbeef_check" ]
+         ]
+       else
+         []
+      ) in
   let sexpl_try =
     push_wasmptr gpad trylabel
     @ push_local "envptr"
@@ -2164,6 +2344,21 @@ let rec emit_instr gpad fpad instr =
         @ pop_to_local "accu"
     | Wgetglobal arg ->
         let Global offset = arg.src in
+        (*
+        debug2 160 offset
+        @ push_const 161l
+        @ [
+            L [ K "global.get";
+              ID "wasicaml_global_data";
+            ];
+          L [ K "i32.load" ];
+          L [ K "i32.const";
+              N (I32 (Int32.of_int (4 * offset)));
+            ];
+          L [ K "i32.add" ];
+          L [ K "call"; ID "debug2" ]
+        ]
+         *)
         [ L [ K "global.get";
               ID "wasicaml_global_data";
             ];
@@ -2301,6 +2496,14 @@ let emit_fblock gpad fpad fblock =
     Wc_unstack.transl_fblock fpad.lpad fblock
     |> emit_instrs gpad fpad in
   set_bp fpad
+  @ (if !enable_deadbeef_check && fpad.maxdepth > 0 then
+       [ L [ K "local.get"; ID "bp" ];
+         L [ K "local.get"; ID "fp" ];
+         L [ K "call"; ID "deadbeef_init" ]
+       ]
+     else
+       []
+    )
   @ instrs
 
 let get_funcmapping scode =
@@ -2379,6 +2582,7 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
   let fpad = empty_fpad() in
   Hashtbl.add fpad.lpad.locals "accu" RValue;
   Hashtbl.add fpad.lpad.locals "bp" RValue;
+  fpad.lpad.avoid_locals <- export_flag; (* avoid local vars in the long main function *)
 
   let subfunc_pairs =
     List.map
@@ -2426,6 +2630,13 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
   if fpad.need_appterm_common then (
     Hashtbl.add fpad.lpad.locals "appterm_new_num_args" RInt;
   );
+
+  if fpad.need_xalloc then
+    Hashtbl.add fpad.lpad.locals "xalloc" RValue;
+  if fpad.need_tmp1_i32 then
+    Hashtbl.add fpad.lpad.locals "tmp1_i32" RValue;
+  if fpad.need_tmp1_f64 then
+    Hashtbl.add fpad.lpad.locals "tmp1_f64" RValue;
 
   let locals =
     Hashtbl.fold (fun name vtype acc -> (name,vtype) :: acc) fpad.lpad.locals [] in
@@ -2490,6 +2701,20 @@ let generate_main scode gpad =
     with Not_found -> assert false in
   assert(subfunc_labels <> []);
   let func_name = "letrec_main" in
+  (* -- dummy --
+  [ L [ K "func"; ID func_name;
+        L [ K "export"; S func_name ];
+        L [ K "param"; ID "envptr"; K "i32" ];
+        L [ K "param"; ID "extra_args"; K "i32" ];
+        L [ K "param"; ID "codeptr"; K "i32" ];
+        L [ K "param"; ID "fp"; K "i32" ];
+        BR;
+        L [ K "result"; K "i32" ];
+        L [ K "i32.const"; N (I32 0l) ];
+        L [ K "return" ]
+      ]
+  ]
+   *)
   generate_function scode gpad letrec_label func_name subfunc_labels true
 
 
@@ -2497,6 +2722,7 @@ let globals() =
   [ "wasicaml_global_data", true, TI32;
     "wasicaml_domain_state", true, TI32;
     "wasicaml_atom_table", true, TI32;
+    "wasicaml_stack_threshold", true, TI32;
     "exn_result", true, TI32;
   ]
   @ if !enable_multireturn then [] else
@@ -2530,6 +2756,8 @@ let imp_functions =
       L [ K "param"; K "i32" ];
     ];
     "env", "caml_raise_zero_divide",
+    [];
+    "env", "caml_raise_stack_overflow",
     [];
     "env", "wasicaml_wraptry4",
     [ L [ K "param"; K "i32" ];
@@ -2705,6 +2933,11 @@ let generate scode exe get_defname =
     )
   @ (if gpad.need_mlookup then
        mlookup
+     else
+       []
+    )
+  @ (if !enable_deadbeef_check then
+       deadbeef_init @ deadbeef_check
      else
        []
     )

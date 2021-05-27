@@ -6,6 +6,14 @@ open Wc_types
      for bp
  *)
 
+let trace_stack_max depth instr =
+  (* some instructions need temporarily additional stack positions *)
+  match instr with
+    | I.Kapply num -> if num < 4 then depth+3 else depth
+    | Kappterm(num,slots) -> max depth (depth-slots+num)
+    | Kpushtrap _ -> depth+4
+    | _ -> depth
+
 let trace_stack_instr depth instr =
   match instr with
     | I.Klabel _ -> assert false
@@ -43,12 +51,14 @@ let trace_stack_instr depth instr =
     | Kstrictbranchif _ -> assert false
     | Kstrictbranchifnot _ -> assert false
 
+
 let max_stack_depth_of_instrs instrs =
   let len = Array.length instrs in
   let rec recurse mdepth depth k =
     if k < len then
+      let mdep = trace_stack_max depth instrs.(k) in
       let depth' = trace_stack_instr depth instrs.(k) in
-      recurse (max mdepth depth') depth' (k+1)
+      recurse (max mdepth (max mdep depth')) depth' (k+1)
     else
       mdepth in
   recurse 0 0 0

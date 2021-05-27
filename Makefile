@@ -4,17 +4,20 @@
         setup setup-downloads setup-git setup-bin setup-js \
         configure configure-ocaml \
 	build build-ocaml \
+	build2 build-wasicaml \
 	install install-downloads install-bin install-ocaml install-lib \
-	clean clean-ocaml
+	install2 install-wasicaml \
+	clean clean-ocaml clean-wasicaml \
+	test test-wasicaml
 
-default: setup configure build install
+default: setup configure build install build2 install2
 
 setup: setup-downloads setup-git setup-bin setup-js
 
 setup-downloads:
 	./install_wasi-sdk
-	./install_wabt
 
+# ./install_wabt
 # ./install_wasmtime
 
 setup-git:
@@ -69,29 +72,13 @@ lib/initruntime.o: src/initruntime.c
 		-Iocaml/runtime \
 		-O -o lib/initruntime.o -c src/initruntime.c
 
-src/prims.c:
-	~/.wasicaml/bin/ocamlrun -p > src/primitives
-	(echo '#define CAML_INTERNALS'; \
-	 echo '#include "caml/mlvalues.h"'; \
-	 echo '#include "caml/prims.h"'; \
-	 sed -e 's/.*/extern value &();/' src/primitives; \
-	 echo 'c_primitive caml_builtin_cprim[] = {'; \
-	 sed -e 's/.*/  &,/' src/primitives; \
-	 echo '  0 };'; \
-	 echo 'char * caml_names_of_builtin_cprim[] = {'; \
-	 sed -e 's/.*/  "&",/' src/primitives; \
-	 echo '  0 };') > src/prims.c
-
-lib/prims.o: src/prims.c
-	mkdir -p lib
-	./wasi-sdk/bin/clang --sysroot=wasi-sdk/share/wasi-sysroot \
-		-Iocaml/runtime -flto \
-		-o lib/prims.o -c src/prims.c
-
-build: build-ocaml
+build: build-ocaml build-wasicaml
 
 build-ocaml:
 	cd ocaml && make
+
+build2: build-wasicaml
+	cd src/wasicaml && make
 
 install: install-downloads install-bin install-js install-ocaml install-lib
 
@@ -121,7 +108,12 @@ install-lib:
 	cp lib/initwasi.o $(prefix)/lib
 	cp lib/initruntime.o $(prefix)/lib
 
-clean: clean-ocaml
+install2: install-wasicaml
+
+install-wasicaml:
+	cp src/wasicaml/wasicaml $(prefix)/bin/
+
+clean: clean-ocaml clean-wasicaml
 	rm -f wasi_preamble
 	rm -f lib/*.o
 	rm -rf js/node_modules
@@ -130,5 +122,14 @@ clean: clean-ocaml
 clean-ocaml:
 	cd ocaml && make clean
 
+clean-wasicaml:
+	cd src/wasicaml && make clean
+	cd test && make clean
+
 wasi_preamble: wasi_preamble.c
 	cc -DPREFIX='"$(prefix)"' -o wasi_preamble wasi_preamble.c
+
+test: test-wasicaml
+
+test-wasicaml:
+	cd test && make

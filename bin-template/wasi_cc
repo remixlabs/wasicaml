@@ -31,25 +31,23 @@ for arg in "$@"; do
     esac
 done
 
+# --stack-first: places the stack at the beginning of linear memory. It grows
+# downwards, and a stack overflow causes that the addresses wrap across zero
+# to high values that are guaranteed to be invalid - in other words, a stack
+# overflow causes an exception. The downside is that the executables are
+# somewhat larger because the data segment is placed at a higher address
+# that takes more bytes in the code.
+
 genwrapper=0
 if [ $noexe -eq 0 ]; then
     genwrapper=1
-    init="$root/lib/initwasi.o"
+    init="$root/lib/initwasi.o -Wl,--stack-first"
     case "$out" in
         *.wasm)
             genwrapper=0
             ;;
     esac
 fi
-
-# -flto (link-time optimizations): this switch is crucial for getting around
-# the problem that Wasm functions are typed. It enables the linker to fix up
-# any typing mistakes at link time. For example, caml_sys_open is defined
-# with type (i32,i32,i32)->i32 but prims.c references it with type
-# ()->i32. Without -flto you run into a link error.
-# Plus, the optimizations make the code run faster.
-# Downsie: -flto implies -emit-llvm so the .o files are LLVM IR, and the
-# wasm code is first generated when the executable is created.
 
 "$root"/lib/wasicaml/wasi-sdk/bin/clang --sysroot="$root"/lib/wasicaml/wasi-sdk/share/wasi-sysroot $init "$@"
 

@@ -1,12 +1,13 @@
 #! /bin/sh
 
 prefix=~/.wasicaml
+args=""
 
 run_test() {
     rm -f t_byte t_byte.* t_wasm t_wasm.*
     printf "Test %s: " "$t"
     "$prefix"/bin/ocamlc -g -use-runtime ./testruntime -I testprint -o t_byte testprint.cma "$t" || return
-    ../src/wasicaml/wasicaml -q -o t_wasm.wasm -cclib "testprint/libtestprint.a" t_byte || return
+    ../src/wasicaml/wasicaml $args -q -o t_wasm.wasm -cclib "testprint/libtestprint.a" t_byte || return
     printf "build OK\n"
     ./testruntime t_byte >t_byte.out || { echo "t_byte: bad exit code"; return 1; }
     $prefix/bin/wasi_run ./t_wasm.wasm ./t_wasm.wasm >t_wasm.out || { echo "t_wasm: bad exit code"; return 1; }
@@ -16,6 +17,11 @@ run_test() {
     fi
     printf "Test %s: results OK\n" "$t"
 }
+
+if [ "$1" = "-deadbeef" ]; then
+    args="$args -enable-deadbeef-check"
+    shift
+fi
 
 bad=0
 if [ $# -eq 0 ]; then

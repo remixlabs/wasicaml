@@ -4,6 +4,10 @@
 #include "caml/prims.h"
 #include "caml/domain.h"
 #include "caml/startup.h"
+#include "caml/stacks.h"
+
+extern uintnat caml_max_stack_size;    /* defined in stacks.c */
+extern uintnat caml_percent_max;       /* from gc_ctrl.c */
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -41,6 +45,11 @@ void wasicaml_main(char **argv) {
     char *data = wasicaml_get_data();
     asize_t data_size = wasicaml_get_data_size();
     caml_startup_code(zerocode, zerocode_size, data, data_size, NULL, 0, false, argv);
+    // we don't support stack reallocation while the program is running,
+    // so allocate the max right from the beginning
+    caml_realloc_stack(caml_max_stack_size);
+    // disable the compactor - there seems to be an incompatibility:
+    caml_percent_max = 1000000;
     // fprintf(stderr, "Init done\n"); fflush(stdout);
     // fprintf(stderr, "Caml_state=%p\n", Caml_state);
     // fprintf(stderr, "&young_ptr=%p\n", &Caml_state_field(young_ptr));

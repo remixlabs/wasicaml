@@ -30,6 +30,9 @@ let main() =
 
       "-enable-multivalue", Arg.Set Wc_emit.enable_multireturn,
       "   enable Wasm feature: multi-value returns (EXPERIMENTAL)";
+
+      "-enable-deadbeef-check", Arg.Set Wc_emit.enable_deadbeef_check,
+      "   enable stack initialization check (debug)";
     ]
     (fun arg ->
       if !inp <> None then

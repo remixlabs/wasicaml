@@ -46,6 +46,9 @@ type lpad =  (* local pad *)
        is set to true when the local is actually used.
      *)
 
+    mutable avoid_locals : bool;
+    (* try not to allocate locals in this function *)
+
     mutable loops : ISet.t;
     (* which labels are loop labels *)
 
@@ -74,6 +77,7 @@ let empty_state =
 
 let empty_lpad() =
   { locals = Hashtbl.create 7;
+    avoid_locals = false;
     loops = ISet.empty;
     indegree = Hashtbl.create 7;
     state_table = Hashtbl.create 7;
@@ -446,6 +450,8 @@ let localize_accu lpad state repr =
 
 let unary_operation ?(no_function=false) lpad state op_repr op_code =
   let src1 = state.accu in
+  let op_repr =
+    if lpad.avoid_locals then RValue else op_repr in
   match op_repr with
     | RValue ->
         (* result goes into accu *)
@@ -469,6 +475,8 @@ let unary_effect lpad state op_code =
 let binary_operation ?(no_function=false) lpad state op_repr op_code =
   let src1 = state.accu in
   let src2 = List.hd state.camlstack in
+  let op_repr =
+    if lpad.avoid_locals then RValue else op_repr in
   match op_repr with
     | RValue ->
         (* result goes into accu *)
@@ -645,7 +653,9 @@ let transl_instr lpad state instr =
         unary_operation lpad state RIntVal Pboolnot
     | Koffsetint offset ->
         (* localize_accu is beneficial for "for" loops *)
-        let (state, instrs1) = localize_accu lpad state RIntVal in
+        let (state, instrs1) =
+          if lpad.avoid_locals then (state, []) else
+            localize_accu lpad state RIntVal in
         let (state, instrs2) =
           unary_operation lpad state RIntVal (Poffsetint offset) in
         (state, instrs1 @ instrs2)
@@ -791,6 +801,7 @@ let transl_instr lpad state instr =
         let (br_state, instrs) = branch lpad state label in
         (state, [ Wif { src=state.accu; neg=true; body=instrs }])
     | Kswitch (labels_int, labels_blk) ->
+        let state = norm_accu state in
         let state, instrs_str = straighten_all lpad state in
         validate state;
         Array.iter (update_state_table lpad state) labels_int;
