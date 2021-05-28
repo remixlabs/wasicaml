@@ -6,8 +6,50 @@ open Wc_emit
 open Wc_sexp
 open Printf
 
+module SMap = Map.Make(String)
+
 let prefix =
   Sys.getenv "HOME" ^ "/.wasicaml"
+
+let size_limit_for_warning = 10000
+
+let size_of_function func =
+  let rec size_of_block block =
+    Array.fold_left
+      (fun acc instr ->
+        match instr with
+          | Block b -> acc + size_of_block b
+          | Label _ -> acc
+          | _ -> acc + 1
+      )
+      0
+      block.instructions in
+  size_of_block func.block
+
+let size_table s get_defname =
+  let get_letrec_name func =
+    let label =
+      Option.value ~default:0 func.scope.cfg_letrec_label  in
+    let prefix =
+      if label = 0 then
+        "letrec_main"
+      else if func.scope.cfg_main then
+        sprintf "letrec_main%d" label
+      else
+        sprintf "letrec%d" label in
+    try
+      prefix ^ "_" ^ get_defname label
+    with Not_found -> prefix in
+  IMap.bindings s.functions
+  |> List.fold_left
+       (fun acc (label, func) ->
+         let name = get_letrec_name func in
+         let n = try SMap.find name acc with Not_found -> 0 in
+         SMap.add name (n + size_of_function func) acc
+       )
+       SMap.empty
+  |> SMap.bindings
+  |> List.sort (fun (l1,s1) (l2,s2) -> s1-s2)
 
 let main() =
   let out = ref "a.out" in   (* let's be traditional *)
@@ -74,6 +116,21 @@ let main() =
     eprintf "* validating...\n%!";
   );
   validate s;
+
+  let tab = size_table s get_defname |> List.rev in
+  let have_large_functions =
+    List.exists (fun (_, size) -> size >= size_limit_for_warning) tab in
+  if have_large_functions then (
+    eprintf "* WARNING: there are very large functions which can lead to slow JIT compiling\n";
+    try
+      List.iteri
+        (fun i (name,size) ->
+          if i >= 100 || size < size_limit_for_warning then raise Exit;
+          eprintf "  %s: %d instructions\n" name size
+        )
+        tab
+    with Exit -> ()
+  );
 
   if not !quiet then
     eprintf "* translating to WASM...\n%!";
