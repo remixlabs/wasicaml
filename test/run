@@ -2,16 +2,26 @@
 
 prefix=~/.wasicaml
 args=""
+with_ocamlopt=0
 
 run_test() {
     rm -f t_byte t_byte.* t_wasm t_wasm.*
     printf "Test %s: " "$t"
+    if [ $with_ocamlopt -gt 0 ]; then
+        ocamlopt -g -I testprint_opt -o t_opt testprint.cmxa "$t" || return
+    fi
     "$prefix"/bin/ocamlc -g -use-runtime ./testruntime -I testprint -o t_byte testprint.cma "$t" || return
     ../src/wasicaml/wasicaml $args -q -o t_wasm.wasm -cclib "testprint/libtestprint.a" t_byte || return
     printf "build OK\n"
-    ./testruntime t_byte >t_byte.out || { echo "t_byte: bad exit code"; return 1; }
+    if [ $with_ocamlopt -gt 0 ]; then
+        ./t_opt >t_opt.out || { echo "t_byte: bad exit code"; return 1; }
+        ref=t_opt.out
+    else
+        ./testruntime t_byte >t_byte.out || { echo "t_byte: bad exit code"; return 1; }
+        ref=t_byte.out
+    fi
     $prefix/bin/wasi_run ./t_wasm.wasm ./t_wasm.wasm >t_wasm.out || { echo "t_wasm: bad exit code"; return 1; }
-    if ! cmp t_byte.out t_wasm.out; then
+    if ! cmp "$ref" t_wasm.out; then
         printf "Test %s: DIFFERENT RESULTS\n" "$t";
         return 1
     fi
@@ -22,6 +32,10 @@ if [ "$1" = "-deadbeef" ]; then
     args="$args -enable-deadbeef-check"
     shift
 fi
+if [ "$1" = "-ocamlopt" ]; then
+    with_ocamlopt=1
+    shift
+fi
 
 bad=0
 if [ $# -eq 0 ]; then
@@ -30,6 +44,12 @@ if [ $# -eq 0 ]; then
     done
 else
     for t in "$@"; do
+        case "$t" in
+            -*)
+                echo "Unkown option: $t" >&2
+                exit 2
+                ;;
+        esac
         run_test "$t" || bad=1
     done
 fi
