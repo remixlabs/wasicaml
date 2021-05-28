@@ -152,6 +152,7 @@ type winstruction =
   | Wraise of { src:store; kind:Lambda.raise_kind }
   | Wtrap of { trylabel:int; catchlabel:int; depth:int }
   | Wtryreturn of { src:store }
+  | Wnextmain of { label:int }
   | Wstop
   | Wnop
   | Wunreachable
@@ -296,6 +297,8 @@ let rec string_of_winstruction =
               arg.trylabel arg.catchlabel arg.depth
   | Wtryreturn arg ->
       sprintf "Wtryreturn(%s)" (string_of_store arg.src)
+  | Wnextmain arg ->
+      sprintf "Wnextmain(letrec_main%d)" arg.label
   | Wstop ->
       "Wstop"
   | Wnop ->

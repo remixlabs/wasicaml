@@ -968,7 +968,7 @@ let transl_fblock lpad fblock =
               | _ ->
                   ()
              )
-       | Label _ | TryReturn ->
+       | Label _ | TryReturn | NextMain _ ->
            ()
       )
       block.instructions in
@@ -1037,6 +1037,10 @@ let transl_fblock lpad fblock =
                 (state, List.rev_append instrs acc)
             | Block inner ->
                 let instrs = transl_block inner upd_loops in
+                (state, List.rev_append instrs acc)
+            | NextMain label ->
+                let instrs =
+                  [ Wnextmain { label } ] in
                 (state, List.rev_append instrs acc)
         )
         (state, [])

@@ -50,6 +50,7 @@ type structured_code =
    | Simple of I.instruction
    | Trap of { trylabel: int; catchlabel: int; poplabel: int option }
    | TryReturn
+   | NextMain of int
 
  and cfg_scope =
   { cfg_letrec_label : int option;
@@ -59,6 +60,8 @@ type structured_code =
     (* label of current function, or 0 for the init block *)
     cfg_try_labels : int list;
     (* surrounding "try" sections, inner to outer *)
+    cfg_main : bool;
+    (* this is a main scope *)
   }
 
 type trap_info =
@@ -104,6 +107,7 @@ type cfg_node =
     cfg_length : int;
     (* Number of Instruct.instructions (can be 0) *)
     cfg_final : I.instruction option;
+    cfg_next_main : int option;
   }
 
 type cfg =
@@ -116,7 +120,14 @@ val create_cfg : Instruct.instruction array -> ISet.t -> cfg
   (* Create the CFG from the instructions and the set of labels
      (as returned by {!Wc_reader.decode}).
    *)
- 
+
+val split_main_function : cfg -> unit
+  (* An optional transformation of the CFG: Split the usually very long
+     main function (starting at label 0) into a sequence of smaller functions.
+     At the end of every such smaller function the cfg_next_main field
+     is set to point to the next function (should become a tailcall).
+   *)
+
 val recover_structure : cfg -> structured_code
   (* Analyze the loop/jump structure of the code *)
 

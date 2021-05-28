@@ -62,6 +62,7 @@ let main() =
   if not !quiet then
     eprintf "* creating CFG...\n%!";
   let cfg = create_cfg code labels in
+  split_main_function cfg;
   if not !quiet then
     eprintf "  number nodes: %d\n%!" (IMap.cardinal cfg.nodes);
 

@@ -6,63 +6,6 @@ open Wc_types
      for bp
  *)
 
-let trace_stack_max depth instr =
-  (* some instructions need temporarily additional stack positions *)
-  match instr with
-    | I.Kapply num -> if num < 4 then depth+3 else depth
-    | Kappterm(num,slots) -> max depth (depth-slots+num)
-    | Kpushtrap _ -> depth+4
-    | _ -> depth
-
-let trace_stack_instr depth instr =
-  match instr with
-    | I.Klabel _ -> assert false
-    | Krestart -> depth
-    | Kconst _ | Kacc _ | Kassign _ | Kenvacc _ | Kgetglobal _ -> depth
-    | Kpush -> depth+1
-    | Kpop num -> depth-num
-    | ( Knegint | Kboolnot | Koffsetint _ | Koffsetref _ | Kisint
-      | Ksetglobal _ | Kgetfield _ | Kgetfloatfield _ | Kvectlength
-      ) -> depth
-    | ( Kaddint | Ksubint | Kmulint | Kdivint | Kmodint
-        | Kandint | Korint | Kxorint | Klslint | Klsrint | Kasrint
-        | Kintcomp _ | Kisout | Ksetfield _ | Ksetfloatfield _
-        | Kgetvectitem | Kgetstringchar | Kgetbyteschar
-      ) -> depth-1
-    | ( Ksetvectitem | Ksetbyteschar ) -> depth-2
-    | ( Kmakeblock(size, _) | Kmakefloatblock size ) -> depth-(max (size-1) 0)
-    | Kccall(_, num) -> depth-(num-1)
-    | Kbranch _ | Kbranchif _ | Kbranchifnot _ | Kswitch _ -> depth
-    | Kpush_retaddr _ -> depth+3
-    | Kapply num -> depth - num - (if num < 4 then 0 else 3)
-    | Kappterm _ | Kreturn _ | Kraise _ | Kstop -> depth
-    | Kgrab _ -> depth
-    | Kclosure(_, num) -> depth-(max (num-1) 0)
-    | Kclosurerec(funcs, num) ->
-        let num_funcs = List.length funcs in
-        depth-(max (num-1) 0)+num_funcs
-    | Koffsetclosure _ -> depth
-    | Kpushtrap _ | Kpoptrap -> depth
-    | Kcheck_signals -> depth
-    | Kgetmethod -> depth
-    | Kgetpubmet _ -> depth+1
-    | Kgetdynmet -> depth
-    | Kevent _ -> depth
-    | Kstrictbranchif _ -> assert false
-    | Kstrictbranchifnot _ -> assert false
-
-
-let max_stack_depth_of_instrs instrs =
-  let len = Array.length instrs in
-  let rec recurse mdepth depth k =
-    if k < len then
-      let mdep = trace_stack_max depth instrs.(k) in
-      let depth' = trace_stack_instr depth instrs.(k) in
-      recurse (max mdepth (max mdep depth')) depth' (k+1)
-    else
-      mdepth in
-  recurse 0 0 0
-
 let local_branch_labels =
   function
   | I.Kbranch l -> [l]
@@ -96,6 +39,8 @@ let rec dump block indent =
                  (Option.map string_of_int poplabel |> Option.value ~default:"")
      | TryReturn ->
          eprintf "%sTryReturn\n" istr
+     | NextMain label ->
+         eprintf "%sNextMain %d\n" istr label
      | Block inner ->
          dump inner (indent+1)
     )
@@ -136,7 +81,7 @@ let max_stack_depth_of_fblock fblock =
           | Simple i ->
               let labels = local_branch_labels i in
               update_depth_table depth labels;
-              let depth' = trace_stack_instr depth i in
+              let depth' = Wc_traceinstr.trace_stack_instr depth i in
               (max depth' max_depth, depth')
           | Trap { catchlabel; poplabel=Some pop } ->
               update_depth_table depth [ catchlabel; pop ];
@@ -145,6 +90,8 @@ let max_stack_depth_of_fblock fblock =
               update_depth_table depth [ catchlabel ];
               (max_depth, depth)
           | TryReturn ->
+              (max_depth, depth)
+          | NextMain _ ->
               (max_depth, depth)
           | Block inner ->
               recurse inner

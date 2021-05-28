@@ -1,5 +1,6 @@
 ML = wc_types.ml wc_util.ml \
      wc_reader.mli wc_reader.ml \
+     wc_traceinstr.ml \
      wc_control.mli wc_control.ml \
      wc_number.ml \
      wc_sexp.ml \

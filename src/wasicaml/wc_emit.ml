@@ -42,16 +42,20 @@ let zero_expr_of_vtype =
   | TI64 -> [ L [ K "i64.const"; N (I64 0L) ] ]
   | TF64 -> [ L [ K "f64.const"; N (F64 0.0) ] ]
 
+type letrec_label =
+  | Func of int
+  | Main of int
+
 type gpad =  (* global pad *)
-  { letrec_name : (int, string) Hashtbl.t;
+  { letrec_name : (letrec_label, string) Hashtbl.t;
     (* maps letrec label to name *)
     primitives : (string, sexp list) Hashtbl.t;
     (* maps name to type *)
-    funcmapping : (int, int * int) Hashtbl.t;
+    funcmapping : (int, letrec_label * int) Hashtbl.t;
     (* maps function label to (letrec_label, subfunction_id) *)
-    subfunctions : (int, int list) Hashtbl.t;
+    subfunctions : (letrec_label, int list) Hashtbl.t;
     (* maps letrec_label to list of subfunction labels *)
-    wasmindex : (int, int) Hashtbl.t;
+    wasmindex : (letrec_label, int) Hashtbl.t;
     (* maps letrec label to the (relative) index in the table of functions *)
     mutable need_reinit_frame : bool;
     mutable need_reinit_frame_k : ISet.t;
@@ -2465,6 +2469,14 @@ let rec emit_instr gpad fpad instr =
             (* L ( K "block" :: debug2 1 3); *)
             L [ K "return" ]
           ]
+    | Wnextmain { label } ->
+        push_local "accu"  (* sic! *)
+        @ push_local "extra_args"
+        @ push_local "codeptr"
+        @ push_local "fp"
+        @ [ L [ K "call"; ID (sprintf "letrec_main%d" label) ];
+            L [ K "return" ]
+          ]
     | Wstop ->
         [ L [ K "i32.const"; N (I32 0l) ];
           (* L ( K "block" :: debug2 1 2); *)
@@ -2513,10 +2525,15 @@ let get_funcmapping scode =
   let subfunctions = Hashtbl.create 7 in
   IMap.iter
     (fun func_label fblock ->
-      let letrec_label =
+      let letrec_func_label =
         match fblock.scope.cfg_letrec_label with
           | None -> 0
           | Some label -> label in
+      let letrec_label =
+        if fblock.scope.cfg_main then
+          Main letrec_func_label
+        else
+          Func letrec_func_label in
       let subfunc_num =
         try Hashtbl.find subfunction_num letrec_label
         with Not_found -> 0 in
@@ -2615,9 +2632,20 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
             ] in
           block_cascade body subfunc_pairs_with_panic in
   let sexpl =
-    [ L [ K "i32.const"; N (I32 1l) ];
-      L [ K "local.set"; ID "accu" ]
-    ]
+    ( match letrec_label with
+        | Main 0 | Func _ ->
+            [ L [ K "i32.const"; N (I32 1l) ];
+              L [ K "local.set"; ID "accu" ]
+            ]
+        | Main _ ->
+            (* envptr is abused to pass on the accu from one main function
+               to the next *)
+            [ L [ K "local.get"; ID "envptr" ];
+              L [ K "local.set"; ID "accu" ];
+              L [ K "i32.const"; N (I32 0xffff_fffcl) ];
+              L [ K "local.set"; ID "envptr" ]
+            ]
+    )
     @ (subfunc_sexpl
        |> cond_section
             fpad.need_appterm_common "appterm_common" (appterm_common fpad)
@@ -2692,31 +2720,8 @@ let generate_letrec scode gpad letrec_label =
     with Not_found -> assert false in
   assert(subfunc_labels <> []);
   let func_name = Hashtbl.find gpad.letrec_name letrec_label in
-  generate_function scode gpad letrec_label func_name subfunc_labels false
-
-let generate_main scode gpad =
-  let letrec_label = 0 in
-  let subfunc_labels =
-    try Hashtbl.find gpad.subfunctions letrec_label
-    with Not_found -> assert false in
-  assert(subfunc_labels <> []);
-  let func_name = "letrec_main" in
-  (* -- dummy --
-  [ L [ K "func"; ID func_name;
-        L [ K "export"; S func_name ];
-        L [ K "param"; ID "envptr"; K "i32" ];
-        L [ K "param"; ID "extra_args"; K "i32" ];
-        L [ K "param"; ID "codeptr"; K "i32" ];
-        L [ K "param"; ID "fp"; K "i32" ];
-        BR;
-        L [ K "result"; K "i32" ];
-        L [ K "i32.const"; N (I32 0l) ];
-        L [ K "return" ]
-      ]
-  ]
-   *)
-  generate_function scode gpad letrec_label func_name subfunc_labels true
-
+  let export = (letrec_label = Main 0) in
+  generate_function scode gpad letrec_label func_name subfunc_labels export
 
 let globals() =
   [ "wasicaml_global_data", true, TI32;
@@ -2794,32 +2799,35 @@ let generate scode exe get_defname =
 
   let letrec_name = Hashtbl.create 7 in
   Hashtbl.iter
-    (fun letrec_label _ ->
-      if letrec_label = 0 then
-        Hashtbl.add letrec_name letrec_label "letrec_main"
-      else
-        let suffix =
-          try
-            let defname = get_defname letrec_label in
-            "_" ^ sanitize defname
-          with
-            | Not_found -> "" in
-        Hashtbl.add letrec_name letrec_label (sprintf "letrec%d%s" letrec_label suffix)
+    (fun _ (letrec_label, _) ->
+      match letrec_label with
+        | Main 0 ->
+            Hashtbl.add letrec_name letrec_label "letrec_main"
+        | Main lab ->
+            Hashtbl.add letrec_name letrec_label (sprintf "letrec_main%d" lab)
+        | Func lab ->
+            let suffix =
+              try
+                let defname = get_defname lab in
+                "_" ^ sanitize defname
+              with
+                | Not_found -> "" in
+            Hashtbl.add letrec_name letrec_label (sprintf "letrec%d%s" lab suffix)
     )
-    subfunctions;
+    funcmapping;
 
   let wasmindex = Hashtbl.create 7 in
   (* Need 'elements' this only for PIC: *)
   let nextindex = ref 0 in
   let _elements =
     Hashtbl.fold
-      (fun letrec_label _ acc ->
+      (fun _ (letrec_label, _) acc ->
         Hashtbl.add wasmindex letrec_label !nextindex;
         incr nextindex;
         let name = Hashtbl.find letrec_name letrec_label in
         (ID name) :: acc
       )
-      subfunctions
+      funcmapping
       [] in
   let data = Marshal.to_string Wc_reader.(exe.data) [] in
 
@@ -2837,15 +2845,11 @@ let generate scode exe get_defname =
   let sexpl_code =
     Hashtbl.fold
       (fun letrec_label _ acc ->
-        if letrec_label > 0 then
-          let sexpl = generate_letrec scode gpad letrec_label in
-          sexpl @ acc
-        else
-          acc
+        let sexpl = generate_letrec scode gpad letrec_label in
+        sexpl @ acc
       )
       gpad.subfunctions
-      []
-  @ generate_main scode gpad in
+      [] in
 
   let sexpl_memory =
     [ L [ K "import";

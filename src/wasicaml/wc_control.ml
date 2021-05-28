@@ -22,11 +22,13 @@ type structured_code =
    | Simple of I.instruction
    | Trap of { trylabel: int; catchlabel: int; poplabel: int option }
    | TryReturn
+   | NextMain of int
 
  and cfg_scope =
   { cfg_letrec_label : int option;
     cfg_func_label : int;
     cfg_try_labels : int list;
+    cfg_main : bool;
   }
 
 type trap_info =
@@ -46,6 +48,7 @@ type cfg_node =
     cfg_succ : int list;
     cfg_length : int;
     cfg_final : I.instruction option;
+    cfg_next_main : int option;
   }
 
 type cfg =
@@ -172,7 +175,8 @@ let create_cfg code labels =
   let init_scope =
     { cfg_letrec_label = None;
       cfg_func_label = 0;
-      cfg_try_labels = []
+      cfg_try_labels = [];
+      cfg_main = true;
     } in
   Queue.add (init_scope, None, 0) todo;
   let add where scope popfrom start =
@@ -214,7 +218,8 @@ let create_cfg code labels =
           let scope =
             { cfg_letrec_label = Some(List.hd flabs);
               cfg_func_label = flab;
-              cfg_try_labels = []
+              cfg_try_labels = [];
+              cfg_main = false;
             } in
           add (start + !n - 1) scope None flab
         )
@@ -226,11 +231,15 @@ let create_cfg code labels =
     let cfg_succ = last_clabs @ last_jlabs in
     let is_pushtrap = is_trapping code.(start + !n - 1) in
     let is_poptrap = code.(start) = Kpoptrap in
-    let cfg_final =
-      if last_no_cont || is_pushtrap then
-        None
-      else
-        Some (I.Kbranch (start + !n)) in
+    let cfg_final, cfg_length =
+      match code.(start + !n - 1) with
+        | Kbranch lab as instr ->
+            (Some instr, !n-1)
+        | _ ->
+            if last_no_cont || is_pushtrap then
+              (None, !n)
+            else
+              (Some (I.Kbranch (start + !n)), !n) in
     let cfg_try =
       match cfg_scope.cfg_try_labels with
         | lab :: _ when lab = start ->
@@ -244,6 +253,7 @@ let create_cfg code labels =
                 cfg_succ = [];
                 cfg_length = 0;
                 cfg_final = None;
+                cfg_next_main = None;
               } in
             Hashtbl.replace nodes exit_label exit_node;
             Some (Try_entry exit_label)
@@ -289,8 +299,9 @@ let create_cfg code labels =
         cfg_trap;
         cfg_loops = [];  (* later *)
         cfg_succ;
-        cfg_length = !n;
+        cfg_length;
         cfg_final;
+        cfg_next_main = None;
       } in
     Hashtbl.replace nodes start cfg_node;
     if not last_no_cont then (
@@ -363,6 +374,88 @@ let create_cfg code labels =
     } in
   detect_loops cfg;
   cfg
+
+
+let split_main_function cfg =
+  (* We are interested in nodes that
+      - are part of the main function (initializer)
+      - can only be reached via Kbranch instructions (no condition, no switch)
+      - is not part of a loop
+      - does not start/end a "try" block
+      - start with a stack depth of 0
+    Such nodes are moved into a new function - to avoid very long wasm
+    functions.
+   *)
+  let depth_table = Hashtbl.create 7 in
+  let excluded = Hashtbl.create 7 in
+  let exclude p =
+    Hashtbl.replace excluded p true in
+  let rec set_depth depth label =
+    if not (Hashtbl.mem depth_table label) then (
+      Hashtbl.add depth_table label depth;
+      let node =
+        try IMap.find label cfg.nodes
+        with Not_found -> assert false in
+      assert(node.cfg_scope.cfg_letrec_label = None);
+      assert(node.cfg_scope.cfg_main);
+      if node.cfg_loops <> [] then exclude label;
+      if node.cfg_trap <> None then exclude label;
+      let d = ref depth in
+      for lab = label to label + node.cfg_length - 1 do
+        let instr = cfg.code.(lab) in
+        d := Wc_traceinstr.trace_stack_instr !d instr;
+        match instr with
+          | I.Kbranch _ -> assert false
+          | I.Kbranchif p | I.Kbranchifnot p ->
+              exclude p
+          | I.Kswitch(plist,qlist) ->
+              Array.iter exclude plist;
+              Array.iter exclude qlist;
+          | _ ->
+              ()
+      done;
+      List.iter (set_depth !d) node.cfg_succ
+    ) in
+  let starts_another_function label =
+    Hashtbl.find depth_table label = 0 &&
+      not (Hashtbl.mem excluded label) in
+  (* now split the main function up: *)
+  let visited = Hashtbl.create 7 in
+  let rec split_function new_letrec_label label =
+    if not (Hashtbl.mem visited label) then (
+      Hashtbl.add visited label true;
+      let node =
+        try IMap.find label cfg.nodes
+        with Not_found -> assert false in
+      let cfg_scope =
+        { node.cfg_scope with
+          cfg_letrec_label = new_letrec_label;
+          cfg_func_label = new_letrec_label |> Option.value ~default:0;
+        } in
+      let cfg_final, cfg_next_main =
+        match node.cfg_final with
+          | Some (I.Kbranch lab) when starts_another_function lab ->
+              (None, Some lab)
+          | _ ->
+              (node.cfg_final, None) in
+      let next_funcs, cfg_succ =
+        List.partition starts_another_function node.cfg_succ in
+      let node =
+        { node with
+          cfg_scope; cfg_succ; cfg_final; cfg_next_main
+        } in
+      cfg.nodes <- IMap.add label node cfg.nodes;
+      List.iter (split_function new_letrec_label) cfg_succ;
+      List.iter (fun lab -> split_function (Some lab) lab) next_funcs
+    ) in
+  let start_label = 0 in
+  let start_node =
+    try IMap.find start_label cfg.nodes
+    with Not_found -> assert false in
+  assert(start_node.cfg_scope.cfg_letrec_label = None);
+  set_depth 0 start_label;
+  split_function None start_label
+
 
 let is_node_in_loop ctx loop_label label =
   let node =
@@ -451,7 +544,16 @@ let recover_structure ctx =
             |> (fun a1 ->
               match node.cfg_final with
                 | None -> a1
-                | Some instr -> Array.append a1 [| Simple instr |]
+                | Some instr ->
+                    assert(node.cfg_next_main = None);
+                    Array.append a1 [| Simple instr |]
+            )
+            |> (fun a1 ->
+              match node.cfg_next_main with
+                | None -> a1
+                | Some label ->
+                    assert(node.cfg_final = None);
+                    Array.append a1 [| NextMain label |]
             )
             |> (fun a ->
               Array.append [| Label label1 |] a)
@@ -587,6 +689,8 @@ let validate scode =
       | TryReturn ->
           ()
       | Label _ ->
+          ()
+      | NextMain _ ->
           ()
 
   and validate_label labels_in_scope func_label last_label label =
