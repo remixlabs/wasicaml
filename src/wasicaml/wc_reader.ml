@@ -1,15 +1,32 @@
 open Printf
+open Bigarray
 open Wc_types
 
 type executable =
   { dll_paths : string list;
     dll_names : string list;
     primitives : string array;
-    code : string;
-    data : Obj.t array;
+    code : string;    (* TODO: use bigarray - can be larger than 16MB *)
+    data : (char, int8_unsigned_elt, c_layout) Array1.t;
     symbols : Symtable.global_map;
     debug : (int, string) Hashtbl.t;
   }
+
+let read_bigstring f len =
+  let ba = Array1.create Char c_layout len in
+  let by = Bytes.create 4096 in
+  let n = ref len in
+  let k = ref 0 in
+  while !n > 0 do
+    let p = min !n 4096 in
+    really_input f by 0 p;
+    for i = 0 to p - 1 do
+      ba.{!k + i} <- Bytes.get by i
+    done;
+    k := !k + p;
+    n := !n - p;
+  done;
+  ba
 
 let input_stringlist f section =
   try
@@ -19,12 +36,16 @@ let input_stringlist f section =
   with
     | Not_found -> []
 
-let input_objarray f section : Obj.t array =
+let input_objarray_as_bigstring f section =
   try
     let _len = Bytesections.seek_section f section in
-    Marshal.from_channel f
+    let p1 = pos_in f in
+    let _dummay = Marshal.from_channel f in
+    let p2 = pos_in f in
+    let _len = Bytesections.seek_section f section in
+    read_bigstring f (p2 - p1)
   with
-    | Not_found -> [| |]
+    | Not_found -> Array1.create Char c_layout 0
 
 let input_symbols f section : Symtable.global_map =
   try
@@ -71,7 +92,7 @@ let read_executable name =
   let dll_names = input_stringlist f "DLLS" in
   let primitives = input_stringlist f "PRIM" |> Array.of_list in
   let code = Bytesections.read_section_string f "CODE" in
-  let data = input_objarray f "DATA" in
+  let data = input_objarray_as_bigstring f "DATA" in
   let symbols = input_symbols f "SYMB" in
   let debug = input_debug f "DBUG" in
   close_in f;

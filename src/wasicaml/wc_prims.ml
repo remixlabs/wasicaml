@@ -14,7 +14,6 @@ let prims_non_func_result =
     "caml_array_blit";
     "caml_array_concat";
     "caml_array_fill";
-    "caml_array_get_addr";
     "caml_array_get_float";
     "caml_array_set";
     "caml_array_set_addr";

@@ -678,7 +678,7 @@ let transl_instr lpad state instr =
     | Ksubint ->
         binary_operation lpad state RIntVal Psubint
     | Kmulint ->
-        binary_operation lpad state RInt Pmulint
+        binary_operation lpad state RIntUnclean Pmulint
     | Kdivint ->
         binary_operation lpad state RInt Pdivint
     | Kmodint ->
@@ -690,11 +690,11 @@ let transl_instr lpad state instr =
     | Kxorint ->
         binary_operation lpad state RIntVal Pxorint
     | Klslint ->
-        binary_operation lpad state RInt Plslint
+        binary_operation lpad state RIntVal Plslint
     | Klsrint ->
-        binary_operation lpad state RInt Plsrint
+        binary_operation lpad state RIntVal Plsrint
     | Kasrint ->
-        binary_operation lpad state RInt Pasrint
+        binary_operation lpad state RIntVal Pasrint
     | Kintcomp cmp ->
         binary_operation lpad state RInt (Pintcomp cmp)
     | Kisout ->

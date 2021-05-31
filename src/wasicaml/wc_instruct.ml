@@ -5,7 +5,13 @@ type repr =
   | RValue
     (* a pointer to an OCaml block, or an OCaml integer when LSB=1 *)
   | RInt
-    (* an I32 integer that needs to be converted to an OCaml integer *)
+    (* an I32 integer that needs to be converted to an OCaml integer.
+       This is a clean 31 bit value with bit 30 = Bit 31.
+     *)
+  | RIntUnclean
+    (* an I32 integer that needs to be converted to an OCaml integer.
+       Here, the MSB (sign bit) is bit 30, and bit 31 is random.
+     *)
   | RIntVal
     (* an I32 integer that is already converted to an OCaml integer *)
   | RNatInt

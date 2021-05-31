@@ -4,13 +4,24 @@ prefix=~/.wasicaml
 args=""
 with_ocamlopt=0
 
+ocamlc="$prefix"/bin/ocamlc
+ocamlopt=ocamlopt
+
+if [ "x$OCAMLC" != "x" ]; then
+    ocamlc="$OCAMLC"
+fi
+
+if [ "x$OCAMLOPT" != "x" ]; then
+    ocamlopt="$OCAMLOPT"
+fi
+
 run_test() {
     rm -f t_byte t_byte.* t_wasm t_wasm.*
     printf "Test %s: " "$t"
     if [ $with_ocamlopt -gt 0 ]; then
-        ocamlopt -g -I testprint_opt -o t_opt testprint.cmxa "$t" || return
+        "$ocamlopt" -g -I testprint_opt -o t_opt testprint.cmxa "$t" || return
     fi
-    "$prefix"/bin/ocamlc -g -use-runtime ./testruntime -I testprint -o t_byte testprint.cma "$t" || return
+    "$ocamlc" -g -use-runtime ./testruntime -I testprint -o t_byte testprint.cma "$t" || return
     ../src/wasicaml/wasicaml $args -q -o t_wasm.wasm -cclib "testprint/libtestprint.a" t_byte || return
     printf "build OK\n"
     if [ $with_ocamlopt -gt 0 ]; then

@@ -52,7 +52,13 @@ let g (a:int) (b:int) =
   Testprint.int "x17" (if b <> a then 1 else 0);
 
   ()
-  
+
+let h() =
+  (* bit 31 - if present - needs to be ignored: *)
+  let bad_zero = 4 * 0x2000_0000 in
+  (* this will be the unclean value 0x8000_0000 *)
+  f bad_zero 0
+
 let () =
   f 10 11;
   g 10 11;
@@ -61,4 +67,5 @@ let () =
   f (-10) 11;
   g (-10) 11;
   f (-10) (-11);
-  g (-10) (-11)
+  g (-10) (-11);
+  h()

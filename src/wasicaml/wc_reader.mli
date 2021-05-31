@@ -5,7 +5,7 @@ type executable =
     dll_names : string list;
     primitives : string array;
     code : string;
-    data : Obj.t array;
+    data : (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t;
     symbols : Symtable.global_map;
     debug : (int, string) Hashtbl.t;
     (* map bytepos/4 of instr to defname of event *)

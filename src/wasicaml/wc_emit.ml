@@ -1,4 +1,5 @@
 open Printf
+open Bigarray
 open Wc_types
 open Wc_number
 open Wc_sexp
@@ -69,6 +70,7 @@ type fpad =  (* function pad *)
     mutable need_return : bool;
     mutable need_panic : bool;
     mutable need_tmp1_i32 : bool;
+    mutable need_tmp2_i32 : bool;
     mutable need_tmp1_f64 : bool;
     mutable need_xalloc : bool;
   }
@@ -120,6 +122,7 @@ let domain_field_trapsp = 21
 let domain_field_trap_barrier = 22
 let domain_field_external_raise = 23
 let domain_field_exn_bucket = 24
+let domain_field_local_roots = 36
 
 let double_size = 2
 let double_tag = 253
@@ -136,7 +139,7 @@ let make_header size tag =
 
 let vtype repr =
   match repr with
-    | RValue | RInt | RIntVal | RNatInt | RInt32 ->
+    | RValue | RInt | RIntUnclean | RIntVal | RNatInt | RInt32 ->
         TI32
     | RInt64 ->
         TI64
@@ -150,6 +153,7 @@ let empty_fpad() =
     need_return = false;
     need_panic = false;
     need_tmp1_i32 = false;
+    need_tmp2_i32 = false;
     need_tmp1_f64 = false;
     need_xalloc = false;
   }
@@ -161,6 +165,13 @@ let req_tmp1_i32 fpad =
   if fpad.lpad.avoid_locals then (
     fpad.need_tmp1_i32 <- true;
     "tmp1_i32"
+  )
+  else new_local fpad RInt
+
+let req_tmp2_i32 fpad =
+  if fpad.lpad.avoid_locals then (
+    fpad.need_tmp2_i32 <- true;
+    "tmp2_i32"
   )
   else new_local fpad RInt
 
@@ -1304,7 +1315,7 @@ let tovalue_alloc fpad repr descr_opt =
   match repr with
     | RValue | RIntVal ->
         []
-    | RInt ->
+    | RInt | RIntUnclean ->
         [ L [ K "i32.const";
               N (I32 1l);
             ];
@@ -1349,14 +1360,25 @@ let toint repr =
   match repr with
     | RInt ->
         []
+    | RIntUnclean ->
+        [ L [ K "i32.const"; N (I32 1l) ];
+          L [ K "i32.shl" ];
+          L [ K "i32.const"; N (I32 1l) ];
+          L [ K "i32.shr_s" ];
+        ]
     | RValue | RIntVal ->
-        [ L [ K "i32.const";
-              N (I32 1l);
-            ];
+        [ L [ K "i32.const"; N (I32 1l) ];
           L [ K "i32.shr_s" ];
         ]
     | _ ->
         assert false
+
+let tointunclean repr =
+  match repr with
+    | RIntUnclean ->
+        []
+    | _ ->
+        toint repr
 
 let tofloat repr =
   match repr with
@@ -1370,6 +1392,7 @@ let convert fpad repr_from repr_to descr_opt =
   match repr_to with
     | RValue | RIntVal -> tovalue_alloc fpad repr_from descr_opt
     | RInt -> toint repr_from
+    | RIntUnclean -> tointunclean repr_from
     | RFloat -> tofloat repr_from
     | _ ->
         assert false (* TODO *)
@@ -1583,18 +1606,24 @@ let emit_unaryeffect fpad op src1 =
               ]
           ]
 
-let emit_int_binary fpad src1 src2 dest instrs_int =
+let emit_int_binary fpad src1 src2 dest instrs_repr instrs_int =
   ( push_as fpad src1 RInt
     @ push_as fpad src2 RInt
     @ instrs_int
-  ) |> pop_to fpad dest RInt None
+  ) |> pop_to fpad dest instrs_repr None
+
+let emit_int_binary_unclean_ok fpad src1 src2 dest instrs_int =
+  ( push_as fpad src1 RIntUnclean
+    @ push_as fpad src2 RIntUnclean
+    @ instrs_int
+  ) |> pop_to fpad dest RIntUnclean None
 
 let emit_intval_binary fpad src1 src2 dest instrs_int instrs_intval =
   if repr_of_store src1 = RInt && repr_of_store src2 = RInt then
     ( push_as fpad src1 RInt
       @ push_as fpad src2 RInt
       @ instrs_int
-      @ tovalue fpad RInt
+      @ tovalue fpad RIntUnclean
     ) |> pop_to fpad dest RIntVal None
   else
     ( push_as fpad src1 RIntVal
@@ -1602,10 +1631,37 @@ let emit_intval_binary fpad src1 src2 dest instrs_int instrs_intval =
       @ instrs_intval
     ) |> pop_to fpad dest RIntVal None
 
+let emit_intval_binary_unclean_ok fpad src1 src2 dest instrs_int instrs_intval =
+  let is_ok st =
+    let repr = repr_of_store st in
+    repr = RInt || repr = RIntUnclean in
+  if is_ok src1 && is_ok src2 then
+    ( push_as fpad src1 RIntUnclean
+      @ push_as fpad src2 RIntUnclean
+      @ instrs_int
+      @ tovalue fpad RIntUnclean
+    ) |> pop_to fpad dest RIntVal None
+  else
+    emit_intval_binary fpad src1 src2 dest instrs_int instrs_intval
+
+let emit_intval_int_binary fpad src1 src2 dest instrs_int instrs_intval =
+  (* src2 is always an RInt *)
+  if repr_of_store src1 = RInt then
+    ( push_as fpad src1 RInt
+      @ push_as fpad src2 RInt
+      @ instrs_int
+      @ tovalue fpad RIntUnclean
+    ) |> pop_to fpad dest RIntVal None
+  else
+    ( push_as fpad src1 RIntVal
+      @ push_as fpad src2 RInt
+      @ instrs_intval
+    ) |> pop_to fpad dest RIntVal None
+
 let emit_binary gpad fpad op src1 src2 dest =
   match op with
     | Paddint ->
-        emit_intval_binary
+        emit_intval_binary_unclean_ok
           fpad src1 src2 dest
           [ L [ K "i32.add" ] ]
           [ L [ K "i32.add" ];
@@ -1613,7 +1669,7 @@ let emit_binary gpad fpad op src1 src2 dest =
             L [ K "i32.sub" ]
           ]
     | Psubint ->
-        emit_intval_binary
+        emit_intval_binary_unclean_ok
           fpad src1 src2 dest
           [ L [ K "i32.sub" ] ]
           [ L [ K "i32.sub" ];
@@ -1622,18 +1678,18 @@ let emit_binary gpad fpad op src1 src2 dest =
           ]
     | Pmulint ->
         emit_int_binary
-          fpad src1 src2 dest
+          fpad src1 src2 dest RIntUnclean
           [ L [ K "i32.mul" ] ]
     | Pdivint ->
         ( match src2 with
             | Const n when n <> 0 ->
                 emit_int_binary
-                  fpad src1 src2 dest
+                  fpad src1 src2 dest RInt
                   [ L [ K "i32.div_s" ]]
             | _ ->
                 let local = req_tmp1_i32 fpad in
                 emit_int_binary
-                  fpad src1 src2 dest
+                  fpad src1 src2 dest RInt
                   [ L [ K "local.tee"; ID local ];
                     L [ K "i32.eqz" ];
                     L [ K "if";
@@ -1649,12 +1705,12 @@ let emit_binary gpad fpad op src1 src2 dest =
         ( match src2 with
             | Const n when n <> 0 ->
                 emit_int_binary
-                  fpad src1 src2 dest
+                  fpad src1 src2 dest RInt
                   [ L [ K "i32.rem_s" ]]
             | _ ->
                 let local = req_tmp1_i32 fpad in
                 emit_int_binary
-                  fpad src1 src2 dest
+                  fpad src1 src2 dest RInt
                   [ L [ K "local.tee"; ID local ];
                     L [ K "i32.eqz" ];
                     L [ K "if";
@@ -1667,17 +1723,17 @@ let emit_binary gpad fpad op src1 src2 dest =
                   ]
         )
     | Pandint ->
-        emit_intval_binary
+        emit_intval_binary_unclean_ok
           fpad src1 src2 dest
           [ L [ K "i32.and" ] ]
           [ L [ K "i32.and" ] ]
     | Porint ->
-        emit_intval_binary
+        emit_intval_binary_unclean_ok
           fpad src1 src2 dest
           [ L [ K "i32.or" ] ]
           [ L [ K "i32.or" ] ]
     | Pxorint ->
-        emit_intval_binary
+        emit_intval_binary_unclean_ok
           fpad src1 src2 dest
           [ L [ K "i32.xor" ] ]
           [ L [ K "i32.xor" ];
@@ -1685,20 +1741,41 @@ let emit_binary gpad fpad op src1 src2 dest =
             L [ K "i32.or" ];
           ]
     | Plslint ->
-        emit_int_binary
-          fpad src1 src2 dest
-          [ L [ K "i32.shl" ] ]
+        let r1 = repr_of_store src1 in
+        if r1 = RInt || r1 = RIntUnclean then
+          emit_int_binary_unclean_ok
+            fpad src1 src2 dest
+            [ L [ K "i32.shl" ]]
+        else
+          ( push_as fpad src1 RIntVal
+            @ [ L [ K "i32.const"; N (I32 0xffff_fffel) ];
+                L [ K "i32.and" ]
+              ]
+            @ push_as fpad src2 RIntUnclean
+            @ [ L [ K "i32.shl" ];
+                L [ K "i32.const"; N (I32 1l) ];
+                L [ K "i32.or" ]
+              ]
+          ) |> pop_to fpad dest RIntVal None
     | Plsrint ->
-        emit_int_binary
+        emit_intval_int_binary
           fpad src1 src2 dest
           [ L [ K "i32.shr_u" ];
             L [ K "i32.const"; N (I32 0x3fff_ffffl) ];
             L [ K "i32.and" ]
           ]
+          [ L [ K "i32.shr_u" ];
+            L [ K "i32.const"; N(I32 1l) ];
+            L [ K "i32.or" ]
+          ]
     | Pasrint ->
-        emit_int_binary
+        emit_intval_int_binary
           fpad src1 src2 dest
-          [ L [ K "i32.shr_s" ] ]
+          [ L [ K "i32.shr_s" ]]
+          [ L [ K "i32.shr_s" ];
+            L [ K "i32.const"; N(I32 1l) ];
+            L [ K "i32.or" ]
+          ]
     | (Pintcomp cmp | Puintcomp cmp) ->
         let wasm_op =
           match op with
@@ -1723,7 +1800,7 @@ let emit_binary gpad fpad op src1 src2 dest =
           ) |> pop_to fpad dest RInt None
         else
           emit_int_binary
-            fpad src1 src2 dest
+            fpad src1 src2 dest RInt
             [ L [ K wasm_op ]]
     | Pgetvectitem ->
         ( push_as fpad src1 RValue
@@ -1734,7 +1811,7 @@ let emit_binary gpad fpad op src1 src2 dest =
                           K "align=2"
                         ]
                     ]
-                | _, RInt ->
+                | _, (RInt | RIntUnclean) ->
                     push_as fpad src2 RInt
                     @ [ L [ K "i32.const"; N (I32 2l) ];
                         L [ K "i32.shl" ];
@@ -1761,7 +1838,7 @@ let emit_binary gpad fpad op src1 src2 dest =
                         ]
                     ]
                 | _ ->
-                    push_as fpad src2 RInt
+                    push_as fpad src2 RIntUnclean
                     @ [ L [ K "i32.add" ];
                         L [ K "i32.load8_u" ]
                       ]
@@ -1821,8 +1898,8 @@ let emit_ternaryeffect fpad op src1 src2 src3 =
                   [ L [ K "i32.const"; N (I32 (Int32.shift_left (Int32.of_int c) 2)) ];
                     L [ K "i32.add" ]
                   ]
-              | _, RInt ->
-                  push_as fpad src2 RInt
+              | _, (RInt | RIntUnclean) ->
+                  push_as fpad src2 RIntUnclean
                   @ [ L [ K "i32.const"; N (I32 2l) ];
                       L [ K "i32.shl" ];
                       L [ K "i32.add" ];
@@ -1848,9 +1925,9 @@ let emit_ternaryeffect fpad op src1 src2 src3 =
                         ]
                     ]
               | _ ->
-                  push_as fpad src2 RInt
+                  push_as fpad src2 RIntUnclean
                   @ [ L [ K "i32.add" ] ]
-                  @ push_as fpad src3 RInt
+                  @ push_as fpad src3 RIntUnclean
                   @ [ L [ K "i32.store8" ]]
           )
 
@@ -2257,7 +2334,8 @@ let trap gpad fpad trylabel catchlabel depth =
   (* if (caught): accu = Caml_state->exn_bucket; jump lab *)
   (* else: accu = global "exn_result" *)
   (* at end of try function: global "exn_result" = accu *)
-  let local = req_tmp1_i32 fpad in
+  let local1 = req_tmp1_i32 fpad in
+  let local2 = req_tmp2_i32 fpad in
   let sexpl_stack =
     (push_const 0l |> pop_to_stack fpad (-depth-1))
     @ (push_const 0l |> pop_to_stack fpad (-depth-2))
@@ -2274,7 +2352,9 @@ let trap gpad fpad trylabel catchlabel depth =
          []
       ) in
   let sexpl_try =
-    push_wasmptr gpad trylabel
+    push_domain_field domain_field_local_roots
+    @ pop_to_local local2
+    @ push_wasmptr gpad trylabel
     @ push_local "envptr"
     @ push_local "extra_args"
     @ push_codeptr gpad trylabel
@@ -2284,10 +2364,13 @@ let trap gpad fpad trylabel catchlabel depth =
       ]
     (* @ debug2 30 0 *)
     @ [ L [ K "call"; ID "wasicaml_wraptry4" ];
-        L [ K "local.set"; ID local ];
+        L [ K "local.set"; ID local1 ];
       ]
     (* @ debug2 30 1 *)
-    @ [ L [ K "local.get"; ID local ];
+    @ ( push_local local2
+        |> pop_to_domain_field domain_field_local_roots
+      )
+    @ [ L [ K "local.get"; ID local1 ];
         L [ K "if";
             L [ K "then";
                 L [ K "global.get"; ID "wasicaml_domain_state" ];
@@ -2370,7 +2453,7 @@ let rec emit_instr gpad fpad instr =
           L [ K "i32.load";
               K (sprintf "offset=0x%lx" (Int32.of_int (4 * offset)));
               K "align=2";
-            ];
+            ]
         ]
         @ pop_to_local "accu"
     | Wunary arg ->
@@ -2409,6 +2492,12 @@ let rec emit_instr gpad fpad instr =
             | RInt ->
                 push_as fpad arg.src RInt
                 @ (if arg.neg then [ L [ K "i32.eqz" ]] else [])
+            | RIntUnclean ->
+                push_as fpad arg.src RIntUnclean
+                @ [ L [ K "i32.const"; N (I32 0x7fff_ffffl) ];
+                    L [ K "i32.and" ]
+                  ]
+                @ (if arg.neg then [ L [ K "i32.eqz" ]] else [])
             | _ ->
                 push_as fpad arg.src RIntVal
                 @ [ L [ K "i32.const"; N (I32 1l) ];
@@ -2431,9 +2520,9 @@ let rec emit_instr gpad fpad instr =
         appterm gpad fpad arg.numargs arg.oldnumargs arg.depth
     | Wreturn arg ->
         let no_function =
-          match arg.src with
-            | RealAccu { no_function } -> no_function
-            | _ -> repr_of_store arg.src <> RValue in
+        match arg.src with
+          | RealAccu { no_function } -> no_function
+          | _ -> repr_of_store arg.src <> RValue in
         if no_function then
           push_as fpad arg.src RValue
           @ [ L [ K "return" ]]
@@ -2663,6 +2752,8 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
     Hashtbl.add fpad.lpad.locals "xalloc" RValue;
   if fpad.need_tmp1_i32 then
     Hashtbl.add fpad.lpad.locals "tmp1_i32" RValue;
+  if fpad.need_tmp2_i32 then
+    Hashtbl.add fpad.lpad.locals "tmp2_i32" RValue;
   if fpad.need_tmp1_f64 then
     Hashtbl.add fpad.lpad.locals "tmp1_f64" RValue;
 
@@ -2794,6 +2885,22 @@ let sanitize =
         | _ -> '?'
     )
 
+let bigarray_to_string_list limit ba =
+  let n = Array1.dim ba in
+  let l = ref [] in
+  let p = ref 0 in
+  while !p < n do
+    let q = min (n - !p) limit in
+    let by = Bytes.create q in
+    for i = 0 to q-1 do
+      Bytes.set by i ba.{!p + i}
+    done;
+    l := Bytes.to_string by :: !l;
+    p := !p + q
+  done;
+  List.rev !l
+
+
 let generate scode exe get_defname =
   let (funcmapping, subfunctions) = get_funcmapping scode in
 
@@ -2829,7 +2936,9 @@ let generate scode exe get_defname =
       )
       funcmapping
       [] in
-  let data = Marshal.to_string Wc_reader.(exe.data) [] in
+  let data =
+    bigarray_to_string_list 4096 Wc_reader.(exe.data)
+    |> List.map (fun s -> S s) in
 
   let gpad =
     { funcmapping;
@@ -2923,7 +3032,7 @@ let generate scode exe get_defname =
   @ sexpl_globals
   @ wasicaml_init
   @ wasicaml_get_data
-  @ wasicaml_get_data_size (String.length data)
+  @ wasicaml_get_data_size Wc_reader.(Array1.dim exe.data)
   @ alloc_fast
   @ alloc_slow()
   @ grab_helper gpad
@@ -2959,13 +3068,14 @@ let generate scode exe get_defname =
         )
     ]
  *)
-  @ [ L [ K "data";
-          L [ K "memory"; N (I32 0l) ];
-          (* PIC: L [ K "offset"; K "global.get"; ID "__memory_base" ]; *)
-          (* WAT extension: *)
-          ID "data";
-          S data
-        ]
+  @ [ L ( [ K "data";
+            L [ K "memory"; N (I32 0l) ];
+            (* PIC: L [ K "offset"; K "global.get"; ID "__memory_base" ]; *)
+            (* WAT extension: *)
+            ID "data";
+          ]
+          @ data
+        )
     ]
 
   (*
