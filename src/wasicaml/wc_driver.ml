@@ -152,7 +152,7 @@ let main() =
   if not !quiet then
     eprintf "* assemble...\n%!";
   let cmd =
-    sprintf "%s/bin/wasi_cc -c %s" prefix (Filename.quote (inp ^ ".s")) in
+    sprintf "%s/bin/wasi_cc -o %s -c %s" prefix (Filename.quote (inp ^ ".o")) (Filename.quote (inp ^ ".s")) in
   if not !quiet then
     eprintf "+ %s\n%!" cmd;
   let code = Sys.command cmd in

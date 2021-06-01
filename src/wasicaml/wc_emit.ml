@@ -5,14 +5,6 @@ open Wc_number
 open Wc_sexp
 open Wc_instruct
 
-(* TODO:
-   - do a stack check at the beginning of a function (but no realloc)
-   - check that subfunc fits into codeptr (10 bits)
-   - helper functions for "makeblock": field initialization
-   - prevent that the stack can be reallocated
-   - division by zero check for div, mod
- *)
-
 (* OCaml functions are translated to Wasm functions with parameters:
    param 1: envptr
    param 2: extra_args
