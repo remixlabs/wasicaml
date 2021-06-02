@@ -88,8 +88,8 @@ install-downloads:
 	mkdir -p $(prefix)/lib/wasicaml
 	rm -rf $(prefix)/lib/wasi-sdk
 	rm -rf $(prefix)/lib/wasi-sdk-*
-	cp -a wasi-sdk $(prefix)/lib/
-	cp -a wasi-sdk-* $(prefix)/lib/
+	cp -a lib/wasi-sdk $(prefix)/lib/
+	cp -a lib/wasi-sdk-* $(prefix)/lib/
 
 install-bin:
 	mkdir -p $(prefix)/bin
