@@ -57,6 +57,8 @@ type gpad =  (* global pad *)
 
 type fpad =  (* function pad *)
   { lpad : Wc_unstack.lpad;
+    fpad_letrec_label : letrec_label;
+    mutable fpad_scope : Wc_control.cfg_scope;
     mutable maxdepth : int;
     mutable need_appterm_common : bool;
     mutable need_return : bool;
@@ -140,6 +142,12 @@ let vtype repr =
 
 let empty_fpad() =
   { lpad = Wc_unstack.empty_lpad();
+    fpad_letrec_label = Main 0;
+    fpad_scope = { cfg_letrec_label = None;
+                   cfg_func_label = 0;
+                   cfg_try_labels = [];
+                   cfg_main = false
+                 };
     maxdepth = 0;
     need_appterm_common = false;
     need_return = false;
@@ -2211,6 +2219,29 @@ let return =
     L [ K "return" ];
   ]
 
+let throw fpad =
+  (* the exception value must be in domain_field_exn_bucket *)
+  if fpad.fpad_scope.cfg_main && fpad.fpad_scope.cfg_try_labels = [] then
+    (* in outermost scope there is no caller - prefer to throw
+       a real exception
+     *)
+    [ L [ K "call"; ID "wasicaml_throw" ];
+      L [ K "unreachable" ]
+    ]
+  else if fpad.fpad_scope.cfg_try_labels = [] then
+    (* a normal function, but outside a "try" block *)
+    [ L [ K "i32.const"; N (I32 0l) ];
+      L [ K "return" ]
+    ]
+  else
+    (* inside a "try" block: the result is returned via exn_result *)
+    [ L [ K "i32.const"; N (I32 0l) ];
+      L [ K "global.set"; ID "exn_result" ];
+      L [ K "i32.const"; N (I32 0l) ];
+      L [ K "return" ]
+    ]
+
+
 let apply fpad numargs depth =
   let env_pos = (-depth + numargs + 1) in
   let codeptr = req_tmp1_i32 fpad in
@@ -2262,7 +2293,11 @@ let apply fpad numargs depth =
           L [ K "param"; K "i32" ];
           L [ K "result"; K "i32" ];
         ];
-      L [ K "local.set"; ID "accu" ];
+      L [ K "local.tee"; ID "accu" ];
+      L [ K "i32.eqz" ];  (* check for exceptions *)
+      L [ K "if";
+          L ([ K "then"] @ throw fpad)
+        ];
     ]
 
 let appterm_common fpad =
@@ -2363,6 +2398,9 @@ let trap gpad fpad trylabel catchlabel depth =
         |> pop_to_domain_field domain_field_local_roots
       )
     @ [ L [ K "local.get"; ID local1 ];
+        L [ K "global.get"; ID "exn_result" ];
+        L [ K "i32.eqz" ];
+        L [ K "i32.or" ];
         L [ K "if";
             L [ K "then";
                 L [ K "global.get"; ID "wasicaml_domain_state" ];
@@ -2538,9 +2576,7 @@ let rec emit_instr gpad fpad instr =
         @ ( push_local "fp"
             |> pop_to_domain_field domain_field_extern_sp
           )
-        @ [ L [ K "call"; ID "wasicaml_throw" ];
-            L [ K "unreachable" ]
-          ]
+        @ throw fpad
     | Wtrap arg ->
         trap gpad fpad arg.trylabel arg.catchlabel arg.depth
     | Wtryreturn arg ->
@@ -2677,7 +2713,7 @@ let cond_loop cond label sexpl =
 
 
 let generate_function scode gpad letrec_label func_name subfunc_labels export_flag =
-  let fpad = empty_fpad() in
+  let fpad = { (empty_fpad()) with fpad_letrec_label = letrec_label } in
   Hashtbl.add fpad.lpad.locals "accu" RValue;
   Hashtbl.add fpad.lpad.locals "bp" RValue;
   fpad.lpad.avoid_locals <- export_flag; (* avoid local vars in the long main function *)
@@ -2686,6 +2722,7 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
     List.map
       (fun func_label ->
         let fblock = IMap.find func_label Wc_control.(scode.functions) in
+        fpad.fpad_scope <- fblock.scope;
         let label = sprintf "func%d" func_label in
         let sexpl = emit_fblock gpad fpad fblock in
         (label, sexpl)
