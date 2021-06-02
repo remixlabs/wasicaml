@@ -25,8 +25,8 @@ url="https://github.com/bytecodealliance/wasmtime/releases/download/${version}/$
 if [ ! -f "$file" ]; then
     curl -o "$file" -L "$url"
 fi
-mkdir -p lib/wasicaml
-cd lib/wasicaml
+mkdir -p lib
+cd lib
 if [ ! -f "$base" ]; then
     case "$suffix" in
         tar.xz)
