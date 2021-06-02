@@ -23,7 +23,7 @@ setup-downloads:
 # ./install_wasmtime
 
 setup-git:
-	git submodule update --init
+	git submodule update --init --progress
 
 TOOLS=wasi_cc wasi_ld wasi_ar wasi_ranlib wasi_nm wasi_strip wasi_objdump wasi_run
 
