@@ -1,7 +1,6 @@
 version: 2
 jobs:
   build:
-    # same image as amp!
     docker:
       - image: cimg/node:lts
     environment:
