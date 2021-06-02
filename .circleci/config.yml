@@ -7,5 +7,6 @@ jobs:
       - ARCH: linux
     steps:
     - checkout
+    - run: ./configure
     - run: make
     - run: make test
