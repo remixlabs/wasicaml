@@ -1,0 +1,13 @@
+version: 2
+jobs:
+  build:
+    docker:
+      - image: cimg/node:lts
+    environment:
+      - ARCH: linux
+    steps:
+    - checkout
+    - run: ln -s ~/project /tmp
+    - run: cd /tmp/project && ./configure
+    - run: cd /tmp/project && make
+    - run: cd /tmp/project && make test

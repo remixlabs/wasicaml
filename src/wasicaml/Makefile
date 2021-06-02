@@ -1,3 +1,5 @@
+-include ../../Makefile.config
+
 ML = wc_types.ml wc_util.ml \
      wc_reader.mli wc_reader.ml \
      wc_traceinstr.ml \
@@ -8,8 +10,7 @@ ML = wc_types.ml wc_util.ml \
      wc_tracestack.ml wc_instruct.ml wc_unstack.ml wc_emit.ml \
      wc_sexp2s.ml
 LIBS = ocamlcommon.cma ocamlbytecomp.cma
-PREFIX = ~/.wasicaml
-OCAMLC = $(PREFIX)/bin/ocamlc
+OCAMLC = $(prefix)/bin/ocamlc
 
 all: wasicaml
 

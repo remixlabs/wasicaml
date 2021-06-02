@@ -1,5 +1,7 @@
 -include Makefile.config
 
+WASI_SDK = lib/wasi-sdk
+
 .PHONY: default \
         setup setup-downloads setup-git setup-bin setup-js \
         configure configure-ocaml \
@@ -21,7 +23,7 @@ setup-downloads:
 # ./install_wasmtime
 
 setup-git:
-	git submodule update --init
+	git submodule update --init --progress
 
 TOOLS=wasi_cc wasi_ld wasi_ar wasi_ranlib wasi_nm wasi_strip wasi_objdump wasi_run
 
@@ -62,17 +64,17 @@ configure-ocaml:
 
 lib/initwasi.o: src/initwasi.c
 	mkdir -p lib
-	./wasi-sdk/bin/clang --sysroot=wasi-sdk/share/wasi-sysroot \
+	$(WASI_SDK)/bin/clang --sysroot=$(WASI_SDK)/share/wasi-sysroot \
 		-Iinclude \
 		-O -o lib/initwasi.o -c src/initwasi.c
 
 lib/initruntime.o: src/initruntime.c
 	mkdir -p lib
-	./wasi-sdk/bin/clang --sysroot=wasi-sdk/share/wasi-sysroot \
+	$(WASI_SDK)/bin/clang --sysroot=$(WASI_SDK)/share/wasi-sysroot \
 		-Iocaml/runtime \
 		-O -o lib/initruntime.o -c src/initruntime.c
 
-build: build-ocaml build-wasicaml
+build: lib/initruntime.o build-ocaml build-wasicaml
 
 build-ocaml:
 	cd ocaml && make
@@ -84,11 +86,10 @@ install: install-downloads install-bin install-js install-ocaml install-lib
 
 install-downloads:
 	mkdir -p $(prefix)/lib/wasicaml
-	rm -rf $(prefix)/lib/wasicaml/*
-	cp -a wasi-sdk $(prefix)/lib/wasicaml/
-	cp -a wasi-sdk-* $(prefix)/lib/wasicaml/
-	cp -a wabt $(prefix)/lib/wasicaml/
-	cp -a wabt-* $(prefix)/lib/wasicaml/
+	rm -rf $(prefix)/lib/wasi-sdk
+	rm -rf $(prefix)/lib/wasi-sdk-*
+	cp -a lib/wasi-sdk $(prefix)/lib/
+	cp -a lib/wasi-sdk-* $(prefix)/lib/
 
 install-bin:
 	mkdir -p $(prefix)/bin
@@ -104,7 +105,7 @@ install-js:
 install-ocaml:
 	cd ocaml && make install
 
-install-lib:
+install-lib: lib/initwasi.o lib/initruntime.o
 	cp lib/initwasi.o $(prefix)/lib
 	cp lib/initruntime.o $(prefix)/lib
 
