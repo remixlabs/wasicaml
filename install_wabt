@@ -29,11 +29,11 @@ cd lib
 if [ ! -f "$base" ]; then
     case "$suffix" in
         tar.gz)
-            tar -xzf "../../$file" ;;
+            tar -xzf "../$file" ;;
         tar.xz)
-            tar -xJf "../../$file" ;;
+            tar -xJf "../$file" ;;
         zip)
-            unzip "../../$file" ;;
+            unzip "../$file" ;;
         *)
             echo "Unknown file suffix: $suffix" >&2; exit 2 ;;
     esac

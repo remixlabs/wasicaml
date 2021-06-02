@@ -28,7 +28,7 @@ fi
 mkdir -p lib
 cd lib
 if [ ! -f "$base" ]; then
-    tar xzf "../../$file"
+    tar xzf "../$file"
 fi
 rm -f wasi-sdk
 ln -s "$base" wasi-sdk
