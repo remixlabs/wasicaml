@@ -74,7 +74,7 @@ lib/initruntime.o: src/initruntime.c
 		-Iocaml/runtime \
 		-O -o lib/initruntime.o -c src/initruntime.c
 
-build: build-ocaml build-wasicaml
+build: lib/initruntime.o build-ocaml build-wasicaml
 
 build-ocaml:
 	cd ocaml && make
@@ -105,7 +105,7 @@ install-js:
 install-ocaml:
 	cd ocaml && make install
 
-install-lib:
+install-lib: lib/initwasi.o lib/initruntime.o
 	cp lib/initwasi.o $(prefix)/lib
 	cp lib/initruntime.o $(prefix)/lib
 
