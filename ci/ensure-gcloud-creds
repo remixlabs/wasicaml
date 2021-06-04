@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail && cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+gcloud config set component_manager/disable_update_check true
+
+
+if [[ "$(uname)" == "Darwin" ]]; then
+  B64_DECODE="base64 --decode"
+else
+  B64_DECODE="base64 -d"
+fi
+
+# These are set as environment variables in CircleCI.
+# To generate a credentials key file for a service account:
+#
+#   gcloud iam service-accounts keys create key.json --iam-account=deploy-agent@rmx-staging.iam.gserviceaccount.com
+#   cat key.json | base64
+#
+# Put the output of the second command in the relevant environment var.
+set +x
+echo $RMX_DEPLOY_KEY | $B64_DECODE > ~/deploy_key.json
+set -x
+
+# staging
+# activate service account
+gcloud --project rmx-prod auth activate-service-account --key-file ~/deploy_key.json
+
+gcloud auth list
+gcloud -q auth configure-docker
