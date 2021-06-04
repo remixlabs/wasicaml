@@ -5,9 +5,14 @@ jobs:
       - image: cimg/node:lts
     environment:
       - ARCH: linux
+      - GCLOUD_VERSION: 309.0.0
     steps:
     - checkout
+    - run: ./ci/install-gcloud
+    - run: echo 'export PATH=$HOME/ci:$PATH' >> $BASH_ENV
     - run: ln -s ~/project /tmp
     - run: cd /tmp/project && ./configure
     - run: cd /tmp/project && make
     - run: cd /tmp/project && make test
+    - run: ci/ensure-gcloud-creds
+    - run: ci/upload_web

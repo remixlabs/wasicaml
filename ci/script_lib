@@ -1,0 +1,27 @@
+# set some standard variables gleaned from our environment
+
+# current sha
+sha="${CIRCLE_SHA1-}"
+if [[ "$sha" == "" ]]; then
+    sha="$(git rev-parse HEAD)"
+fi
+
+# current branch
+branch="${CIRCLE_BRANCH-}"
+if [[ "$branch" == "" ]]; then
+    branch="$(git rev-parse --abbrev-ref HEAD)"
+fi
+
+# compute the build number
+if [[ -e "release.json" ]]; then
+  # read info from release.json file, if it exists
+  fingerprint=$(awk '/fingerprint/{ gsub(/[",]/, "", $2); print $2 }' release.json)
+  build_number=$(awk '/build_number/{ gsub(/[",]/, "", $2); print $2 }' release.json)
+else
+  # use circle build number as a base, and adjust for the release type
+  build_number="${CIRCLE_BUILD_NUM}"
+
+  # generate a unique identifier to mark this build
+  fingerprint="ci_build_${build_number}"
+
+fi
