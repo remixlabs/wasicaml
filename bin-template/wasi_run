@@ -2,4 +2,4 @@
 
 export WASICAML='%ROOT%'
 export WASICAML_CWD=`pwd`
-exec node --stack-size=$(ulimit -s) --no-warnings --experimental-wasm-bigint -- "$WASICAML/js/main.js" "$@"
+exec node --stack-size=$(( $(ulimit -s) - 256)) --no-warnings --experimental-wasm-bigint -- "$WASICAML/js/main.js" "$@"
