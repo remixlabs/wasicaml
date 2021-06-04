@@ -370,6 +370,25 @@ value. If, however, a `NULL` is returned, this has to be treated by
 the caller as if an exception was raised (as a quicker alternative
 to calling `wasicaml_throw()`).
 
+OCaml functions can be called with too few arguments. This case is
+tested for at runtime (`extra_args` is too small), and if true, a
+closure is created that saves the existing arguments, and prepares for
+re-execution when more arguments become available. The code pointer of
+this closure sets the `RESTART` bit - but is otherwise the same code
+pointer. The `RESTART` bit causes that the saved arguments are pushed
+back to the stack when the closure is finally called. The translation
+of this scheme involves just two additional cheap tests that are
+always done when a function is called. Unfortunately, quite some
+additional code needs to be generated for the case that one of the
+tests yields a true result.
+
+The opposite edge case is that an OCaml function is called with too
+many arguments. The additional arguments can be "consumed" when the
+function returns another function. For this reason, it has to be
+checked on function return whether there are arguments left and a
+closure to call. If so, this is done.
+
+
 
 ## Inside functions
 
