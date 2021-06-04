@@ -237,7 +237,7 @@ OCaml function names can be encoded in the symbol names, which is
 results in better stack traces.
 
 There are a couple of restrictions:
- - Tail calls are generally not available. There is some emzlation
+ - Tail calls are generally not available. There is some emulation
    for self calls, and when one function of a `let rec` definition
    calls another function of the same `let rec`. (Note that tail calls
    are another feature announced for WebAssembly.)
@@ -257,9 +257,21 @@ $ wasicaml -o hello_wasm hello -cclib ~/.wasicaml/lib/ocaml/libunix.a
 Of course, these libraries must be compiled for WebAssembly, too.
 
 
+
+# Troubleshooting
+
+## WASI
+
+During the development I figured out that the current WASI SDK
+is quite buggy. In particular, WASI files are sometimes not cleanly
+mapped to physical files (random characters are inserted into the
+names). The `rename()` function was completely unusable.
+
+
+
 # How it works
 
-THe reason for taking the bytecode as starting point for `wasicaml` is
+The reason for taking the bytecode as starting point for `wasicaml` is
 that it allows us an easy start of the project. It is a good starting
 point because it is a stack machine - close to what we need, but there
 are also downsides, in particular information is missing that would
@@ -267,6 +279,12 @@ be very helpful (e.g. types, or whether the function to call is a
 certain static function). But anyway, we don't have to create a full
 new toolchain, but can just append to an existing one.
 
+For the following, keep in mind that WebAssembly code is normally not
+directly interpreted. There is a JIT pass, and even non-JIT
+interpreters do not directly operate on the code as it is, but rather
+on a preprocessed version that is optimized for execution. This
+normally includes some mapping from logical stores to physical ones,
+and often also advanced techniques like function inlining.
 
 ## The outer structure
 
@@ -298,10 +316,59 @@ subfunction index for "try" blocks.
 
 Summarized, a WebAssembly function includes the code of all the
 OCaml functions of the same `let rec` definition where each function
-is identified by another subfunction index. Also, the code inside
+is identified by a subfunction index. Also, the code inside
 `try` blocks are also translated to subfunctions.
 
 The subfunction index is encoded in code pointers.
+
+
+## Functions
+
+A WebAssembly function takes four parameters:
+ - `envptr`: a pointer to the stack location where the closure value is stored
+ - `extra_args`: the number of further arguments on the stack (i.e. in total
+   there are `extra_args+1` arguments)
+ - `codeptr`: the code pointer (initially taken from `*envptr[0]` but
+   can be overridden here)
+ - `fp`: the address of the first argument
+
+The OCaml arguments are always passed via the stack, and not via the
+WebAssembly parameters. (It is unclear whether this would be
+an advantage - still need to be figured out.)
+
+There are several deviations from the scheme the bytecode interpreter uses.
+First, the closure value (called `env` in the interpreter sources) is
+not directly passed, but indirectly. This way we don't have to save it
+when calling functions that could run the GC.
+
+Second, `extra_args` is not a global counter, but passed on from function to
+function. This also has the nice effect that we don't need to save it
+when calling other functions.
+
+Third, the code pointer is not an address. As WebAssembly is a Harvard
+architecture, code generally doesn't have addresses. Instead, there is
+an indirection mechanism using so-called tables. Essentially, this
+mechanism boils down to enumerating the indirectly callable functions
+with small integers. We reserve now a part of the 32 bits of the code
+pointer for these function IDs. Another part is used for encoding the
+subfunction index.  One bit indicates whether a function is restarted
+(as if it went through the `RESTART` instruction). The LSB of code
+pointers is always 1, so that the GC doesn't touch code pointers.
+
+Fourth, there is no global stack pointer. Instead, each function is
+called with a frame pointer, which is the address of the first
+argument (and further arguments may follow at higher stack positions).
+The function can now use more stack space, so that the non-negative
+offsets are arguments, and the negative ones are local values.
+(Note that WebAssembly doesn't support negative offsets directly,
+and as a workaround we compute another pointer `bp` which is just
+`fp` shifted by some value so that negative offsets do not occur
+anymore.)
+
+A function returns one 32 bit value, which is normally the result
+value. If, however, a `NULL` is returned, this has to be treated by
+the caller as if an exception was raised (as a quicker alternative
+to calling `wasicaml_throw()`).
 
 
 ## Inside functions
