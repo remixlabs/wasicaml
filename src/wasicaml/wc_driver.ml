@@ -1,4 +1,8 @@
 open Wc_types
+(* Copyright (C) 2021 by Figly, Inc.
+   This code is free software, see the file LICENSE for details.
+ *)
+
 open Wc_reader
 open Wc_control
 open Wc_sexp

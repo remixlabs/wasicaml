@@ -1,3 +1,7 @@
+(* Copyright (C) 2021 by Figly, Inc.
+   This code is free software, see the file LICENSE for details.
+ *)
+
 (* write the WAT-type S-expression as a .s file that is understood
    by LLVM
  *)

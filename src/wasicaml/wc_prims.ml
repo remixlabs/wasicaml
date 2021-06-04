@@ -1,3 +1,7 @@
+(* Copyright (C) 2021 by Figly, Inc.
+   This code is free software, see the file LICENSE for details.
+ *)
+
 let mk_table l =
   let tab = Hashtbl.create 7 in
   List.iter (fun k -> Hashtbl.add tab k ()) l;

@@ -1,3 +1,7 @@
+(* Copyright (C) 2021 by Figly, Inc.
+   This code is free software, see the file LICENSE for details.
+ *)
+
 open Wc_types
 open Printf
 
