@@ -3,8 +3,8 @@ set -euo pipefail && cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 source ci/script_lib
 
-tar czf wasicaml-${build_number}.tar.gz -C ~/ .wasicaml
-assets=wasicaml-${build_number}.tar.gz
+tar czf wasicaml-${build_number}-$ARCH.tar.gz -C ~/ .wasicaml
+assets=wasicaml-${build_number}-$ARCH.tar.gz
 
 set -x
 gcloud config set account deploy-agent@rmx-prod.iam.gserviceaccount.com
