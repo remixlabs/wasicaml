@@ -1,5 +1,9 @@
 -include Makefile.config
 
+ifndef prefix
+$(error Run ./configure first)
+endif
+
 WASI_SDK = lib/wasi-sdk
 
 .PHONY: default \
