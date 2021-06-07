@@ -1,3 +1,4 @@
 [submodule "ocaml"]
 	path = ocaml
-	url = git@github.com:gerdstolpmann/ocaml.git
+	url = https://github.com/gerdstolpmann/ocaml.git
+	branch = gerd/wasi-4.12.0
