@@ -27,9 +27,16 @@ setup-downloads:
 
 .PHONE: build-wasi-libc
 build-wasi-libc:
-	if [ ! -d wasi-libc ]; then git clone https://github.com/WebAssembly/wasi-libc.git; else cd wasi-libc; git fetch; fi
-	cd wasi-libc && git checkout $(WASI_LIBC_BRANCH)
-	cd wasi-libc && git merge --ff-only FETCH_HEAD
+	if [ ! -d wasi-libc ]; then \
+	    git clone https://github.com/WebAssembly/wasi-libc.git && \
+	    cd wasi-libc && \
+	    git checkout $(WASI_LIBC_BRANCH); \
+	else \
+	    cd wasi-libc && \
+	    git fetch && \
+	    git checkout $(WASI_LIBC_BRANCH) && \
+	    git merge --ff-only FETCH_HEAD; \
+	fi
 	cd wasi-libc && $(MAKE) WASM_CC=$(TOP)/lib/wasi-sdk/bin/clang WASM_AR=$(TOP)/lib/wasi-sdk/bin/llvm-ar WASM_NM=$(TOP)/lib/wasi-sdk/bin/llvm-nm
 	rm -rf lib/wasi-sdk/share/wasi-sysroot.old
 	mv lib/wasi-sdk/share/wasi-sysroot lib/wasi-sdk/share/wasi-sysroot.old
