@@ -21,7 +21,7 @@ for arg in "$@"; do
         break
     fi
     case "$arg" in
-        -c | -E | -S | -fsyntax-only | --version | -v | -V)
+        -c | -E | -S | -fsyntax-only | --version | -v | -V | -MMD | -MM | -MD | -M )
             noexe=1 ;;
         -o)
             nextout=1 ;;
@@ -41,7 +41,7 @@ done
 genwrapper=0
 if [ $noexe -eq 0 ]; then
     genwrapper=1
-    init="$root/lib/initwasi.o -Wl,--stack-first"
+    init="$root/lib/initwasi.o -Wl,--stack-first -lwasi-emulated-process-clocks"
     case "$out" in
         *.wasm)
             genwrapper=0
@@ -49,7 +49,7 @@ if [ $noexe -eq 0 ]; then
     esac
 fi
 
-"$root"/lib/wasi-sdk/bin/clang --sysroot="$root"/lib/wasi-sdk/share/wasi-sysroot $init "$@"
+"$root"/lib/wasi-sdk/bin/clang --sysroot="$root"/lib/wasi-sdk/share/wasi-sysroot $init -D_WASI_EMULATED_PROCESS_CLOCKS "$@"
 
 if [ $genwrapper -gt 0 -a -f "$out" ]; then
     wasm=`mktemp tmp.XXXXXX`

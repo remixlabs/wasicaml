@@ -1,6 +1,8 @@
 -include Makefile.config
 
 WASI_SDK = lib/wasi-sdk
+WASI_LIBC_BRANCH = main
+TOP := $(realpath .)
 
 .PHONY: default \
         setup setup-downloads setup-git setup-bin setup-js \
@@ -18,9 +20,20 @@ setup: setup-downloads setup-git setup-bin setup-js
 
 setup-downloads:
 	./install_wasi-sdk
+	if [ -n "$(WASI_LIBC_BRANCH)" ]; then $(MAKE) build-wasi-libc; fi
 
 # ./install_wabt
 # ./install_wasmtime
+
+.PHONE: build-wasi-libc
+build-wasi-libc:
+	if [ ! -d wasi-libc ]; then git clone https://github.com/WebAssembly/wasi-libc.git; else cd wasi-libc; git fetch; fi
+	cd wasi-libc && git checkout $(WASI_LIBC_BRANCH)
+	cd wasi-libc && git merge --ff-only FETCH_HEAD
+	cd wasi-libc && $(MAKE) WASM_CC=$(TOP)/lib/wasi-sdk/bin/clang WASM_AR=$(TOP)/lib/wasi-sdk/bin/llvm-ar WASM_NM=$(TOP)/lib/wasi-sdk/bin/llvm-nm
+	rm -rf lib/wasi-sdk/share/wasi-sysroot.old
+	mv lib/wasi-sdk/share/wasi-sysroot lib/wasi-sdk/share/wasi-sysroot.old
+	cp -a wasi-libc/sysroot lib/wasi-sdk/share/wasi-sysroot
 
 setup-git:
 	git submodule update --init --progress
@@ -119,6 +132,7 @@ clean: clean-ocaml clean-wasicaml
 	rm -f lib/*.o
 	rm -rf js/node_modules
 	rm -f js/package-lock.json
+	if [ -d wasi-libc ]; then cd wasi-libc; $(MAKE) clean; fi
 
 clean-ocaml:
 	cd ocaml && make clean
