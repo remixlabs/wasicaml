@@ -16,7 +16,7 @@ TOP := $(realpath .)
 
 default: setup configure build install build2 install2
 
-setup: setup-downloads setup-git setup-bin setup-js
+setup: setup-git setup-downloads setup-bin setup-js
 
 setup-downloads:
 	./install_wasi-sdk
