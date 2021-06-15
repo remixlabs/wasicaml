@@ -1,7 +1,8 @@
 -include Makefile.config
 
 WASI_SDK = lib/wasi-sdk
-WASI_LIBC_BRANCH = main
+WASI_LIBC_REPO = https://github.com/gerdstolpmann/wasi-libc.git
+WASI_LIBC_BRANCH = gerd/chdir-fixes
 TOP := $(realpath .)
 
 .PHONY: default \
@@ -28,7 +29,7 @@ setup-downloads:
 .PHONE: build-wasi-libc
 build-wasi-libc:
 	if [ ! -d wasi-libc ]; then \
-	    git clone https://github.com/WebAssembly/wasi-libc.git && \
+	    git clone $(WASI_LIBC_REPO) && \
 	    cd wasi-libc && \
 	    git checkout $(WASI_LIBC_BRANCH); \
 	else \
