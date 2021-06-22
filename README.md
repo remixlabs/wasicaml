@@ -438,3 +438,10 @@ for further processing. We had to go another route. LLVM features an
 integrated assembler, and it turned out it also understands a form
 of textual WebAssembly. The S-expression is converted to this format,
 resulting into an `.s` file.
+
+--------------
+
+# Interested in developing compilers for WebAssembly?
+
+[June, 2021] - So far you live in Germany, there is a position:
+https://www.mixtional.de/recruiting/2021-01/index.html
