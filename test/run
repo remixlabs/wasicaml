@@ -1,6 +1,10 @@
 #! /bin/sh
 
-prefix=~/.wasicaml
+if [ -n "$PREFIX" ]; then
+    prefix="$PREFIX"
+else
+    prefix=~/.wasicaml
+fi
 args=""
 with_ocamlopt=0
 

@@ -17,7 +17,7 @@ TOP := $(realpath .)
 	install install-downloads install-bin install-ocaml install-lib \
 	install2 install-wasicaml \
 	clean clean-ocaml clean-wasicaml \
-	test test-wasicaml
+	test test-internals test-wasicaml
 
 default: setup configure build install build2 install2
 
@@ -156,7 +156,10 @@ clean-wasicaml:
 wasi_preamble: wasi_preamble.c
 	cc -DPREFIX='"$(prefix)"' -o wasi_preamble wasi_preamble.c
 
-test: test-wasicaml
+test: test-internals test-wasicaml
+
+test-internals:
+	cd test-internals && make
 
 test-wasicaml:
 	cd test && make

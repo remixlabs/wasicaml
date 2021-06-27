@@ -1,0 +1,46 @@
+#! /bin/sh
+
+if [ -n "$PREFIX" ]; then
+    prefix="$PREFIX"
+else
+    prefix=~/.wasicaml
+fi
+args=""
+
+ocamlc="$prefix"/bin/ocamlc
+
+if [ "x$OCAMLC" != "x" ]; then
+    ocamlc="$OCAMLC"
+fi
+
+run_test() {
+    rm -f t_byte t_byte.* t_wasm t_wasm.*
+    printf "Test %s: " "$t"
+    "$ocamlc" -g -I ../src/wasicaml -I +compiler-libs ocamlcommon.cma ocamlbytecomp.cma wc.cma -o t_byte "$t" || return
+    chmod u+x t_byte
+    printf "build OK\n"
+   ./t_byte >t_byte.out || { echo "t_byte: bad exit code"; return 1; }
+    printf "Test %s: results OK\n" "$t"
+}
+
+bad=0
+if [ $# -eq 0 ]; then
+    for t in $(ls *.ml); do
+        run_test "$t" || bad=1
+    done
+else
+    for t in "$@"; do
+        case "$t" in
+            -*)
+                echo "Unkown option: $t" >&2
+                exit 2
+                ;;
+        esac
+        run_test "$t" || bad=1
+    done
+fi
+
+if [ $bad -gt 0 ]; then
+    echo "ERRORS EXIST\n" >&2
+    exit 1
+fi

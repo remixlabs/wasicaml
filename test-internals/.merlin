@@ -1,0 +1,3 @@
+PKG compiler-libs.common compiler-libs.bytecomp
+B ../src/wasicaml
+S ../src/wasicaml

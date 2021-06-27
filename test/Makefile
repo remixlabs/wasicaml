@@ -1,6 +1,8 @@
-.PHONY: test test_opt
+-include ../Makefile.config
 
-prefix=~/.wasicaml
+export PREFIX=$(prefix)
+
+.PHONY: test test_opt
 
 test: testruntime
 	./run
