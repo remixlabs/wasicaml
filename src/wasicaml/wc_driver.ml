@@ -121,7 +121,9 @@ let main() =
   );
   validate s;
 
-  let _ = Wc_traceglobals.trace_globals s in
+  if not !quiet then
+    eprintf "* tracing globals...\n%!";
+  let globals_table = Wc_traceglobals.trace_globals s in
 
   let tab = size_table s get_defname |> List.rev in
   let have_large_functions =
@@ -140,7 +142,7 @@ let main() =
 
   if not !quiet then
     eprintf "* translating to WASM...\n%!";
-  let sexpl = generate s exec get_defname in
+  let sexpl = generate s exec get_defname globals_table in
 
   if not !quiet then
     eprintf "* print as .wat...\n%!";

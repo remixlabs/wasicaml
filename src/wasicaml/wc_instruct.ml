@@ -44,6 +44,11 @@ type store =
      *)
   | Atom of int
     (* an atom with this tag *)
+  | TracedGlobal of int * int list * Wc_traceglobals.initvalue
+    (* TracedGlobal(glb, path, value): the global with index [glb], and here
+       the value in the subblock as denoted by [path]. This position is
+       known to contain [value].
+     *)
   | Invalid
     (* an uninitialized value *)
 
@@ -71,6 +76,14 @@ type store =
    after a comparison. Converting RBool to RValue is a bit cheaper
    (can use "select" instruction)
  *)
+
+let extract_directly_callable_function st =
+  match st with
+    | TracedGlobal(glb, path, Function label) ->
+        eprintf "EXTRACT: global=%d path=%s\n%!" glb (List.map string_of_int path |> String.concat ",");
+        Some (glb, path, label)
+    | _ ->
+        None
 
 type global = Global of int
 type label = Label of int | Loop of int
@@ -151,7 +164,9 @@ type winstruction =
   | Wbranch of { label:label }
   | Wif of { src:store; neg:bool; body:winstruction list }
   | Wswitch of { labels_int:label array; labels_blk:label array; src:store }
-  | Wapply of { numargs:int; depth:int; src:store }
+  | Wapply of { numargs:int; depth:int }  (* src=accu *)
+  | Wapply_direct of { funlabel:int; global:int; path:int list;
+                       numargs:int; depth:int }
   | Wappterm of { numargs:int; oldnumargs:int; depth:int } (* src=accu *)
     (* CHECK: maybe also pass args individually to appterm *)
   | Wreturn of { src:store; arity:int }
@@ -180,6 +195,7 @@ let repr_of_store =
   | Local(repr, _) -> repr
   | RealAccu _ -> RValue
   | Atom _ -> RValue
+  | TracedGlobal _ -> RValue
   | Invalid -> assert false
 
 let empty_descr =
@@ -195,6 +211,11 @@ let string_of_store =
   | Const k -> sprintf "%d" k
   | Local(repr, name) -> name
   | Atom k -> sprintf "atom%d" k
+  | TracedGlobal(glb,path,_) ->
+      let s_path =
+        if path = [] then "" else
+          List.map (fun d -> sprintf "[%d]" d) path |> String.concat "" in
+      sprintf "global%d%s" glb s_path
   | Invalid -> "invalid"
 
 let string_label =
@@ -280,8 +301,11 @@ let rec string_of_winstruction =
         |> String.concat "," in
       sprintf "Wswitch(%s;%s on %s)" s1 s2 (string_of_store arg.src)
   | Wapply arg ->
-      sprintf "Wapply(f=%s, args=[fp[%d]...fp[%d]])"
-              (string_of_store arg.src)
+      sprintf "Wapply(f=accu, args=[fp[%d]...fp[%d]])"
+              (-arg.depth) (-arg.depth+arg.numargs-1)
+  | Wapply_direct arg ->
+      sprintf "Wapply_direct(f=letrec%d, args=[fp[%d]...fp[%d]])"
+              arg.funlabel
               (-arg.depth) (-arg.depth+arg.numargs-1)
   | Wappterm arg ->
       sprintf "Wappterm(f=accu, args=[fp[%d]...fp[%d]], oldnum=%d)"

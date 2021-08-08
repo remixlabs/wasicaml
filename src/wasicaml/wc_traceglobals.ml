@@ -133,14 +133,19 @@ let trace_globals_of_fblock globals_table fblock =
             length = shape.length - (size-1);
             accu = block
           }
-      | Kclosure(lab, 0) ->
-          { shape with accu = Function lab }
-      | Kclosurerec(labs, 0) when labs <> [] ->
+      | Kclosure(lab, num) ->
+          let n = max (num-1) 0 in
+          { accu = Function lab;
+            stack = delete n shape.stack;
+            length = shape.length - n
+          }
+      | Kclosurerec(labs, num) when labs <> [] ->
+          let n = max (num-1) 0 in
           let funcs =
             List.rev labs
             |> List.map (fun lab -> Function lab) in
-          { stack = funcs @ shape.stack;
-            length = shape.length + List.length funcs;
+          { stack = funcs @ delete n shape.stack;
+            length = shape.length + - n + List.length funcs;
             accu = Function (List.hd labs)
           }
       | Ksetglobal ident ->
