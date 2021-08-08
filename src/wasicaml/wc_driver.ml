@@ -121,6 +121,8 @@ let main() =
   );
   validate s;
 
+  let _ = Wc_traceglobals.trace_globals s in
+
   let tab = size_table s get_defname |> List.rev in
   let have_large_functions =
     List.exists (fun (_, size) -> size >= size_limit_for_warning) tab in
