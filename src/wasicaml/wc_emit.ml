@@ -59,6 +59,8 @@ type gpad =  (* global pad *)
     mutable need_mlookup : bool;
     mutable globals_table : (int, Wc_traceglobals.initvalue) Hashtbl.t;
     (* knowledge about the globals *)
+    mutable glbfun_table : (int,  Wc_traceglobals.initvalue array) Hashtbl.t;
+    (* for each letrec function: knowledge about its environment *)
   }
 
 type fpad =  (* function pad *)
@@ -238,9 +240,12 @@ let load_offset offset =
     ]
 
 let add_offset offset =
-  [ L [ K "i32.const"; N (I32 (Int32.of_int offset)) ];
-    L [ K "i32.add" ]
-  ]
+  if offset <> 0 then
+    [ L [ K "i32.const"; N (I32 (Int32.of_int offset)) ];
+      L [ K "i32.add" ]
+    ]
+  else
+    []
 
 let push_env =
   [ L [ K "local.get"; ID "envptr" ];
@@ -1414,16 +1419,15 @@ let push_global offset =
       ]
   ]
 
-let push_tracedglobal offset path =
-  push_global offset
-  @ List.map
-      (fun field ->
-        L [ K "i32.load";
-            K (sprintf "offset=0x%lx" (Int32.of_int (4 * field)));
-            K "align=2";
-          ]
-      )
-      path
+let follow_path path =
+  List.map
+    (fun field ->
+      L [ K "i32.load";
+          K (sprintf "offset=0x%lx" (Int32.of_int (4 * field)));
+          K "align=2";
+        ]
+    )
+    path
 
 let push fpad store =
   (* put the value in store onto the wasm stack *)
@@ -1438,8 +1442,13 @@ let push fpad store =
         push_stack fpad pos
     | Atom tag ->
         alloc_atom fpad tag
-    | TracedGlobal(glb_offset, path, _) ->
-        push_tracedglobal glb_offset path
+    | TracedGlobal(Glb glb_offset, path, _) ->
+        push_global glb_offset
+        @ follow_path path
+    | TracedGlobal(Env env_offset, path, _) ->
+        push_env
+        @ add_offset (4 * env_offset)
+        @ follow_path path
     | Invalid ->
         assert false
 
@@ -2504,11 +2513,7 @@ let rec emit_instr gpad fpad instr =
         @ pop_to_local "accu"
     | Wcopyenv arg ->
         push_env
-        @ ( if arg.offset <> 0 then
-              add_offset (4 * arg.offset)
-            else
-              []
-          )
+        @ add_offset (4 * arg.offset)
         @ pop_to_local "accu"
     | Wgetglobal arg ->
         let Global offset = arg.src in
@@ -2594,7 +2599,8 @@ let rec emit_instr gpad fpad instr =
            access the environment. Note that, however, functions not
            accessing the environment at all seem to be relatively rare.
          *)
-        let src = TracedGlobal(arg.global, arg.path, Function arg.funlabel) in
+        let fn = Wc_traceglobals.Function { label=arg.funlabel; env_offset=0; env=[| |] } in
+        let src = TracedGlobal(arg.global, arg.path, fn) in
         copy fpad src Wc_unstack.real_accu None
         @ apply_direct gpad fpad arg.funlabel arg.numargs arg.depth
     | Wappterm arg ->
@@ -2769,6 +2775,14 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
   Hashtbl.add fpad.lpad.locals "bp" RValue;
   fpad.lpad.avoid_locals <- export_flag; (* avoid local vars in the long main function *)
   fpad.lpad.globals_table <- gpad.globals_table;
+  let environment =
+    match letrec_label with
+      | Func label ->
+          ( try Hashtbl.find gpad.glbfun_table label
+            with Not_found -> [| |]
+          )
+      | Main _ -> [| |] in
+  fpad.lpad.environment <- environment;
 
   let subfunc_pairs =
     List.map
@@ -2981,6 +2995,20 @@ let bigarray_to_string_list limit ba =
   done;
   List.rev !l
 
+let derive_glbfun_table globals_table =
+  let glbfun_table = Hashtbl.create 7 in
+  let rec recurse initvalue =
+    match initvalue with
+      | Wc_traceglobals.Unknown -> ()
+      | Block b -> Array.iter recurse b
+      | Function { label; env } ->
+          Hashtbl.replace glbfun_table label env in
+  Hashtbl.iter
+    (fun glb initvalue ->
+      recurse initvalue
+    )
+    globals_table;
+  glbfun_table
 
 let generate scode exe get_defname globals_table =
   let (funcmapping, subfunctions) = get_funcmapping scode in
@@ -3031,6 +3059,7 @@ let generate scode exe get_defname globals_table =
       need_reinit_frame_k = ISet.empty;
       need_mlookup = false;
       globals_table;
+      glbfun_table = derive_glbfun_table globals_table;
     } in
 
   let sexpl_code =

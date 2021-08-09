@@ -27,6 +27,10 @@ type repr =
   | RFloat
     (* an F64 number that will be stored as float block *)
 
+type global_lookup =
+  | Glb of int   (* the global is only accessble via this global *)
+  | Env of int   (* the global is also in the local environment here *)
+
 type store =
   | RealStack of int
     (* it's on the real OCaml stack at the given position, i.e. at fp[pos] *)
@@ -44,9 +48,9 @@ type store =
      *)
   | Atom of int
     (* an atom with this tag *)
-  | TracedGlobal of int * int list * Wc_traceglobals.initvalue
-    (* TracedGlobal(glb, path, value): the global with index [glb], and here
-       the value in the subblock as denoted by [path]. This position is
+  | TracedGlobal of global_lookup * int list * Wc_traceglobals.initvalue
+    (* TracedGlobal(glb, path, value, env_opt): the global with index [glb],
+       and here the value in the subblock as denoted by [path]. This position is
        known to contain [value].
      *)
   | Invalid
@@ -76,14 +80,6 @@ type store =
    after a comparison. Converting RBool to RValue is a bit cheaper
    (can use "select" instruction)
  *)
-
-let extract_directly_callable_function st =
-  match st with
-    | TracedGlobal(glb, path, Function label) ->
-        eprintf "EXTRACT: global=%d path=%s\n%!" glb (List.map string_of_int path |> String.concat ",");
-        Some (glb, path, label)
-    | _ ->
-        None
 
 type global = Global of int
 type label = Label of int | Loop of int
@@ -157,7 +153,7 @@ type winstruction =
                          descr:stack_descriptor  } (* dest is always RealAccu *)
   | Wccall of { name:string; src:store list;
                 descr:stack_descriptor }
-    (* up to 5 arga; dest is always RealAccu *)
+    (* up to 5 args; dest is always RealAccu *)
   | Wccall_vector of { name:string; numargs:int; depth:int;
                        descr:stack_descriptor }
     (* more than 5 args; dest is always RealAccu *)
@@ -165,7 +161,7 @@ type winstruction =
   | Wif of { src:store; neg:bool; body:winstruction list }
   | Wswitch of { labels_int:label array; labels_blk:label array; src:store }
   | Wapply of { numargs:int; depth:int }  (* src=accu *)
-  | Wapply_direct of { funlabel:int; global:int; path:int list;
+  | Wapply_direct of { funlabel:int; global:global_lookup; path:int list;
                        numargs:int; depth:int }
   | Wappterm of { numargs:int; oldnumargs:int; depth:int } (* src=accu *)
     (* CHECK: maybe also pass args individually to appterm *)
@@ -212,10 +208,14 @@ let string_of_store =
   | Local(repr, name) -> name
   | Atom k -> sprintf "atom%d" k
   | TracedGlobal(glb,path,_) ->
+      let s_glb =
+        match glb with
+          | Glb i -> sprintf "global%d" i
+          | Env i -> sprintf "env+%d" i in
       let s_path =
         if path = [] then "" else
           List.map (fun d -> sprintf "[%d]" d) path |> String.concat "" in
-      sprintf "global%d%s" glb s_path
+      sprintf "%s%s" s_glb s_path
   | Invalid -> "invalid"
 
 let string_label =
@@ -224,7 +224,13 @@ let string_label =
   | Loop k -> sprintf "loop%d" k
 
 
-
+let extract_directly_callable_function st =
+  match st with
+    | TracedGlobal(glb, path, Function {label; env}) ->
+        eprintf "EXTRACT: %s\n%!" (string_of_store st);
+        Some (glb, path, label, env)
+    | _ ->
+        None
 
 let rec string_of_winstruction =
   function

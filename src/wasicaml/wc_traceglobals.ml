@@ -13,7 +13,7 @@ open Wc_util
 
 type initvalue =
   | Unknown
-  | Function of int (* label *)
+  | Function of { label:int; env_offset:int; env:initvalue array }
   | Block of initvalue array
 
 type shape =
@@ -32,8 +32,13 @@ let print_initvalue prefix initvalue =
   let rec recurse prefix initvalue =
     match initvalue with
       | Unknown -> ()
-      | Function lab ->
-          printf "%s = label %d\n" prefix lab
+      | Function fn ->
+          printf "%s = letrec_%d\n" prefix fn.label;
+          Array.iteri
+            (fun i iv ->
+              recurse (sprintf "%s.env[%d]" prefix i) iv
+            )
+            fn.env
       | Block b ->
           Array.iteri
             (fun i iv ->
@@ -44,19 +49,23 @@ let print_initvalue prefix initvalue =
 
 let rec merge_initvalues v1 v2 =
   match v1, v2 with
-    | Function n1, Function n2 when n1 = n2 ->
-        Function n1
+    | Function fn1, Function fn2
+          when fn1.label = fn2.label &&
+                 Array.length fn1.env = Array.length fn2.env ->
+        let env = merge_initvalue_arrays fn1.env fn2.env in
+        Function { fn1 with env }
     | Block b1, Block b2 when Array.length b1 = Array.length b2 ->
-        Block
-          (Array.mapi
-             (fun i bv1 ->
-               let bv2 = b2.(i) in
-               merge_initvalues bv1 bv2
-             )
-             b1
-          )
+        Block (merge_initvalue_arrays b1 b2)
     | _ ->
         Unknown
+
+and merge_initvalue_arrays a1 a2 =
+  Array.mapi
+    (fun i bv1 ->
+      let bv2 = a2.(i) in
+      merge_initvalues bv1 bv2
+    )
+    a1
 
 let merge_stacks s1 s2 =
   assert(s1.length = s2.length);
@@ -133,20 +142,36 @@ let trace_globals_of_fblock globals_table fblock =
             length = shape.length - (size-1);
             accu = block
           }
-      | Kclosure(lab, num) ->
+      | Kclosure(label, num) ->
+          let env_fields =
+            if num=0 then [] else
+              shape.accu :: list_prefix (num-1) shape.stack in
+          let env =
+            Array.of_list (Unknown :: Unknown :: env_fields) in
           let n = max (num-1) 0 in
-          { accu = Function lab;
+          { accu = Function { label; env_offset=0; env };
             stack = delete n shape.stack;
             length = shape.length - n
           }
       | Kclosurerec(labs, num) when labs <> [] ->
+          let num_labs = List.length labs in
+          let env_fields =
+            if num=0 then [] else
+              shape.accu :: list_prefix (num-1) shape.stack in
+          let env_fields_a = Array.of_list env_fields in
+          let unknowns = Array.make (2 + 3 * (num_labs-1)) Unknown in
+          let env = Array.append unknowns env_fields_a in
           let n = max (num-1) 0 in
           let funcs =
             List.rev labs
-            |> List.map (fun lab -> Function lab) in
+            |> List.mapi
+                 (fun i label ->
+                   let env_offset = 3 * (num_labs-i-1) in
+                   Function {label; env_offset; env}
+                 ) in
           { stack = funcs @ delete n shape.stack;
             length = shape.length + - n + List.length funcs;
-            accu = Function (List.hd labs)
+            accu = Unknown
           }
       | Ksetglobal ident ->
           let offset = global_offset ident in

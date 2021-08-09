@@ -66,6 +66,12 @@ type lpad =  (* local pad *)
 
     mutable globals_table : (int, Wc_traceglobals.initvalue) Hashtbl.t;
     (* knowledge about the globals *)
+
+    mutable environment : Wc_traceglobals.initvalue array;
+    (* knowledge about the environment *)
+
+    mutable env_offset : int;
+    (* knowledge about the environment *)
   }
 
 let real_accu =
@@ -89,6 +95,8 @@ let empty_lpad() =
     indegree = Hashtbl.create 7;
     state_table = Hashtbl.create 7;
     globals_table = Hashtbl.create 1;
+    environment = [| |];
+    env_offset = 0;
   }
 
 let new_local lpad repr =
@@ -643,17 +651,28 @@ let transl_instr lpad state instr =
         (state, instrs_flush @ instrs_copy)
     | Kenvacc field ->
         let state, instrs_flush = flush_accu lpad state in
-        let accu = real_accu in
-        let state = { state with accu } in
-        let instrs_op = [ Wenv { field } ] in
-        (state, instrs_flush @ instrs_op)
+        let real_field = lpad.env_offset + field in
+        if real_field < Array.length lpad.environment &&
+             lpad.environment.(real_field) <> Unknown then (
+          let efield = lpad.environment.(real_field) in
+          let state = { state with
+                        accu = TracedGlobal(Env 0,
+                                            [field],
+                                            efield)
+                      } in
+          (state, instrs_flush)
+        ) else
+            let accu = real_accu in
+            let state = { state with accu } in
+            let instrs_op = [ Wenv { field } ] in
+            (state, instrs_flush @ instrs_op)
     | Kgetglobal ident ->
         let offset = global_offset ident in
         assert(offset >= 0);
         let state, instrs_flush = flush_accu lpad state in
         ( match Hashtbl.find lpad.globals_table offset with
             | initvalue ->
-                let accu = TracedGlobal(offset, [], initvalue) in
+                let accu = TracedGlobal(Glb offset, [], initvalue) in
                 let state = { state with accu } in
                 (state, instrs_flush)
             | exception Not_found ->
@@ -691,8 +710,9 @@ let transl_instr lpad state instr =
                         b.(field)
                     | _ ->
                         Unknown in
+                let accu = TracedGlobal(glb, new_path, new_initvalue) in
                 let state = { state with
-                              accu = TracedGlobal(glb, new_path, new_initvalue)
+                              accu;
                             } in
                 (state, [])
             | _ ->
@@ -859,7 +879,7 @@ let transl_instr lpad state instr =
         let depth = cd-3 in
         let instr_apply =
           match direct_opt with
-            | Some (global, path, funlabel) ->
+            | Some (global, path, funlabel, _) ->
                 Wapply_direct { global; path; funlabel; numargs=num; depth }
             | None ->
                 Wapply { numargs=num; depth } in
@@ -883,7 +903,7 @@ let transl_instr lpad state instr =
         let depth = state.camldepth in
         let instr_apply =
           match direct_opt with
-            | Some (global, path, funlabel) ->
+            | Some (global, path, funlabel, _) ->
                 Wapply_direct { global; path; funlabel; numargs=num; depth }
             | None ->
                 Wapply { numargs=num; depth } in
