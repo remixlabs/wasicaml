@@ -226,8 +226,13 @@ let string_label =
 
 let extract_directly_callable_function st =
   match st with
-    | TracedGlobal(glb, path, Function {label; env}) ->
-        eprintf "EXTRACT: %s\n%!" (string_of_store st);
+    | TracedGlobal(glb, path, FuncInEnv {func_offset; env}) ->
+        (* eprintf "EXTRACT: %s\n%!" (string_of_store st); *)
+        let func = env.(func_offset) in
+        let label =
+          match func with
+            | Function { label } -> label
+            | _ -> assert false in
         Some (glb, path, label, env)
     | _ ->
         None

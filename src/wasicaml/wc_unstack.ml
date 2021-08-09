@@ -68,10 +68,14 @@ type lpad =  (* local pad *)
     (* knowledge about the globals *)
 
     mutable environment : Wc_traceglobals.initvalue array;
-    (* knowledge about the environment *)
+    (* knowledge about the environment of this function - can be the empty
+       array if nothing is known
+     *)
 
-    mutable env_offset : int;
-    (* knowledge about the environment *)
+    mutable func_offset : int;
+    (* knowledge about the environment: this function is at position
+       func_offset in the environment (only when environment <> [])
+     *)
   }
 
 let real_accu =
@@ -96,7 +100,7 @@ let empty_lpad() =
     state_table = Hashtbl.create 7;
     globals_table = Hashtbl.create 1;
     environment = [| |];
-    env_offset = 0;
+    func_offset = 0;
   }
 
 let new_local lpad repr =
@@ -651,7 +655,7 @@ let transl_instr lpad state instr =
         (state, instrs_flush @ instrs_copy)
     | Kenvacc field ->
         let state, instrs_flush = flush_accu lpad state in
-        let real_field = lpad.env_offset + field in
+        let real_field = lpad.func_offset + field in
         if real_field < Array.length lpad.environment &&
              lpad.environment.(real_field) <> Unknown then (
           let efield = lpad.environment.(real_field) in
@@ -976,12 +980,27 @@ let transl_instr lpad state instr =
         (state, instrs)
     | Koffsetclosure offset ->
         let state, instrs_flush = flush_accu lpad state in
-        let accu = real_accu in
-        let state = { state with accu } in
-        let instrs =
-          instrs_flush
-          @ [ Wcopyenv { offset } ] in
-        (state, instrs)
+        let real_field = lpad.func_offset + offset in
+        let n = Array.length lpad.environment in
+        if n > 0 && real_field < Array.length lpad.environment &&
+             (let _ = assert(real_field >= 0) in true) &&
+             Wc_traceglobals.is_function lpad.environment.(real_field) then (
+          let efield = Wc_traceglobals.FuncInEnv { func_offset=real_field;
+                                                   env=lpad.environment
+                                                 } in
+          let state = { state with
+                        accu = TracedGlobal(Env offset,
+                                            [],
+                                            efield)
+                      } in
+          (state, instrs_flush)
+        ) else
+          let accu = real_accu in
+          let state = { state with accu } in
+          let instrs =
+            instrs_flush
+            @ [ Wcopyenv { offset } ] in
+          (state, instrs)
     | Krestart ->
         (state, [])
     | Kpushtrap _ | Kpoptrap ->

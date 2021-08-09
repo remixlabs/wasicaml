@@ -59,7 +59,7 @@ type gpad =  (* global pad *)
     mutable need_mlookup : bool;
     mutable globals_table : (int, Wc_traceglobals.initvalue) Hashtbl.t;
     (* knowledge about the globals *)
-    mutable glbfun_table : (int,  Wc_traceglobals.initvalue array) Hashtbl.t;
+    mutable glbfun_table : (int,  int * Wc_traceglobals.initvalue array) Hashtbl.t;
     (* for each letrec function: knowledge about its environment *)
   }
 
@@ -2601,7 +2601,7 @@ let rec emit_instr gpad fpad instr =
            access the environment. Note that, however, functions not
            accessing the environment at all seem to be relatively rare.
          *)
-        let fn = Wc_traceglobals.Function { label=arg.funlabel; env_offset=0; env=[| |] } in
+        let fn = Wc_traceglobals.Unknown in (* this arg is ignored by [copy] *)
         let src = TracedGlobal(arg.global, arg.path, fn) in
         copy fpad src Wc_unstack.real_accu None
         @ apply_direct gpad fpad arg.funlabel arg.numargs arg.depth
@@ -2775,20 +2775,20 @@ let eff_label =
   | Func l -> l
   | Main l -> l
 
+let init_lpad_for_subfunc gpad fpad func_label =
+  let func_offset, environment =
+    ( try Hashtbl.find gpad.glbfun_table func_label
+      with Not_found -> 0, [| |]
+    ) in
+  fpad.lpad.environment <- environment;
+  fpad.lpad.func_offset <- func_offset
+
 let generate_function scode gpad letrec_label func_name subfunc_labels export_flag =
   let fpad = { (empty_fpad()) with fpad_letrec_label = letrec_label } in
   Hashtbl.add fpad.lpad.locals "accu" RValue;
   Hashtbl.add fpad.lpad.locals "bp" RValue;
   fpad.lpad.avoid_locals <- export_flag; (* avoid local vars in the long main function *)
   fpad.lpad.globals_table <- gpad.globals_table;
-  let environment =
-    match letrec_label with
-      | Func label ->
-          ( try Hashtbl.find gpad.glbfun_table label
-            with Not_found -> [| |]
-          )
-      | Main _ -> [| |] in
-  fpad.lpad.environment <- environment;
 
   let subfunc_pairs =
     List.map
@@ -2796,6 +2796,7 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
         let fblock = IMap.find func_label Wc_control.(scode.functions) in
         fpad.fpad_scope <- fblock.scope;
         let label = sprintf "func%d" func_label in
+        init_lpad_for_subfunc gpad fpad func_label;
         let sexpl = emit_fblock gpad fpad fblock in
         (label, sexpl)
       )
@@ -3001,21 +3002,6 @@ let bigarray_to_string_list limit ba =
   done;
   List.rev !l
 
-let derive_glbfun_table globals_table =
-  let glbfun_table = Hashtbl.create 7 in
-  let rec recurse initvalue =
-    match initvalue with
-      | Wc_traceglobals.Unknown -> ()
-      | Block b -> Array.iter recurse b
-      | Function { label; env } ->
-          Hashtbl.replace glbfun_table label env in
-  Hashtbl.iter
-    (fun glb initvalue ->
-      recurse initvalue
-    )
-    globals_table;
-  glbfun_table
-
 let generate scode exe get_defname globals_table =
   let (funcmapping, subfunctions) = get_funcmapping scode in
 
@@ -3065,7 +3051,7 @@ let generate scode exe get_defname globals_table =
       need_reinit_frame_k = ISet.empty;
       need_mlookup = false;
       globals_table;
-      glbfun_table = derive_glbfun_table globals_table;
+      glbfun_table = Wc_traceglobals.derive_glbfun_table globals_table;
     } in
 
   let sexpl_code =

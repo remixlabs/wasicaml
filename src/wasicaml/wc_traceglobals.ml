@@ -13,8 +13,20 @@ open Wc_util
 
 type initvalue =
   | Unknown
-  | Function of { label:int; env_offset:int; env:initvalue array }
+  | Function of { label:int }
+  | FuncInEnv of { func_offset:int; env:initvalue array }
   | Block of initvalue array
+
+(* Function is a pointer to the letrec [label].
+   FuncInEnv is a function inside an environment. env[func_offset] must
+     be a Function.
+   Block is a block of values
+ *)
+
+let is_function =
+  function
+  | Function _ -> true
+  | _ -> false
 
 type shape =
   { stack : initvalue list;
@@ -33,12 +45,13 @@ let print_initvalue prefix initvalue =
     match initvalue with
       | Unknown -> ()
       | Function fn ->
-          printf "%s = letrec_%d\n" prefix fn.label;
+          printf "%s = letrec_%d\n" prefix fn.label
+      | FuncInEnv fenv ->
           Array.iteri
             (fun i iv ->
-              recurse (sprintf "%s.env[%d]" prefix i) iv
+              recurse (sprintf "%s.env[%d](%d)" prefix i fenv.func_offset) iv
             )
-            fn.env
+            fenv.env
       | Block b ->
           Array.iteri
             (fun i iv ->
@@ -50,10 +63,13 @@ let print_initvalue prefix initvalue =
 let rec merge_initvalues v1 v2 =
   match v1, v2 with
     | Function fn1, Function fn2
-          when fn1.label = fn2.label &&
-                 Array.length fn1.env = Array.length fn2.env ->
-        let env = merge_initvalue_arrays fn1.env fn2.env in
-        Function { fn1 with env }
+          when fn1.label = fn2.label ->
+        v1
+    | FuncInEnv fenv1, FuncInEnv fenv2
+          when fenv1.func_offset = fenv2.func_offset &&
+                 Array.length fenv1.env = Array.length fenv2.env ->
+        let env = merge_initvalue_arrays fenv1.env fenv2.env in
+        FuncInEnv { fenv1 with env }
     | Block b1, Block b2 when Array.length b1 = Array.length b2 ->
         Block (merge_initvalue_arrays b1 b2)
     | _ ->
@@ -147,9 +163,9 @@ let trace_globals_of_fblock globals_table fblock =
             if num=0 then [] else
               shape.accu :: list_prefix (num-1) shape.stack in
           let env =
-            Array.of_list (Unknown :: Unknown :: env_fields) in
+            Array.of_list (Function { label } :: Unknown :: env_fields) in
           let n = max (num-1) 0 in
-          { accu = Function { label; env_offset=0; env };
+          { accu = FuncInEnv { func_offset=0; env };
             stack = delete n shape.stack;
             length = shape.length - n
           }
@@ -166,8 +182,9 @@ let trace_globals_of_fblock globals_table fblock =
             List.rev labs
             |> List.mapi
                  (fun i label ->
-                   let env_offset = 3 * (num_labs-i-1) in
-                   Function {label; env_offset; env}
+                   let func_offset = 3 * (num_labs-i-1) in
+                   env.(func_offset) <- Function { label };
+                   FuncInEnv {func_offset; env}
                  ) in
           { stack = funcs @ delete n shape.stack;
             length = shape.length + - n + List.length funcs;
@@ -234,13 +251,36 @@ let trace_globals scode =
         trace_globals_of_fblock globals_table fblock
     )
     scode.functions;
-
+(*
   Hashtbl.iter
     (fun i iv ->
       print_initvalue (sprintf "global%d" i) iv
     )
     globals_table;
   flush stdout;
+ *)
 
   globals_table
 
+let derive_glbfun_table globals_table =
+  let glbfun_table = Hashtbl.create 7 in
+  let rec recurse initvalue =
+    match initvalue with
+      | Unknown -> ()
+      | Block b -> Array.iter recurse b
+      | FuncInEnv { env; _ } ->
+          Array.iteri
+            (fun func_offset env_val ->
+              match env_val with
+                | Function { label } ->
+                    Hashtbl.replace glbfun_table label (func_offset, env)
+                | _ -> ()
+            )
+            env
+      | Function _ -> assert false in
+  Hashtbl.iter
+    (fun glb initvalue ->
+      recurse initvalue
+    )
+    globals_table;
+  glbfun_table
