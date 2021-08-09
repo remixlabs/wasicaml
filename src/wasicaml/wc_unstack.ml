@@ -876,7 +876,7 @@ let transl_instr lpad state instr =
                (fun k ->
                  Wcopy { src=RealStack(-cd+k); dest=RealStack(-cd+k-3) }
                ) in
-        let depth = cd-3 in
+        let depth = cd+3 in
         let instr_apply =
           match direct_opt with
             | Some (global, path, funlabel, _) ->

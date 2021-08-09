@@ -2292,7 +2292,9 @@ let apply_direct gpad fpad funlabel numargs depth =
     ]
   @ push_field "accu" 0
   @ push_local "fp"
-  @ [ L [ K "call";
+  @ [L [ K "i32.const"; N (I32 (Int32.of_int (4 * depth))) ];
+     L [ K "i32.sub" ];
+     L [ K "call";
           ID letrec_name
         ];
       L [ K "local.tee"; ID "accu" ];
@@ -2768,6 +2770,10 @@ let cond_loop cond label sexpl =
   else
     sexpl
 
+let eff_label =
+  function
+  | Func l -> l
+  | Main l -> l
 
 let generate_function scode gpad letrec_label func_name subfunc_labels export_flag =
   let fpad = { (empty_fpad()) with fpad_letrec_label = letrec_label } in
@@ -2877,7 +2883,7 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
                locals
             )
             (*
-             @ debug2 0 letrec_label
+             @ debug2 0 (eff_label letrec_label)
              @ debug2_var 10 "fp"
              @ debug2_var 11 "envptr"
              @ debug2_var 12 "codeptr"
