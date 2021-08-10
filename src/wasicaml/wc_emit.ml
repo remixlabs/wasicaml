@@ -106,6 +106,8 @@ let code_pointer_shift = 12
       - Bit 1: whether to run RESTART
       - Bit 2 - code_pointer_shift-1: subfunction of the letrec
       - Bit code_pointer_shift-31: the Wasm function index
+
+     See also ocaml/runtime/callback.c
    *)
 let code_pointer_subfunc_mask = 0xffcl
 let code_pointer_letrec_mask = 0xffff_f000l

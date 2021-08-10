@@ -1,10 +1,12 @@
 #define CAML_INTERNALS
+#define CAML_USE_WASICAML
 #include "caml/mlvalues.h"
 #include "caml/instruct.h"
 #include "caml/prims.h"
 #include "caml/domain.h"
 #include "caml/startup.h"
 #include "caml/stacks.h"
+#include "caml/callback.h"
 
 extern uintnat caml_max_stack_size;    /* defined in stacks.c */
 extern uintnat caml_percent_max;       /* from gc_ctrl.c */
@@ -42,6 +44,7 @@ void debug2(int32_t x0, int32_t x1) {
 }
 
 void wasicaml_main(char **argv) {
+    caml_callback_wasi = 1;
     char *data = wasicaml_get_data();
     asize_t data_size = wasicaml_get_data_size();
     caml_startup_code(zerocode, zerocode_size, data, data_size, NULL, 0, false, argv);
