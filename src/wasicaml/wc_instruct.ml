@@ -27,6 +27,10 @@ type repr =
   | RFloat
     (* an F64 number that will be stored as float block *)
 
+type global_lookup =
+  | Glb of int   (* the global is only accessble via this global *)
+  | Env of int   (* the global is also in the local environment here *)
+
 type store =
   | RealStack of int
     (* it's on the real OCaml stack at the given position, i.e. at fp[pos] *)
@@ -44,6 +48,11 @@ type store =
      *)
   | Atom of int
     (* an atom with this tag *)
+  | TracedGlobal of global_lookup * int list * Wc_traceglobals.initvalue
+    (* TracedGlobal(glb, path, value, env_opt): the global with index [glb],
+       and here the value in the subblock as denoted by [path]. This position is
+       known to contain [value].
+     *)
   | Invalid
     (* an uninitialized value *)
 
@@ -144,14 +153,16 @@ type winstruction =
                          descr:stack_descriptor  } (* dest is always RealAccu *)
   | Wccall of { name:string; src:store list;
                 descr:stack_descriptor }
-    (* up to 5 arga; dest is always RealAccu *)
+    (* up to 5 args; dest is always RealAccu *)
   | Wccall_vector of { name:string; numargs:int; depth:int;
                        descr:stack_descriptor }
     (* more than 5 args; dest is always RealAccu *)
   | Wbranch of { label:label }
   | Wif of { src:store; neg:bool; body:winstruction list }
   | Wswitch of { labels_int:label array; labels_blk:label array; src:store }
-  | Wapply of { numargs:int; depth:int; src:store }
+  | Wapply of { numargs:int; depth:int }  (* src=accu *)
+  | Wapply_direct of { funlabel:int; global:global_lookup; path:int list;
+                       numargs:int; depth:int }
   | Wappterm of { numargs:int; oldnumargs:int; depth:int } (* src=accu *)
     (* CHECK: maybe also pass args individually to appterm *)
   | Wreturn of { src:store; arity:int }
@@ -180,6 +191,7 @@ let repr_of_store =
   | Local(repr, _) -> repr
   | RealAccu _ -> RValue
   | Atom _ -> RValue
+  | TracedGlobal _ -> RValue
   | Invalid -> assert false
 
 let empty_descr =
@@ -195,6 +207,15 @@ let string_of_store =
   | Const k -> sprintf "%d" k
   | Local(repr, name) -> name
   | Atom k -> sprintf "atom%d" k
+  | TracedGlobal(glb,path,_) ->
+      let s_glb =
+        match glb with
+          | Glb i -> sprintf "global%d" i
+          | Env i -> sprintf "env+%d" i in
+      let s_path =
+        if path = [] then "" else
+          List.map (fun d -> sprintf "[%d]" d) path |> String.concat "" in
+      sprintf "%s%s" s_glb s_path
   | Invalid -> "invalid"
 
 let string_label =
@@ -203,7 +224,18 @@ let string_label =
   | Loop k -> sprintf "loop%d" k
 
 
-
+let extract_directly_callable_function st =
+  match st with
+    | TracedGlobal(glb, path, FuncInEnv {func_offset; env}) ->
+        (* eprintf "EXTRACT: %s\n%!" (string_of_store st); *)
+        let func = env.(func_offset) in
+        let label =
+          match func with
+            | Function { label } -> label
+            | _ -> assert false in
+        Some (glb, path, label, env)
+    | _ ->
+        None
 
 let rec string_of_winstruction =
   function
@@ -280,8 +312,11 @@ let rec string_of_winstruction =
         |> String.concat "," in
       sprintf "Wswitch(%s;%s on %s)" s1 s2 (string_of_store arg.src)
   | Wapply arg ->
-      sprintf "Wapply(f=%s, args=[fp[%d]...fp[%d]])"
-              (string_of_store arg.src)
+      sprintf "Wapply(f=accu, args=[fp[%d]...fp[%d]])"
+              (-arg.depth) (-arg.depth+arg.numargs-1)
+  | Wapply_direct arg ->
+      sprintf "Wapply_direct(f=letrec%d, args=[fp[%d]...fp[%d]])"
+              arg.funlabel
               (-arg.depth) (-arg.depth+arg.numargs-1)
   | Wappterm arg ->
       sprintf "Wappterm(f=accu, args=[fp[%d]...fp[%d]], oldnum=%d)"

@@ -7,7 +7,9 @@ ML = wc_types.ml wc_util.ml \
      wc_number.ml \
      wc_sexp.ml \
      wc_prims.ml \
-     wc_tracestack.ml wc_instruct.ml wc_unstack.ml wc_emit.ml \
+     wc_tracestack.ml \
+     wc_traceglobals.ml \
+     wc_instruct.ml wc_unstack.ml wc_emit.ml \
      wc_sexp2s.ml
 LIBS = ocamlcommon.cma ocamlbytecomp.cma
 OCAMLC = $(prefix)/bin/ocamlc

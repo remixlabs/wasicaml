@@ -63,6 +63,19 @@ type lpad =  (* local pad *)
 
     state_table : (int, state) Hashtbl.t;
     (* the start state by label *)
+
+    mutable globals_table : (int, Wc_traceglobals.initvalue) Hashtbl.t;
+    (* knowledge about the globals *)
+
+    mutable environment : Wc_traceglobals.initvalue array;
+    (* knowledge about the environment of this function - can be the empty
+       array if nothing is known
+     *)
+
+    mutable func_offset : int;
+    (* knowledge about the environment: this function is at position
+       func_offset in the environment (only when environment <> [])
+     *)
   }
 
 let real_accu =
@@ -85,6 +98,9 @@ let empty_lpad() =
     loops = ISet.empty;
     indegree = Hashtbl.create 7;
     state_table = Hashtbl.create 7;
+    globals_table = Hashtbl.create 1;
+    environment = [| |];
+    func_offset = 0;
   }
 
 let new_local lpad repr =
@@ -153,7 +169,7 @@ let pop_camlstack state =
           camldepth = cd - 1;
           realaccu = ISet.remove cpos state.realaccu;
         }
-    | (Const _ | Local _ | Atom _ | Invalid) :: tl ->
+    | (Const _ | Local _ | Atom _ | TracedGlobal _ | Invalid) :: tl ->
         { state with camlstack = tl; camldepth = cd - 1 }
     | [] ->
         assert false
@@ -179,7 +195,7 @@ let push_camlstack store state =
           camldepth = cd + 1;
           realaccu = ISet.add cpos state.realaccu;
         }
-    | (Const _ | Local _ | Atom _) ->
+    | (Const _ | Local _ | Atom _ | TracedGlobal _) ->
         { state with
           camlstack = store :: state.camlstack;
           camldepth = cd + 1;
@@ -246,7 +262,7 @@ let straighten_accu_when_on_stack lpad state =
 
 let straighten_accu_for_branch lpad state =
   match state.accu with
-    | RealStack _ | Const _ | Atom _ ->
+    | RealStack _ | Const _ | Atom _ | TracedGlobal _ ->
         straighten_accu lpad state
     | Local _ | RealAccu _ | Invalid ->
         (state, [])
@@ -639,18 +655,36 @@ let transl_instr lpad state instr =
         (state, instrs_flush @ instrs_copy)
     | Kenvacc field ->
         let state, instrs_flush = flush_accu lpad state in
-        let accu = real_accu in
-        let state = { state with accu } in
-        let instrs_op = [ Wenv { field } ] in
-        (state, instrs_flush @ instrs_op)
+        let real_field = lpad.func_offset + field in
+        if real_field < Array.length lpad.environment &&
+             lpad.environment.(real_field) <> Unknown then (
+          let efield = lpad.environment.(real_field) in
+          let state = { state with
+                        accu = TracedGlobal(Env 0,
+                                            [field],
+                                            efield)
+                      } in
+          (state, instrs_flush)
+        ) else
+            let accu = real_accu in
+            let state = { state with accu } in
+            let instrs_op = [ Wenv { field } ] in
+            (state, instrs_flush @ instrs_op)
     | Kgetglobal ident ->
         let offset = global_offset ident in
         assert(offset >= 0);
         let state, instrs_flush = flush_accu lpad state in
-        let accu = real_accu in
-        let state = { state with accu } in
-        let instrs_op = [ Wgetglobal { src=Global offset } ] in
-        (state, instrs_flush @ instrs_op)
+        ( match Hashtbl.find lpad.globals_table offset with
+            | initvalue ->
+                let accu = TracedGlobal(Glb offset, [], initvalue) in
+                let state = { state with accu } in
+                (state, instrs_flush)
+            | exception Not_found ->
+                let accu = real_accu in
+                let state = { state with accu } in
+                let instrs_op = [ Wgetglobal { src=Global offset } ] in
+                (state, instrs_flush @ instrs_op)
+        )
     | Knegint ->
         unary_operation lpad state RIntVal Pnegint
     | Kboolnot ->
@@ -671,7 +705,23 @@ let transl_instr lpad state instr =
         let offset = global_offset ident in
         unary_effect lpad state (Psetglobal (Global offset))
     | Kgetfield field ->
-        unary_operation lpad state RValue (Pgetfield field)
+        ( match state.accu with
+            | TracedGlobal(glb, path, initvalue) ->
+                let new_path = path @ [field] in
+                let new_initvalue =
+                  match initvalue with
+                    | Block b when field < Array.length b ->
+                        b.(field)
+                    | _ ->
+                        Unknown in
+                let accu = TracedGlobal(glb, new_path, new_initvalue) in
+                let state = { state with
+                              accu;
+                            } in
+                (state, [])
+            | _ ->
+                unary_operation lpad state RValue (Pgetfield field)
+        )
     | Kvectlength ->
         unary_operation lpad state RIntVal Pvectlength
     | Kgetpubmet k ->
@@ -817,6 +867,11 @@ let transl_instr lpad state instr =
     | Kapply num when num <= 3 ->
         (* TODO: the args don't need to be straightened - they are duplicated
            anyway *)
+        let direct_opt = extract_directly_callable_function state.accu in
+        let state =
+          match direct_opt with
+            | Some _ -> { state with accu = real_accu }
+            | None -> state in
         let state, instrs_str = straighten_all lpad state in
         let cd = state.camldepth in
         let instrs_move =
@@ -825,22 +880,40 @@ let transl_instr lpad state instr =
                (fun k ->
                  Wcopy { src=RealStack(-cd+k); dest=RealStack(-cd+k-3) }
                ) in
+        let depth = cd+3 in
+        let instr_apply =
+          match direct_opt with
+            | Some (global, path, funlabel, _) ->
+                Wapply_direct { global; path; funlabel; numargs=num; depth }
+            | None ->
+                Wapply { numargs=num; depth } in
         let instrs =
           instrs_str
           @ instrs_move
           @ [ Wcopy { src=Const 0; dest=RealStack(-cd+num-3) };
               Wcopy { src=Const 0; dest=RealStack(-cd+num-2) };
               Wcopy { src=Const 0; dest=RealStack(-cd+num-1) };
-              Wapply { numargs=num; depth=cd+3; src=real_accu }
+              instr_apply
             ] in
         let state = state |> popn_camlstack num in
         (state, instrs)
     | Kapply num ->
+        let direct_opt = extract_directly_callable_function state.accu in
+        let state =
+          match direct_opt with
+            | Some _ -> { state with accu = real_accu }
+            | None -> state in
         let state, instrs_str = straighten_all lpad state in
+        let depth = state.camldepth in
+        let instr_apply =
+          match direct_opt with
+            | Some (global, path, funlabel, _) ->
+                Wapply_direct { global; path; funlabel; numargs=num; depth }
+            | None ->
+                Wapply { numargs=num; depth } in
         let instrs =
           instrs_str
-          @ [ Wapply { numargs=num; depth=state.camldepth; src=real_accu }
-            ] in
+          @ [ instr_apply ] in
         let state = state |> popn_camlstack (num+3) in
         (state, instrs)
     | Kappterm(num, slots) ->
@@ -907,12 +980,27 @@ let transl_instr lpad state instr =
         (state, instrs)
     | Koffsetclosure offset ->
         let state, instrs_flush = flush_accu lpad state in
-        let accu = real_accu in
-        let state = { state with accu } in
-        let instrs =
-          instrs_flush
-          @ [ Wcopyenv { offset } ] in
-        (state, instrs)
+        let real_field = lpad.func_offset + offset in
+        let n = Array.length lpad.environment in
+        if n > 0 && real_field < Array.length lpad.environment &&
+             (let _ = assert(real_field >= 0) in true) &&
+             Wc_traceglobals.is_function lpad.environment.(real_field) then (
+          let efield = Wc_traceglobals.FuncInEnv { func_offset=real_field;
+                                                   env=lpad.environment
+                                                 } in
+          let state = { state with
+                        accu = TracedGlobal(Env offset,
+                                            [],
+                                            efield)
+                      } in
+          (state, instrs_flush)
+        ) else
+          let accu = real_accu in
+          let state = { state with accu } in
+          let instrs =
+            instrs_flush
+            @ [ Wcopyenv { offset } ] in
+          (state, instrs)
     | Krestart ->
         (state, [])
     | Kpushtrap _ | Kpoptrap ->

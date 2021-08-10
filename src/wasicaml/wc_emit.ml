@@ -57,6 +57,10 @@ type gpad =  (* global pad *)
     mutable need_reinit_frame : bool;
     mutable need_reinit_frame_k : ISet.t;
     mutable need_mlookup : bool;
+    mutable globals_table : (int, Wc_traceglobals.initvalue) Hashtbl.t;
+    (* knowledge about the globals *)
+    mutable glbfun_table : (int,  int * Wc_traceglobals.initvalue array) Hashtbl.t;
+    (* for each letrec function: knowledge about its environment *)
   }
 
 type fpad =  (* function pad *)
@@ -238,9 +242,12 @@ let load_offset offset =
     ]
 
 let add_offset offset =
-  [ L [ K "i32.const"; N (I32 (Int32.of_int offset)) ];
-    L [ K "i32.add" ]
-  ]
+  if offset <> 0 then
+    [ L [ K "i32.const"; N (I32 (Int32.of_int offset)) ];
+      L [ K "i32.add" ]
+    ]
+  else
+    []
 
 let push_env =
   [ L [ K "local.get"; ID "envptr" ];
@@ -1403,6 +1410,27 @@ let convert fpad repr_from repr_to descr_opt =
     | _ ->
         assert false (* TODO *)
 
+let push_global offset =
+  [ L [ K "global.get";
+        ID "wasicaml_global_data";
+      ];
+    L [ K "i32.load" ];
+    L [ K "i32.load";
+        K (sprintf "offset=0x%lx" (Int32.of_int (4 * offset)));
+        K "align=2";
+      ]
+  ]
+
+let follow_path path =
+  List.map
+    (fun field ->
+      L [ K "i32.load";
+          K (sprintf "offset=0x%lx" (Int32.of_int (4 * field)));
+          K "align=2";
+        ]
+    )
+    path
+
 let push fpad store =
   (* put the value in store onto the wasm stack *)
   match store with
@@ -1416,6 +1444,13 @@ let push fpad store =
         push_stack fpad pos
     | Atom tag ->
         alloc_atom fpad tag
+    | TracedGlobal(Glb glb_offset, path, _) ->
+        push_global glb_offset
+        @ follow_path path
+    | TracedGlobal(Env env_offset, path, _) ->
+        push_env
+        @ add_offset (4 * env_offset)
+        @ follow_path path
     | Invalid ->
         assert false
 
@@ -2247,6 +2282,29 @@ let throw fpad =
       L [ K "return" ]
     ]
 
+let apply_direct gpad fpad funlabel numargs depth =
+  let _, letrec_label, _ = lookup_label gpad funlabel in
+  let letrec_name = Hashtbl.find gpad.letrec_name letrec_label in
+  let env_pos = (-depth + numargs + 1) in
+  ( push_local "accu"
+    |> pop_to_stack fpad env_pos
+  )
+  @ push_field_addr "fp" env_pos (* new envptr *)
+  @ [ L [ K "i32.const"; N (I32 (Int32.of_int (numargs-1))) ];
+    ]
+  @ push_field "accu" 0
+  @ push_local "fp"
+  @ [L [ K "i32.const"; N (I32 (Int32.of_int (4 * depth))) ];
+     L [ K "i32.sub" ];
+     L [ K "call";
+          ID letrec_name
+        ];
+      L [ K "local.tee"; ID "accu" ];
+      L [ K "i32.eqz" ];  (* check for exceptions *)
+      L [ K "if";
+          L ([ K "then"] @ throw fpad)
+        ];
+    ]
 
 let apply fpad numargs depth =
   let env_pos = (-depth + numargs + 1) in
@@ -2459,11 +2517,7 @@ let rec emit_instr gpad fpad instr =
         @ pop_to_local "accu"
     | Wcopyenv arg ->
         push_env
-        @ ( if arg.offset <> 0 then
-              add_offset (4 * arg.offset)
-            else
-              []
-          )
+        @ add_offset (4 * arg.offset)
         @ pop_to_local "accu"
     | Wgetglobal arg ->
         let Global offset = arg.src in
@@ -2482,15 +2536,7 @@ let rec emit_instr gpad fpad instr =
           L [ K "call"; ID "debug2" ]
         ]
          *)
-        [ L [ K "global.get";
-              ID "wasicaml_global_data";
-            ];
-          L [ K "i32.load" ];
-          L [ K "i32.load";
-              K (sprintf "offset=0x%lx" (Int32.of_int (4 * offset)));
-              K "align=2";
-            ]
-        ]
+        push_global offset
         @ pop_to_local "accu"
     | Wunary arg ->
         emit_unary gpad fpad arg.op arg.src1 arg.dest
@@ -2552,6 +2598,15 @@ let rec emit_instr gpad fpad instr =
         switch fpad arg.src arg.labels_int arg.labels_blk
     | Wapply arg ->
         apply fpad arg.numargs arg.depth
+    | Wapply_direct arg ->
+        (* TODO: the copy is only needed for calling functions that actually
+           access the environment. Note that, however, functions not
+           accessing the environment at all seem to be relatively rare.
+         *)
+        let fn = Wc_traceglobals.Unknown in (* this arg is ignored by [copy] *)
+        let src = TracedGlobal(arg.global, arg.path, fn) in
+        copy fpad src Wc_unstack.real_accu None
+        @ apply_direct gpad fpad arg.funlabel arg.numargs arg.depth
     | Wappterm arg ->
         appterm gpad fpad arg.numargs arg.oldnumargs arg.depth
     | Wreturn arg ->
@@ -2717,12 +2772,25 @@ let cond_loop cond label sexpl =
   else
     sexpl
 
+let eff_label =
+  function
+  | Func l -> l
+  | Main l -> l
+
+let init_lpad_for_subfunc gpad fpad func_label =
+  let func_offset, environment =
+    ( try Hashtbl.find gpad.glbfun_table func_label
+      with Not_found -> 0, [| |]
+    ) in
+  fpad.lpad.environment <- environment;
+  fpad.lpad.func_offset <- func_offset
 
 let generate_function scode gpad letrec_label func_name subfunc_labels export_flag =
   let fpad = { (empty_fpad()) with fpad_letrec_label = letrec_label } in
   Hashtbl.add fpad.lpad.locals "accu" RValue;
   Hashtbl.add fpad.lpad.locals "bp" RValue;
   fpad.lpad.avoid_locals <- export_flag; (* avoid local vars in the long main function *)
+  fpad.lpad.globals_table <- gpad.globals_table;
 
   let subfunc_pairs =
     List.map
@@ -2730,6 +2798,7 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
         let fblock = IMap.find func_label Wc_control.(scode.functions) in
         fpad.fpad_scope <- fblock.scope;
         let label = sprintf "func%d" func_label in
+        init_lpad_for_subfunc gpad fpad func_label;
         let sexpl = emit_fblock gpad fpad fblock in
         (label, sexpl)
       )
@@ -2817,7 +2886,7 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
                locals
             )
             (*
-             @ debug2 0 letrec_label
+             @ debug2 0 (eff_label letrec_label)
              @ debug2_var 10 "fp"
              @ debug2_var 11 "envptr"
              @ debug2_var 12 "codeptr"
@@ -2935,8 +3004,7 @@ let bigarray_to_string_list limit ba =
   done;
   List.rev !l
 
-
-let generate scode exe get_defname =
+let generate scode exe get_defname globals_table =
   let (funcmapping, subfunctions) = get_funcmapping scode in
 
   let letrec_name = Hashtbl.create 7 in
@@ -2984,6 +3052,8 @@ let generate scode exe get_defname =
       need_reinit_frame = false;
       need_reinit_frame_k = ISet.empty;
       need_mlookup = false;
+      globals_table;
+      glbfun_table = Wc_traceglobals.derive_glbfun_table globals_table;
     } in
 
   let sexpl_code =

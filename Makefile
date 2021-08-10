@@ -144,7 +144,7 @@ clean: clean-ocaml clean-wasicaml
 	rm -f lib/*.o
 	rm -rf js/node_modules
 	rm -f js/package-lock.json
-	if [ -d wasi-libc ]; then cd wasi-libc; $(MAKE) clean; fi
+	#if [ -d wasi-libc ]; then cd wasi-libc; $(MAKE) clean; fi
 
 clean-ocaml:
 	cd ocaml && make clean
