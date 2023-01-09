@@ -18,12 +18,10 @@ fi
 #
 # Put the output of the second command in the relevant environment var.
 set +x
-echo $RMX_DEPLOY_KEY | $B64_DECODE > ~/deploy_key.json
+echo $RMX_PROD_DEPLOY_KEY | $B64_DECODE > ~/deploy_key.json
 set -x
 
-# staging
 # activate service account
 gcloud --project rmx-prod auth activate-service-account --key-file ~/deploy_key.json
 
 gcloud auth list
-gcloud -q auth configure-docker

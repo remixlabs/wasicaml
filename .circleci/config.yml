@@ -1,4 +1,4 @@
-version: 2
+version: 2.1
 jobs:
   build:
     docker:
@@ -15,3 +15,9 @@ jobs:
     - run: make test
     - run: ci/ensure-gcloud-creds
     - run: ci/upload_web
+
+workflows:
+  build:
+    jobs:
+      - build:
+          context: rmx-prod-uploads
