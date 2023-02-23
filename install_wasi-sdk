@@ -2,7 +2,7 @@
 
 set -e
 
-major="12"
+major="19"
 minor="0"
 
 case "$(uname)" in

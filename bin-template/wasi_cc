@@ -49,7 +49,7 @@ if [ $noexe -eq 0 ]; then
     esac
 fi
 
-"$root"/lib/wasi-sdk/bin/clang --sysroot="$root"/lib/wasi-sdk/share/wasi-sysroot $init -D_WASI_EMULATED_PROCESS_CLOCKS "$@"
+"$root"/lib/wasi-sdk/bin/clang --sysroot="$root"/lib/wasi-sdk/share/wasi-sysroot $init -D_WASI_EMULATED_PROCESS_CLOCKS -Wno-unused-command-line-argument "$@"
 
 if [ $genwrapper -gt 0 -a -f "$out" ]; then
     wasm=`mktemp tmp.XXXXXX`

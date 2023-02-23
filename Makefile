@@ -6,7 +6,7 @@ endif
 
 WASI_SDK = lib/wasi-sdk
 WASI_LIBC_REPO = https://github.com/gerdstolpmann/wasi-libc.git
-WASI_LIBC_BRANCH = gerd/chdir-fixes
+WASI_LIBC_BRANCH =
 TOP := $(realpath .)
 
 .PHONY: default \

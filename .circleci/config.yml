@@ -12,7 +12,7 @@ jobs:
     - run: echo 'export PATH=$HOME/ci:$PATH' >> $BASH_ENV
     - run: ./configure
     - run: make
-    - run: make test
+    - run: ulimit -s 16384 && make test
     - run: ci/ensure-gcloud-creds
     - run: ci/upload_web
 
