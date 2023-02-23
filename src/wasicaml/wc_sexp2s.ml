@@ -347,6 +347,29 @@ let write_file f filename sexpl =
           func_1 func_name (Some obj_name) [] [] [] rest
       | _ ->
           func_1 func_name None [] [] [] sexpl in
+  let rec func_type_1 func_name params results sexpl =
+    match sexpl with
+      | L [ K "export"; S n ] :: rest ->
+          func_type_1 func_name params results rest
+      | L [ K "param"; ID n; K ty ] :: rest ->
+          func_type_1 func_name ((n,ty)::params) results rest
+      | L [ K "result"; K ty ] :: rest ->
+          func_type_1 func_name params (ty::results) rest
+      | L [ K "local"; ID n; K ty ] :: rest ->
+          func_type_1 func_name params results rest
+      | body ->
+          fprintf f "\t.functype %s (%s) -> (%s)\n"
+                  func_name
+                  (List.rev params |> List.map snd |> String.concat ", ")
+                  (List.rev results |> String.concat ", ") in
+  let func_type func_name sexpl =
+    match sexpl with
+      | K "export" :: S _ :: rest ->
+          func_type_1 func_name [] [] rest
+      | _ ->
+          func_type_1 func_name [] [] sexpl in
+
+  let sexpl1 = remove_stuff sexpl in
 
   fprintf f "\t.text\n";
   fprintf f "\t.file %S\n" filename;
@@ -371,7 +394,21 @@ let write_file f filename sexpl =
                 | _ ->
                     failwith ("write_file: bad import: " ^
                                 string_of_sexp (L imp_sexpl))
-            );
+            )
+        | L (K "func" :: ID func_name :: rest) ->
+            (* llvm-16 requires that the .functype directive precedes
+               any call to the function
+             *)
+            func_type func_name rest
+        | _ ->
+            ()
+    )
+    sexpl1;
+  List.iter
+    (fun mod_sexp ->
+      match mod_sexp with
+        | L [ K "import"; _; _; _ ] ->
+            ()
         | L (K ("memory" | "table") :: _) ->
             ()
         | L (K "func" :: ID func_name :: rest) ->
@@ -397,4 +434,4 @@ let write_file f filename sexpl =
             failwith ("write_file: bad definition: " ^
                         string_of_sexp mod_sexp)
     )
-    (remove_stuff sexpl)
+    sexpl1
