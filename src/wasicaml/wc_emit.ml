@@ -69,6 +69,7 @@ type fpad =  (* function pad *)
     mutable fpad_scope : Wc_control.cfg_scope;
     mutable maxdepth : int;
     mutable need_appterm_common : bool;
+    mutable need_startover : bool;
     mutable need_return : bool;
     mutable need_panic : bool;
     mutable need_tmp1_i32 : bool;
@@ -96,6 +97,9 @@ type fpad =  (* function pad *)
 let enable_multireturn = ref false
 (* whether Wasm code can use multivalue returns *)
 (* NB. This seems to be broken in llvm-11 *)
+
+let enable_returncall = ref false
+(* whether Wasm code can use the return_call instruction (tail calls) *)
 
 let enable_deadbeef_check = ref false
 (* debugging: check that there is no uninitialized memory on the stack *)
@@ -160,6 +164,7 @@ let empty_fpad() =
                  };
     maxdepth = 0;
     need_appterm_common = false;
+    need_startover = false;
     need_return = false;
     need_panic = false;
     need_tmp1_i32 = false;
@@ -1010,7 +1015,7 @@ let reinit_frame_k new_num_args =
       )
   ]
 
-let return_helper =
+let return_helper() =
   [ L ( [ [ K "func";
             ID "return_helper";
             L [ K "param"; ID "envptr"; K "i32" ];
@@ -1036,86 +1041,101 @@ let return_helper =
             L [ K "local.get"; ID "codeptr" ];
             L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
             L [ K "i32.shr_u" ];
+          ];
 
-            (* TODO: use a tail call *)
-            L [ K "call_indirect";
-                N (I32 0l);    (* table *)
-                L [ K "param"; K "i32" ];
-                L [ K "param"; K "i32" ];
-                L [ K "param"; K "i32" ];
-                L [ K "param"; K "i32" ];
-                L [ K "result"; K "i32" ];
-              ];
-            L [ K "return" ]
-          ]
+          if !enable_returncall then
+            [ L [ K "return_call_indirect";
+                  N (I32 0l);    (* table *)
+                  L [ K "param"; K "i32" ];
+                  L [ K "param"; K "i32" ];
+                  L [ K "param"; K "i32" ];
+                  L [ K "param"; K "i32" ];
+                  L [ K "result"; K "i32" ];
+                ]
+            ]
+          else
+            [ L [ K "call_indirect";
+                  N (I32 0l);    (* table *)
+                  L [ K "param"; K "i32" ];
+                  L [ K "param"; K "i32" ];
+                  L [ K "param"; K "i32" ];
+                  L [ K "param"; K "i32" ];
+                  L [ K "result"; K "i32" ];
+                ];
+              L [ K "return" ]
+            ]
         ] |> List.flatten
       )
   ]
 
 let appterm_helper() =
-  [ L ( [ [ K "func";
-            ID "appterm_helper";
-            L [ K "param"; ID "envptr"; K "i32" ];
-            L [ K "param"; ID "codeptr"; K "i32" ];
-            L [ K "param"; ID "accu"; K "i32" ];
-            L [ K "param"; ID "extra_args"; K "i32" ];
-            L [ K "param"; ID "new_num_args"; K "i32" ];
-            BR;
-            L [ K "result"; C "out_codeptr"; K "i32" ];
-          ];
-          if !enable_multireturn then
-            [L [ K "result"; C "out_extra_args"; K "i32" ]]
-          else [];
-          [ L [ K "local"; ID "out_codeptr"; K "i32" ]];
+  if !enable_returncall then
+    []
+  else
+    [ L ( [ [ K "func";
+              ID "appterm_helper";
+              L [ K "param"; ID "envptr"; K "i32" ];
+              L [ K "param"; ID "codeptr"; K "i32" ];
+              L [ K "param"; ID "accu"; K "i32" ];
+              L [ K "param"; ID "extra_args"; K "i32" ];
+              L [ K "param"; ID "new_num_args"; K "i32" ];
+              BR;
+              L [ K "result"; C "out_codeptr"; K "i32" ];
+            ];
+            if !enable_multireturn then
+              [L [ K "result"; C "out_extra_args"; K "i32" ]]
+            else [];
+            [ L [ K "local"; ID "out_codeptr"; K "i32" ]];
 
-          push_local "extra_args";
-          push_local "new_num_args";
-          [ L [ K "i32.add" ]];
-          pop_to_local "extra_args";
+            push_local "extra_args";
+            push_local "new_num_args";
+            [ L [ K "i32.add" ]];
+            pop_to_local "extra_args";
 
-          (push_local "accu" |> pop_to_field "envptr" 0);
+            (push_local "accu" |> pop_to_field "envptr" 0);
 
-          push_field "accu" 0;
-          pop_to_local "out_codeptr";
+            push_field "accu" 0;
+            pop_to_local "out_codeptr";
 
-          [ L [ K "local.get"; ID "out_codeptr" ];
-            L [ K "i32.const"; N (I32 code_pointer_letrec_mask) ];
-            L [ K "i32.and" ];
-            L [ K "local.get"; ID "codeptr" ];
-            L [ K "i32.const"; N (I32 code_pointer_letrec_mask) ];
-            L [ K "i32.and" ];
-            L [ K "i32.eq" ];
-            L [ K "if";
-                L ( [ K "then" ;
-                      (* same letrec: we can jump! *)
-                      L [ K "local.get"; ID "out_codeptr" ];
-                      L [ K "local.get"; ID "extra_args" ];
-                      L [ K "i32.const"; N (I32 1l) ];
-                      L [ K "i32.sub" ]
-                    ]
-                    @ (if !enable_multireturn then [] else
-                         [ L [ K "global.set"; ID "retval2" ] ]
-                      )
-                    @ [ L [ K "return" ] ]
-                  );
-                L ( [ K "else";
-                      (* different letrec: call + return. *)
-                      L [ K "i32.const"; N (I32 0l) ];
-                      L [ K "local.get"; ID "extra_args" ]
-                    ]
-                    @ (if !enable_multireturn then [] else
-                         [ L [ K "global.set"; ID "retval2" ] ]
-                      )
-                    @ [ L [ K "return" ]]
-                  )
-              ];
-            L [ K "unreachable" ]
-          ]
-        ] |> List.flatten
-      )
-  ]
+            [ L [ K "local.get"; ID "out_codeptr" ];
+              L [ K "i32.const"; N (I32 code_pointer_letrec_mask) ];
+              L [ K "i32.and" ];
+              L [ K "local.get"; ID "codeptr" ];
+              L [ K "i32.const"; N (I32 code_pointer_letrec_mask) ];
+              L [ K "i32.and" ];
+              L [ K "i32.eq" ];
+              L [ K "if";
+                  L ( [ K "then" ;
+                        (* same letrec: we can jump! *)
+                        L [ K "local.get"; ID "out_codeptr" ];
+                        L [ K "local.get"; ID "extra_args" ];
+                        L [ K "i32.const"; N (I32 1l) ];
+                        L [ K "i32.sub" ]
+                      ]
+                      @ (if !enable_multireturn then [] else
+                           [ L [ K "global.set"; ID "retval2" ] ]
+                        )
+                      @ [ L [ K "return" ] ]
+                    );
+                  L ( [ K "else";
+                        (* different letrec: call + return. *)
+                        L [ K "i32.const"; N (I32 0l) ];
+                        L [ K "local.get"; ID "extra_args" ]
+                      ]
+                      @ (if !enable_multireturn then [] else
+                           [ L [ K "global.set"; ID "retval2" ] ]
+                        )
+                      @ [ L [ K "return" ]]
+                    )
+                ];
+              L [ K "unreachable" ]
+            ]
+          ] |> List.flatten
+        )
+    ]
 
 let call_appterm_helper() =
+  assert(not !enable_returncall);
   [ L [ K "call"; ID "appterm_helper" ]]
   @ if !enable_multireturn then [] else
       [ L [ K "global.get"; ID "retval2" ]]
@@ -2240,21 +2260,29 @@ let grab fpad num =
     ] in
   sexpl
 
-let return =
+let return() =
   (* NB. don't use bp here.
      codeptr is already destroyed when coming from appterm_common
    *)
   [ C "$return";
     L [ K "local.get"; ID "extra_args" ];
     L [ K "if";
-        L [ K "then";
-            L [ K "local.get"; ID "envptr" ];
-            L [ K "local.get"; ID "extra_args" ];
-            L [ K "local.get"; ID "fp" ];
-            L [ K "local.get"; ID "accu" ];
-            L [ K "call"; ID "return_helper" ];  (* TODO: use tail call *)
-            L [ K "return" ]
-          ]
+        L ( [ [ K "then";
+                L [ K "local.get"; ID "envptr" ];
+                L [ K "local.get"; ID "extra_args" ];
+                L [ K "local.get"; ID "fp" ];
+                L [ K "local.get"; ID "accu" ];
+              ];
+              ( if !enable_returncall then
+                  [ L [ K "return_call"; ID "return_helper" ];
+                  ]
+                else
+                  [ L [ K "call"; ID "return_helper" ];
+                    L [ K "return" ]
+                  ]
+              )
+            ] |> List.flatten
+          )
       ];
     L [ K "local.get"; ID "accu" ];
     L [ K "return" ];
@@ -2366,29 +2394,38 @@ let apply fpad numargs depth =
 
 let appterm_common fpad =
   (* NB. don't use bp here *)
-  [ C "$appterm_common";
-    L [ K "local.get"; ID "envptr" ];
-    L [ K "local.get"; ID "codeptr" ];
-    L [ K "local.get"; ID "accu" ];
-    L [ K "local.get"; ID "extra_args" ];
-    L [ K "local.get"; ID "appterm_new_num_args" ];
-  ]
-  @ call_appterm_helper()
-  @ [ L [ K "local.set"; ID "extra_args" ];
-      L [ K "local.tee"; ID "codeptr" ];
-      L [ K "if";
-          L [ K "then";
-              (* same letrec: we can jump! *)
-              L [ K "br"; ID "startover" ]
-            ];
-          L [ K "else";
-              (* different letrec: call + return. In the future,
-                 this can be turned to a tailcall *)
-              (* we can jump to $return *)
-              L [ K "br"; ID "return" ]
-            ]
-        ]
+  if !enable_returncall then
+    [ C "$appterm_common";
+      L [ K "local.get"; ID "extra_args" ];
+      L [ K "local.get"; ID "appterm_new_num_args" ];
+      L [ K "i32.add" ];
+      L [ K "local.set"; ID "extra_args" ];
     ]
+    @ (push_local "accu" |> pop_to_field "envptr" 0)
+    @ [ L [ K "br"; ID "return" ] ]
+  else
+    [ C "$appterm_common";
+      L [ K "local.get"; ID "envptr" ];
+      L [ K "local.get"; ID "codeptr" ];
+      L [ K "local.get"; ID "accu" ];
+      L [ K "local.get"; ID "extra_args" ];
+      L [ K "local.get"; ID "appterm_new_num_args" ];
+    ]
+    @ call_appterm_helper()
+    @ [ L [ K "local.set"; ID "extra_args" ];
+        L [ K "local.tee"; ID "codeptr" ];
+        L [ K "if";
+            L [ K "then";
+                (* same letrec: we can jump! *)
+                L [ K "br"; ID "startover" ]
+              ];
+            L [ K "else";
+                (* different letrec: call + return *)
+                (* we can jump to $return *)
+                L [ K "br"; ID "return" ]
+              ]
+          ]
+      ]
 
 let appterm gpad fpad numargs oldnumargs depth =
   let sexpl =
@@ -2416,6 +2453,8 @@ let appterm gpad fpad numargs oldnumargs depth =
     ) in
   fpad.need_appterm_common <- true;
   fpad.need_return <- true;
+  if not !enable_returncall then
+    fpad.need_startover <- true;
   sexpl
 
 let trap gpad fpad trylabel catchlabel depth =
@@ -2843,9 +2882,9 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
        |> cond_section
             fpad.need_appterm_common "appterm_common" (appterm_common fpad)
        |> cond_loop
-            fpad.need_appterm_common "startover"
+            fpad.need_startover "startover"
        |> cond_section
-            fpad.need_return "return" return
+            fpad.need_return "return" (return())
       ) in
 
   if fpad.need_appterm_common then (
@@ -3141,7 +3180,7 @@ let generate scode exe get_defname globals_table =
   @ alloc_fast
   @ alloc_slow()
   @ grab_helper gpad
-  @ return_helper
+  @ return_helper()
   @ appterm_helper()
   @ restart_helper gpad
   @ (if gpad.need_reinit_frame then

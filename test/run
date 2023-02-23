@@ -43,6 +43,10 @@ if [ "$1" = "-deadbeef" ]; then
     args="$args -enable-deadbeef-check"
     shift
 fi
+if [ "$1" = "-tail-call" ]; then
+    args="$args -enable-tail-call"
+    shift
+fi
 if [ "$1" = "-ocamlopt" ]; then
     with_ocamlopt=1
     shift

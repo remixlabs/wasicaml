@@ -170,12 +170,12 @@ let write_func_body f func_name locals_table sexpl =
               branches in
           fprintf f "\t%s%s %s   # %s\n" indent instr opt_curlies all_lab_names;
           next labels depth rest
-      | L (K "call_indirect" :: N (I32 table) :: inner) :: rest ->
+      | L (K ("call_indirect"|"return_call_indirect" as instr) :: N (I32 table) :: inner) :: rest ->
           let ty, inner2 = extract_func_type inner in
           if inner2 <> [] then
             failwith (sprintf "bad code - function %s - %s"
                               func_name (string_of_sexp (L sexpl)));
-          fprintf f "\t%scall_indirect %s\n" indent ty;
+          fprintf f "\t%s%s %s\n" indent instr ty;
           next labels depth rest
       | L (K "block" :: inner) :: rest ->
           let label, inner2 = extract_label inner in

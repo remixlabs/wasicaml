@@ -5,7 +5,10 @@ export WASICAML_CWD=`pwd`
 
 opts=""
 if node --experimental-wasm-bigint -e '' >/dev/null 2>&1; then
-	opts=--experimental-wasm-bigint
+    opts="$opts --experimental-wasm-bigint"
+fi
+if node --experimental-wasm-return-call -e '' >/dev/null 2>&1; then
+    opts="$opts --experimental-wasm-return-call"
 fi
 
 exec node --stack-size=$(( $(ulimit -s) - 256)) --no-warnings $opts -- "$WASICAML/js/main.js" "$@"
