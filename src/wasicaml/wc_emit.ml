@@ -2735,7 +2735,7 @@ let emit_fblock gpad fpad fblock =
     )
   @ instrs
 
-let get_funcmapping scode =
+let get_funcmapping_without_tailcalls scode =
   let open Wc_control in
   let funcmapping = Hashtbl.create 7 in
   let subfunction_num = Hashtbl.create 7 in
@@ -2771,6 +2771,38 @@ let get_funcmapping scode =
   ( funcmapping,
     subfunctions_rev
   )
+
+let get_funcmapping_with_tailcalls scode =
+  (* simplified: do not generate subfunctions *)
+  let open Wc_control in
+  let funcmapping = Hashtbl.create 7 in
+  let subfunctions = Hashtbl.create 7 in
+  IMap.iter
+    (fun func_label fblock ->
+      let letrec_label =
+        if fblock.scope.cfg_main then
+          Main func_label
+        else
+          Func func_label in
+      Hashtbl.add funcmapping func_label (letrec_label, 0);
+      Hashtbl.replace subfunctions letrec_label [func_label]
+    )
+    scode.functions;
+  let subfunctions_rev = Hashtbl.create 7 in
+  Hashtbl.iter
+    (fun letrec_label subfunc_labels ->
+      Hashtbl.add subfunctions_rev letrec_label (List.rev subfunc_labels)
+    )
+    subfunctions;
+  ( funcmapping,
+    subfunctions_rev
+  )
+
+let get_funcmapping scode =
+  if !enable_returncall then
+    get_funcmapping_with_tailcalls scode
+  else
+    get_funcmapping_without_tailcalls scode
 
 let block_cascade start_sexpl label_sexpl_pairs =
   let rec shift prev_sexpl pairs =
