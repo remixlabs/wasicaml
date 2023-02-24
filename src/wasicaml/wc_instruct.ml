@@ -165,6 +165,9 @@ type winstruction =
                        numargs:int; depth:int }
   | Wappterm of { numargs:int; oldnumargs:int; depth:int } (* src=accu *)
     (* CHECK: maybe also pass args individually to appterm *)
+  | Wappterm_direct of { funlabel:int; global:global_lookup; path:int list;
+                         numargs:int; oldnumargs:int; depth:int } (* src=accu *)
+    (* Wappterm_direct is only used when tail-calls are enabled *)
   | Wreturn of { src:store; arity:int }
   | Wgrab of { numargs:int }
   | Wclosurerec of { src:store list; dest:(store * int) list;
@@ -324,6 +327,10 @@ let rec string_of_winstruction =
   | Wappterm arg ->
       sprintf "Wappterm(f=accu, args=[fp[%d]...fp[%d]], oldnum=%d)"
               (-arg.depth) (-arg.depth+arg.numargs-1)
+              arg.oldnumargs
+  | Wappterm_direct arg ->
+      sprintf "Wappterm(f=letrec%d, args=[fp[%d]...fp[%d]], oldnum=%d)"
+              arg.funlabel (-arg.depth) (-arg.depth+arg.numargs-1)
               arg.oldnumargs
   | Wreturn arg ->
       sprintf "Wreturn(%s)" (string_of_store arg.src)

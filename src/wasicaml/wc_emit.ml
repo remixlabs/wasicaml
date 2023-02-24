@@ -155,7 +155,7 @@ let vtype repr =
         TF64
 
 let empty_fpad() =
-  { lpad = Wc_unstack.empty_lpad();
+  { lpad = Wc_unstack.empty_lpad ~enable_returncall:!enable_returncall ();
     fpad_letrec_label = Main 0;
     fpad_scope = { cfg_letrec_label = None;
                    cfg_func_label = 0;
@@ -2392,69 +2392,128 @@ let apply fpad numargs depth =
         ];
     ]
 
-let appterm_common fpad =
+let appterm_common fpad () =
   (* NB. don't use bp here *)
-  if !enable_returncall then
-    [ C "$appterm_common";
-      L [ K "local.get"; ID "extra_args" ];
-      L [ K "local.get"; ID "appterm_new_num_args" ];
-      L [ K "i32.add" ];
-      L [ K "local.set"; ID "extra_args" ];
+  [ C "$appterm_common";
+    L [ K "local.get"; ID "envptr" ];
+    L [ K "local.get"; ID "codeptr" ];
+    L [ K "local.get"; ID "accu" ];
+    L [ K "local.get"; ID "extra_args" ];
+    L [ K "local.get"; ID "appterm_new_num_args" ];
+  ]
+  @ call_appterm_helper()
+  @ [ L [ K "local.set"; ID "extra_args" ];
+      L [ K "local.tee"; ID "codeptr" ];
+      L [ K "if";
+          L [ K "then";
+              (* same letrec: we can jump! *)
+              L [ K "br"; ID "startover" ]
+            ];
+          L [ K "else";
+              (* different letrec: call + return *)
+              (* we can jump to $return *)
+              L [ K "br"; ID "return" ]
+            ]
+        ]
     ]
-    @ (push_local "accu" |> pop_to_field "envptr" 0)
-    @ [ L [ K "br"; ID "return" ] ]
-  else
-    [ C "$appterm_common";
-      L [ K "local.get"; ID "envptr" ];
-      L [ K "local.get"; ID "codeptr" ];
-      L [ K "local.get"; ID "accu" ];
-      L [ K "local.get"; ID "extra_args" ];
-      L [ K "local.get"; ID "appterm_new_num_args" ];
-    ]
-    @ call_appterm_helper()
-    @ [ L [ K "local.set"; ID "extra_args" ];
-        L [ K "local.tee"; ID "codeptr" ];
-        L [ K "if";
-            L [ K "then";
-                (* same letrec: we can jump! *)
-                L [ K "br"; ID "startover" ]
-              ];
-            L [ K "else";
-                (* different letrec: call + return *)
-                (* we can jump to $return *)
-                L [ K "br"; ID "return" ]
-              ]
-          ]
-      ]
 
-let appterm gpad fpad numargs oldnumargs depth =
+let call_reinit_frame gpad fpad numargs oldnumargs depth =
+  if numargs <= 10 then (
+    gpad.need_reinit_frame_k <- ISet.add numargs gpad.need_reinit_frame_k;
+    push_local "fp"
+    @ push_const (Int32.of_int depth)
+    @ push_const (Int32.of_int oldnumargs)
+    @ [ L [ K "call"; ID (sprintf "reinit_frame_%d" numargs) ] ]
+  ) else (
+    gpad.need_reinit_frame <- true;
+    push_local "fp"
+    @ push_const (Int32.of_int depth)
+    @ push_const (Int32.of_int oldnumargs)
+    @ push_const (Int32.of_int numargs)
+    @ [ L [ K "call"; ID "reinit_frame" ] ]
+  )
+
+let appterm_with_returncall gpad fpad numargs oldnumargs depth =
   let sexpl =
-    if numargs <= 10 then (
-      gpad.need_reinit_frame_k <- ISet.add numargs gpad.need_reinit_frame_k;
-      push_local "fp"
-      @ push_const (Int32.of_int depth)
-      @ push_const (Int32.of_int oldnumargs)
-      @ [ L [ K "call"; ID (sprintf "reinit_frame_%d" numargs) ] ]
-      @ pop_to_local "fp"   (* no need to set bp here *)
-      @ push_const (Int32.of_int numargs)
-      @ pop_to_local "appterm_new_num_args"
-      @ [ L [ K "br"; ID "appterm_common" ] ]
-     ) else (
-      gpad.need_reinit_frame <- true;
-      push_local "fp"
-      @ push_const (Int32.of_int depth)
-      @ push_const (Int32.of_int oldnumargs)
-      @ push_const (Int32.of_int numargs)
-      @ [ L [ K "call"; ID "reinit_frame" ] ]
-      @ pop_to_local "fp"   (* no need to set bp here *)
-      @ push_const (Int32.of_int numargs)
-      @ pop_to_local "appterm_new_num_args"
-      @ [ L [ K "br"; ID "appterm_common" ] ]
-    ) in
+    call_reinit_frame gpad fpad numargs oldnumargs depth
+    @ pop_to_local "fp"   (* no need to set bp here *)
+    @ (push_local "accu" |> pop_to_field "envptr" 0)
+    @ [ L [ K "local.get"; ID "envptr" ];    (* first arg of call *)
+
+        L [ K "local.get"; ID "extra_args" ] (* second arg of call *)
+      ]
+    @ (if numargs >= 2 then
+         [ L [ K "i32.const"; N (I32 (Int32.of_int (numargs - 1))) ];
+           L [ K "i32.add" ];
+         ]
+       else
+         []
+      )
+    @ push_field "accu" 0                (* third arg of call: code pointer *)
+    @ [ L [ K "local.get"; ID "fp" ]     (* fourth arg of call *)
+      ]
+    @ push_field "accu" 0
+    @ [ L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
+        L [ K "i32.shr_u" ];             (* which function to call *)
+      ]
+    @ [ L [ K "return_call_indirect";
+            N (I32 0l);    (* table *)
+            L [ K "param"; K "i32" ];
+            L [ K "param"; K "i32" ];
+            L [ K "param"; K "i32" ];
+            L [ K "param"; K "i32" ];
+            L [ K "result"; K "i32" ];
+          ]
+      ] in
+  sexpl
+
+let appterm_without_returncall gpad fpad numargs oldnumargs depth =
+  let sexpl =
+    call_reinit_frame gpad fpad numargs oldnumargs depth
+    @ pop_to_local "fp"   (* no need to set bp here *)
+    @ push_const (Int32.of_int numargs)
+    @ pop_to_local "appterm_new_num_args"
+    @ [ L [ K "br"; ID "appterm_common" ] ] in
   fpad.need_appterm_common <- true;
   fpad.need_return <- true;
   if not !enable_returncall then
     fpad.need_startover <- true;
+  sexpl
+
+let appterm gpad fpad numargs oldnumargs depth =
+  if !enable_returncall then
+    appterm_with_returncall gpad fpad numargs oldnumargs depth
+  else
+    appterm_without_returncall gpad fpad numargs oldnumargs depth
+
+let appterm_direct gpad fpad funlabel numargs oldnumargs depth =
+  (* Wc_unstack must not emit Wappterm_direct when tail calls are
+     unavailable *)
+  assert(!enable_returncall);
+  let _, letrec_label, _ = lookup_label gpad funlabel in
+  let letrec_name = Hashtbl.find gpad.letrec_name letrec_label in
+  let sexpl =
+    call_reinit_frame gpad fpad numargs oldnumargs depth
+    @ pop_to_local "fp"   (* no need to set bp here *)
+    @ (push_local "accu" |> pop_to_field "envptr" 0)
+    @ [ L [ K "local.get"; ID "envptr" ];     (* first arg of call *)
+
+        L [ K "local.get"; ID "extra_args" ]; (* second arg of call *)
+      ]
+    @ (if numargs >= 2 then
+         [ L [ K "i32.const"; N (I32 (Int32.of_int (numargs - 1))) ];
+           L [ K "i32.add" ];
+         ]
+       else
+         []
+      )
+    @ push_field "accu" 0                (* third arg of call: code pointer *)
+    @ [ L [ K "local.get"; ID "fp" ]     (* fourth arg of call *)
+      ]
+    @ [ L [ K "return_call";
+            ID letrec_name
+          ]
+      ] in
   sexpl
 
 let trap gpad fpad trylabel catchlabel depth =
@@ -2648,6 +2707,16 @@ let rec emit_instr gpad fpad instr =
         @ apply_direct gpad fpad arg.funlabel arg.numargs arg.depth
     | Wappterm arg ->
         appterm gpad fpad arg.numargs arg.oldnumargs arg.depth
+    | Wappterm_direct arg ->
+        (* TODO: the copy is only needed for calling functions that actually
+           access the environment. Note that, however, functions not
+           accessing the environment at all seem to be relatively rare.
+         *)
+        let fn = Wc_traceglobals.Unknown in (* this arg is ignored by [copy] *)
+        let src = TracedGlobal(arg.global, arg.path, fn) in
+        copy fpad src Wc_unstack.real_accu None
+        @ appterm_direct
+            gpad fpad arg.funlabel arg.numargs arg.oldnumargs arg.depth
     | Wreturn arg ->
         let no_function =
         match arg.src with
@@ -2831,11 +2900,14 @@ let block_cascade start_sexpl label_sexpl_pairs =
           inner_sexpl in
   arrange [] (shift start_sexpl label_sexpl_pairs)
 
-let cond_section cond label sexpl_section sexpl_users =
+let cond_section_lz cond label sexpl_section sexpl_users =
   if cond then
-    [ L ( [ K "block"; ID label; BR ] @ sexpl_users ) ] @ sexpl_section
+    [ L ( [ K "block"; ID label; BR ] @ sexpl_users ) ] @ sexpl_section()
   else
     sexpl_users
+
+let cond_section cond label sexpl_section sexpl_users =
+  cond_section_lz cond label (fun () -> sexpl_section) sexpl_users
 
 let cond_loop cond label sexpl =
   if cond then
@@ -2911,12 +2983,12 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
             ]
     )
     @ (subfunc_sexpl
-       |> cond_section
+       |> cond_section_lz
             fpad.need_appterm_common "appterm_common" (appterm_common fpad)
        |> cond_loop
             fpad.need_startover "startover"
-       |> cond_section
-            fpad.need_return "return" (return())
+       |> cond_section_lz
+            fpad.need_return "return" return
       ) in
 
   if fpad.need_appterm_common then (
