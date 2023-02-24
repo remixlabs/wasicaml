@@ -173,6 +173,14 @@ let empty_fpad() =
     need_xalloc = false;
   }
 
+let returncall name =
+  if !enable_returncall then
+    [ L [ K "return_call"; ID name ] ]
+  else
+    [ L [ K "call"; ID name ];
+      L [ K "return" ]
+    ]
+
 let new_local fpad repr =
   Wc_unstack.new_local fpad.lpad repr
 
@@ -2247,15 +2255,15 @@ let grab fpad num =
               L [ K "i32.sub" ];
               L [ K "local.set"; ID "extra_args" ];
             ];
-          L [ K "else";
-              L [ K "local.get"; ID "envptr" ];
-              L [ K "local.get"; ID "extra_args" ];
-              L [ K "local.get"; ID "codeptr" ];
-              L [ K "local.get"; ID "fp" ];
-              L [ K "call"; ID "grab_helper" ];
-              (* L ( K "block" :: debug2 1 0); *)
-              L [ K "return" ];
-            ]
+          L ( [ [ K "else";
+                  L [ K "local.get"; ID "envptr" ];
+                  L [ K "local.get"; ID "extra_args" ];
+                  L [ K "local.get"; ID "codeptr" ];
+                  L [ K "local.get"; ID "fp" ];
+                ];
+                returncall "grab_helper"
+              ] |> List.flatten
+            )
         ];
     ] in
   sexpl
@@ -2273,14 +2281,7 @@ let return() =
                 L [ K "local.get"; ID "fp" ];
                 L [ K "local.get"; ID "accu" ];
               ];
-              ( if !enable_returncall then
-                  [ L [ K "return_call"; ID "return_helper" ];
-                  ]
-                else
-                  [ L [ K "call"; ID "return_helper" ];
-                    L [ K "return" ]
-                  ]
-              )
+              returncall "return_helper"
             ] |> List.flatten
           )
       ];
@@ -2433,25 +2434,28 @@ let call_reinit_frame gpad fpad numargs oldnumargs depth =
     @ [ L [ K "call"; ID "reinit_frame" ] ]
   )
 
+let appterm_push_params numargs =
+  [ L [ K "local.get"; ID "envptr" ];      (* first arg of call *)
+  ]
+  @ [ L [ K "local.get"; ID "extra_args" ] (* second arg of call *)
+    ]
+  @ (if numargs >= 2 then
+       [ L [ K "i32.const"; N (I32 (Int32.of_int (numargs - 1))) ];
+         L [ K "i32.add" ];
+       ]
+     else
+       []
+    )
+  @ push_field "accu" 0                (* third arg of call: code pointer *)
+  @ [ L [ K "local.get"; ID "fp" ]     (* fourth arg of call *)
+    ]
+
 let appterm_with_returncall gpad fpad numargs oldnumargs depth =
   let sexpl =
     call_reinit_frame gpad fpad numargs oldnumargs depth
     @ pop_to_local "fp"   (* no need to set bp here *)
     @ (push_local "accu" |> pop_to_field "envptr" 0)
-    @ [ L [ K "local.get"; ID "envptr" ];    (* first arg of call *)
-
-        L [ K "local.get"; ID "extra_args" ] (* second arg of call *)
-      ]
-    @ (if numargs >= 2 then
-         [ L [ K "i32.const"; N (I32 (Int32.of_int (numargs - 1))) ];
-           L [ K "i32.add" ];
-         ]
-       else
-         []
-      )
-    @ push_field "accu" 0                (* third arg of call: code pointer *)
-    @ [ L [ K "local.get"; ID "fp" ]     (* fourth arg of call *)
-      ]
+    @ appterm_push_params numargs
     @ push_field "accu" 0
     @ [ L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
         L [ K "i32.shr_u" ];             (* which function to call *)
@@ -2480,12 +2484,6 @@ let appterm_without_returncall gpad fpad numargs oldnumargs depth =
     fpad.need_startover <- true;
   sexpl
 
-let appterm gpad fpad numargs oldnumargs depth =
-  if !enable_returncall then
-    appterm_with_returncall gpad fpad numargs oldnumargs depth
-  else
-    appterm_without_returncall gpad fpad numargs oldnumargs depth
-
 let appterm_direct gpad fpad funlabel numargs oldnumargs depth =
   (* Wc_unstack must not emit Wappterm_direct when tail calls are
      unavailable *)
@@ -2496,25 +2494,99 @@ let appterm_direct gpad fpad funlabel numargs oldnumargs depth =
     call_reinit_frame gpad fpad numargs oldnumargs depth
     @ pop_to_local "fp"   (* no need to set bp here *)
     @ (push_local "accu" |> pop_to_field "envptr" 0)
-    @ [ L [ K "local.get"; ID "envptr" ];     (* first arg of call *)
-
-        L [ K "local.get"; ID "extra_args" ]; (* second arg of call *)
-      ]
-    @ (if numargs >= 2 then
-         [ L [ K "i32.const"; N (I32 (Int32.of_int (numargs - 1))) ];
-           L [ K "i32.add" ];
-         ]
-       else
-         []
-      )
-    @ push_field "accu" 0                (* third arg of call: code pointer *)
-    @ [ L [ K "local.get"; ID "fp" ]     (* fourth arg of call *)
-      ]
+    @ appterm_push_params numargs
     @ [ L [ K "return_call";
             ID letrec_name
           ]
       ] in
   sexpl
+
+let appterm gpad fpad funlabel_opt numargs oldnumargs depth =
+  if !enable_returncall then
+    match funlabel_opt with
+      | Some funlabel ->
+          appterm_direct gpad fpad funlabel numargs oldnumargs depth
+      | None ->
+          appterm_with_returncall gpad fpad numargs oldnumargs depth
+  else
+    appterm_without_returncall gpad fpad numargs oldnumargs depth
+
+let appterm_args gpad fpad funlabel_opt funsrc argsrc oldnumargs depth =
+  (* Wc_unstack must not emit Wappterm_args when tail calls are
+     unavailable *)
+  assert(!enable_returncall);
+  (* save argsrc in local variables *)
+  let arg_locals =
+    List.map (fun src -> new_local fpad (repr_of_store src)) argsrc in
+  let arg_instrs1 =
+    List.map2
+      (fun src localname ->
+        let dest = Local(repr_of_store src, localname) in
+        copy fpad src dest None
+      )
+      argsrc
+      arg_locals
+    |> List.flatten in
+  (* set "accu" to the function pointer: *)
+  let accu_instrs =
+    copy fpad funsrc (RealAccu { no_function = false }) None in
+  (* fp = fp + old_num_args - new_num_args *)
+  let newnumargs = List.length argsrc in
+  let fp_delta =
+    oldnumargs - newnumargs in
+  let fp_instrs =
+    if fp_delta = 0 then
+      []
+    else
+      [ L [ K "local.get"; ID "fp" ];
+        L [ K "i32.const"; N (I32 (Int32.of_int (4 * fp_delta))) ];
+        L [ K "i32.add" ];
+        L [ K "local.set"; ID "fp" ];
+      ] in
+  let arg_instrs2 =
+    List.map2
+      (fun src (localname, i) ->
+        let src = Local(repr_of_store src, localname) in
+        let dest = RealStack i in
+        copy fpad src dest None
+      )
+      argsrc
+      (List.mapi (fun i localname -> (localname, i)) arg_locals)
+    |> List.flatten in
+  let envptr_instrs =
+    (push_local "accu" |> pop_to_field "envptr" 0) in
+  let params_instrs =
+    appterm_push_params newnumargs in
+  let call_instrs =
+    match funlabel_opt with
+      | Some funlabel ->
+          let _, letrec_label, _ = lookup_label gpad funlabel in
+          let letrec_name = Hashtbl.find gpad.letrec_name letrec_label in
+          [ L [ K "return_call";
+                ID letrec_name
+              ]
+          ]
+      | None ->
+          push_field "accu" 0
+          @ [ L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
+              L [ K "i32.shr_u" ];             (* which function to call *)
+            ]
+          @ [ L [ K "return_call_indirect";
+                  N (I32 0l);    (* table *)
+                  L [ K "param"; K "i32" ];
+                  L [ K "param"; K "i32" ];
+                  L [ K "param"; K "i32" ];
+                  L [ K "param"; K "i32" ];
+                  L [ K "result"; K "i32" ];
+                ]
+            ] in
+  arg_instrs1
+  @ accu_instrs
+  @ fp_instrs
+  @ arg_instrs2
+  @ envptr_instrs
+  @ params_instrs
+  @ call_instrs
 
 let trap gpad fpad trylabel catchlabel depth =
   (* push 4 values onto stack: 0, 0, 0, extra_args *)
@@ -2706,7 +2778,7 @@ let rec emit_instr gpad fpad instr =
         copy fpad src Wc_unstack.real_accu None
         @ apply_direct gpad fpad arg.funlabel arg.numargs arg.depth
     | Wappterm arg ->
-        appterm gpad fpad arg.numargs arg.oldnumargs arg.depth
+        appterm gpad fpad None arg.numargs arg.oldnumargs arg.depth
     | Wappterm_direct arg ->
         (* TODO: the copy is only needed for calling functions that actually
            access the environment. Note that, however, functions not
@@ -2715,8 +2787,15 @@ let rec emit_instr gpad fpad instr =
         let fn = Wc_traceglobals.Unknown in (* this arg is ignored by [copy] *)
         let src = TracedGlobal(arg.global, arg.path, fn) in
         copy fpad src Wc_unstack.real_accu None
-        @ appterm_direct
-            gpad fpad arg.funlabel arg.numargs arg.oldnumargs arg.depth
+        @ appterm
+            gpad fpad (Some arg.funlabel) arg.numargs arg.oldnumargs arg.depth
+    | Wappterm_args arg ->
+        appterm_args
+          gpad fpad None arg.funsrc arg.argsrc arg.oldnumargs arg.depth
+    | Wappterm_direct_args arg ->
+        appterm_args
+          gpad fpad (Some arg.funlabel) arg.funsrc arg.argsrc arg.oldnumargs
+          arg.depth
     | Wreturn arg ->
         let no_function =
         match arg.src with
@@ -2760,9 +2839,7 @@ let rec emit_instr gpad fpad instr =
         @ push_local "extra_args"
         @ push_local "codeptr"
         @ push_local "fp"
-        @ [ L [ K "call"; ID (sprintf "letrec_main%d" label) ];
-            L [ K "return" ]
-          ]
+        @ returncall (sprintf "letrec_main%d" label)
     | Wstop ->
         [ L [ K "i32.const"; N (I32 0l) ];
           (* L ( K "block" :: debug2 1 2); *)

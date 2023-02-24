@@ -164,10 +164,16 @@ type winstruction =
   | Wapply_direct of { funlabel:int; global:global_lookup; path:int list;
                        numargs:int; depth:int }
   | Wappterm of { numargs:int; oldnumargs:int; depth:int } (* src=accu *)
-    (* CHECK: maybe also pass args individually to appterm *)
+  | Wappterm_args of { argsrc:store list; funsrc:store;
+                       oldnumargs:int; depth:int }
+    (* Wappterm_args is only used when tail-calls are enabled *)
   | Wappterm_direct of { funlabel:int; global:global_lookup; path:int list;
                          numargs:int; oldnumargs:int; depth:int } (* src=accu *)
     (* Wappterm_direct is only used when tail-calls are enabled *)
+  | Wappterm_direct_args of { funlabel:int; global:global_lookup; path:int list;
+                              argsrc:store list; funsrc:store;
+                              oldnumargs:int; depth:int }
+    (* Wappterm_direct_args is only used when tail-calls are enabled *)
   | Wreturn of { src:store; arity:int }
   | Wgrab of { numargs:int }
   | Wclosurerec of { src:store list; dest:(store * int) list;
@@ -196,6 +202,16 @@ let repr_of_store =
   | Atom _ -> RValue
   | TracedGlobal _ -> RValue
   | Invalid -> assert false
+
+(* whether an allocation is needed in order to turn this represnetaion
+   into a proper OCaml value
+ *)
+let repr_needs_alloc =
+  function
+  | RNatInt | RInt32 | RInt64 | RFloat ->
+      true
+  | _ ->
+      false
 
 let empty_descr =
   { stack_uninit = [];
@@ -328,9 +344,19 @@ let rec string_of_winstruction =
       sprintf "Wappterm(f=accu, args=[fp[%d]...fp[%d]], oldnum=%d)"
               (-arg.depth) (-arg.depth+arg.numargs-1)
               arg.oldnumargs
+  | Wappterm_args arg ->
+      sprintf "Wappterm_args(f=%s, args=[%s], oldnum=%d)"
+              (string_of_store arg.funsrc)
+              (List.map string_of_store arg.argsrc |> String.concat ", ")
+              arg.oldnumargs
   | Wappterm_direct arg ->
       sprintf "Wappterm(f=letrec%d, args=[fp[%d]...fp[%d]], oldnum=%d)"
               arg.funlabel (-arg.depth) (-arg.depth+arg.numargs-1)
+              arg.oldnumargs
+  | Wappterm_direct_args arg ->
+      sprintf "Wappterm_args(f=letrec%d, args=[%s], oldnum=%d)"
+              arg.funlabel
+              (List.map string_of_store arg.argsrc |> String.concat ", ")
               arg.oldnumargs
   | Wreturn arg ->
       sprintf "Wreturn(%s)" (string_of_store arg.src)
