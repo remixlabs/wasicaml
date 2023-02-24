@@ -13,7 +13,7 @@ jobs:
     - run: ./configure
     - run: make
     - run: ulimit -s 16384 && make test
-    - run: make test-tail-calls
+    - run: ulimit -s 16384 && make test-tail-calls
     - run: ci/ensure-gcloud-creds
     - run: ci/upload_web
 
