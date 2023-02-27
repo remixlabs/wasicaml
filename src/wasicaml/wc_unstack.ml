@@ -2,6 +2,49 @@
    This code is free software, see the file LICENSE for details.
  *)
 
+(* SPILLING:
+
+   - camlstack: must also represent the args (so that args can go into
+     locals)
+
+     new invariant: List.length camlstack = camldepth + arity
+
+     * arity should be set early (now easy as we extract Wgrab)
+
+   - create a new type of locals with RValue representation
+     names: "arg%d" and "pos%d". "arg%d" is the local for the
+     n-th argument. "pos%d" is the local for the n-th pushed value.
+
+     store: LocalPos, LocalArg
+
+     The invariants for camlstack also apply to the corresponding locals.
+
+      * state: add a new field num_val_locals
+
+   - stack descriptor
+      * enhance it
+      * ensure that all Winstruction have the stack descriptor
+      * do the spilling in setup_for_gc/restore_after_gc
+      * ensure we know the max stack size
+
+   - function calls:
+      * enhance "straighten" so that arg and val locals are written to
+        the stack.
+
+        EXPERIMENT: use spilling instead
+
+   - new function: limit_locals
+      * if there are more than N locals, stash some locals away so
+        we only have N ones
+      * if avoid_locals: N = 0
+
+   - branches
+
+   - Arith operation + PUSH:
+      * avoid the accu, but put the result directly into the right
+        local
+ *)
+
 open Printf
 open Wc_types
 open Wc_instruct
