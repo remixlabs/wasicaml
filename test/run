@@ -39,14 +39,24 @@ run_test() {
     printf "Test %s: results OK\n" "$t"
 }
 
-if [ "$1" = "-deadbeef" ]; then
-    args="$args -enable-deadbeef-check"
-    shift
-fi
-if [ "$1" = "-ocamlopt" ]; then
-    with_ocamlopt=1
-    shift
-fi
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -deadbeef)
+	    args="$args -enable-deadbeef-check"
+            shift ;;
+	-tail-call)
+	    args="$args -enable-tail-call"
+            shift ;;
+	-multivalue)
+	    args="$args -enable-multivalue"
+	    shift ;;
+	-ocamlopt)
+	    with_ocamlopt=1
+	    shift ;;
+	*)
+	    break ;;
+    esac
+done
 
 bad=0
 if [ $# -eq 0 ]; then

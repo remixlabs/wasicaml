@@ -76,6 +76,9 @@ type lpad =  (* local pad *)
     (* knowledge about the environment: this function is at position
        func_offset in the environment (only when environment <> [])
      *)
+
+    enable_returncall : bool;
+    (* whether we are allowed to emit tail calls *)
   }
 
 let real_accu =
@@ -92,7 +95,7 @@ let empty_state =
     arity = 1;
   }
 
-let empty_lpad() =
+let empty_lpad ~enable_returncall () =
   { locals = Hashtbl.create 7;
     avoid_locals = false;
     loops = ISet.empty;
@@ -101,6 +104,7 @@ let empty_lpad() =
     globals_table = Hashtbl.create 1;
     environment = [| |];
     func_offset = 0;
+    enable_returncall;
   }
 
 let new_local lpad repr =
@@ -870,7 +874,9 @@ let transl_instr lpad state instr =
         let direct_opt = extract_directly_callable_function state.accu in
         let state =
           match direct_opt with
-            | Some _ -> { state with accu = real_accu }
+            | Some _ ->
+                (* because Wapply_direct loads the function into accu: *)
+                { state with accu = real_accu }
             | None -> state in
         let state, instrs_str = straighten_all lpad state in
         let cd = state.camldepth in
@@ -901,7 +907,9 @@ let transl_instr lpad state instr =
         let direct_opt = extract_directly_callable_function state.accu in
         let state =
           match direct_opt with
-            | Some _ -> { state with accu = real_accu }
+            | Some _ ->
+                (* because Wapply_direct loads the function into accu: *)
+                { state with accu = real_accu }
             | None -> state in
         let state, instrs_str = straighten_all lpad state in
         let depth = state.camldepth in
@@ -916,18 +924,76 @@ let transl_instr lpad state instr =
           @ [ instr_apply ] in
         let state = state |> popn_camlstack (num+3) in
         (state, instrs)
+    | Kappterm(num, slots) when num <= 10 && lpad.enable_returncall ->
+        (* Here we pick the args of the function call up where they are
+           (register, accu, stack) - in contrast to Wappterm which assumes
+           that the args are already on the stack. We only have to ensure
+           that boxed numbers are already in the boxed representaion and
+           not in registers (allocation is not possible when Wappterm_args
+           is executed because the stack is not proper).
+         *)
+        let direct_opt =
+          extract_directly_callable_function state.accu in
+        let camlstack = Array.of_list state.camlstack in
+        let alloc_positions =
+          enum 0 num
+          |> List.filter (fun k ->
+                 camlstack.(k) |> repr_of_store |> repr_needs_alloc
+               )
+          |> List.map (fun k -> k - state.camldepth) in
+        let state, instrs_stack =
+          straighten_stack_multi lpad state alloc_positions in
+        let instr_appterm =
+          match direct_opt with
+            | Some (global, path, funlabel, _) ->
+                Wappterm_direct_args { global; path; funlabel;
+                                       funsrc=state.accu;
+                                       argsrc=list_prefix num state.camlstack;
+                                       oldnumargs=(slots - state.camldepth);
+                                       depth=state.camldepth
+                                     }
+            | None ->
+                Wappterm_args { funsrc=state.accu;
+                                argsrc=list_prefix num state.camlstack;
+                                oldnumargs=(slots - state.camldepth);
+                                depth=state.camldepth
+                              } in
+        let instrs =
+          instrs_stack @ [ instr_appterm ] in
+        (state, instrs)
     | Kappterm(num, slots) ->
+        let direct_opt =
+          extract_directly_callable_function state.accu
+          |> (function
+              | Some info when lpad.enable_returncall -> Some info
+              | Some _ -> None
+              | None -> None
+             ) in
+        let state =
+          match direct_opt with
+            | Some _ ->
+                (* because Wappterm_direct loads the function into accu: *)
+                { state with accu = real_accu }
+            | None -> state in
         let state, instrs_accu =
           straighten_accu lpad state in
         let state, instrs_stack =
           straighten_stack_multi lpad state (enum (-state.camldepth) num) in
+        let instr_appterm =
+          match direct_opt with
+            | Some (global, path, funlabel, _) ->
+                Wappterm_direct { global; path; funlabel; numargs=num;
+                                  oldnumargs=(slots - state.camldepth);
+                                  depth=state.camldepth
+                                }
+            | None ->
+                Wappterm { numargs=num; oldnumargs=(slots - state.camldepth);
+                           depth=state.camldepth
+                         } in
         let instrs =
           instrs_accu
           @ instrs_stack
-          @ [ Wappterm { numargs=num; oldnumargs=(slots - state.camldepth);
-                         depth=state.camldepth
-                       }
-            ] in
+          @ [ instr_appterm ] in
         (state, instrs)
     | Kreturn slots ->
         assert(state.camldepth + state.arity = slots);

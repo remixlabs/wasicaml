@@ -113,6 +113,11 @@ let write_func_body f func_name locals_table sexpl =
                         func_name (string_of_sexp (L sexpl))) in
     let indent = indentation (4*depth) in
     match sexpl with
+      | BR :: rest ->
+          next labels depth rest
+      | C comment:: rest ->
+          fprintf f "\t%s# %s\n" indent comment;
+          next labels depth rest
       | L [ K ("local.get"|"local.set"|"local.tee" as instr);
             ID name
           ] :: rest ->
@@ -170,12 +175,12 @@ let write_func_body f func_name locals_table sexpl =
               branches in
           fprintf f "\t%s%s %s   # %s\n" indent instr opt_curlies all_lab_names;
           next labels depth rest
-      | L (K "call_indirect" :: N (I32 table) :: inner) :: rest ->
+      | L (K ("call_indirect"|"return_call_indirect" as instr) :: N (I32 table) :: inner) :: rest ->
           let ty, inner2 = extract_func_type inner in
           if inner2 <> [] then
             failwith (sprintf "bad code - function %s - %s"
                               func_name (string_of_sexp (L sexpl)));
-          fprintf f "\t%scall_indirect %s\n" indent ty;
+          fprintf f "\t%s%s %s\n" indent instr ty;
           next labels depth rest
       | L (K "block" :: inner) :: rest ->
           let label, inner2 = extract_label inner in
@@ -305,11 +310,18 @@ let write_file f filename sexpl =
 
   let rec func_1 func_name exp_name_opt params results locals sexpl =
     match sexpl with
+      | BR :: rest ->
+          func_1 func_name exp_name_opt params results locals rest
+      | C comment :: rest ->
+          fprintf f "\t# %s\n" comment;
+          func_1 func_name exp_name_opt params results locals rest
       | L [ K "export"; S n ] :: rest ->
           func_1 func_name (Some n) params results locals rest
       | L [ K "param"; ID n; K ty ] :: rest ->
           func_1 func_name exp_name_opt ((n,ty)::params) results locals rest
-      | L [ K "result"; K ty ] :: rest ->
+      | ( L [ K "result"; K ty ] :: rest
+          | L [ K "result"; C _; K ty ] :: rest
+        ) ->
           func_1 func_name exp_name_opt params (ty::results) locals rest
       | L [ K "local"; ID n; K ty ] :: rest ->
           func_1 func_name exp_name_opt params results ((n,ty)::locals) rest
@@ -341,8 +353,13 @@ let write_file f filename sexpl =
                (List.rev locals |> Array.of_list));
           write_func_body f func_name locals_table body;
           fprintf f "\tend_function\n" in
-  let func func_name sexpl =
+  let rec func func_name sexpl =
     match sexpl with
+      | BR :: rest ->
+          func func_name rest
+      | C comment :: rest ->
+          fprintf f "\t# %s\n" comment;
+          func func_name rest
       | K "export" :: S obj_name :: rest ->
           func_1 func_name (Some obj_name) [] [] [] rest
       | _ ->
@@ -369,7 +386,7 @@ let write_file f filename sexpl =
       | _ ->
           func_type_1 func_name [] [] sexpl in
 
-  let sexpl1 = remove_stuff sexpl in
+  let sexpl_rm = remove_stuff sexpl in
 
   fprintf f "\t.text\n";
   fprintf f "\t.file %S\n" filename;
@@ -403,10 +420,14 @@ let write_file f filename sexpl =
         | _ ->
             ()
     )
-    sexpl1;
+    sexpl_rm;
   List.iter
     (fun mod_sexp ->
       match mod_sexp with
+        | BR ->
+            ()
+        | C comment ->
+            fprintf f "\t# %s\n" comment
         | L [ K "import"; _; _; _ ] ->
             ()
         | L (K ("memory" | "table") :: _) ->
@@ -434,4 +455,4 @@ let write_file f filename sexpl =
             failwith ("write_file: bad definition: " ^
                         string_of_sexp mod_sexp)
     )
-    sexpl1
+    sexpl

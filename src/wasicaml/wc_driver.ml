@@ -77,6 +77,9 @@ let main() =
       "-enable-multivalue", Arg.Set Wc_emit.enable_multireturn,
       "   enable Wasm feature: multi-value returns (EXPERIMENTAL)";
 
+      "-enable-tail-call", Arg.Set Wc_emit.enable_returncall,
+      "   enable Wasm feature: tail calls (EXPERIMENTAL)";
+
       "-enable-deadbeef-check", Arg.Set Wc_emit.enable_deadbeef_check,
       "   enable stack initialization check (debug)";
     ]
@@ -159,8 +162,17 @@ let main() =
 
   if not !quiet then
     eprintf "* assemble...\n%!";
+  let ccopts =
+    ( if !Wc_emit.enable_returncall then
+        [ "-mtail-call" ]
+      else
+        []
+    )
+    |> String.concat " " in
   let cmd =
-    sprintf "%s/bin/wasi_cc -o %s -c %s" prefix (Filename.quote (inp ^ ".o")) (Filename.quote (inp ^ ".s")) in
+    sprintf "%s/bin/wasi_cc %s -o %s -c %s"
+            prefix ccopts
+            (Filename.quote (inp ^ ".o")) (Filename.quote (inp ^ ".s")) in
   if not !quiet then
     eprintf "+ %s\n%!" cmd;
   let code = Sys.command cmd in
@@ -170,8 +182,8 @@ let main() =
   if not !quiet then
     eprintf "* link...\n%!";
   let cmd =
-    sprintf "%s/bin/wasi_cc -Wl,-z,stack-size=%d -o %s %s/lib/initruntime.o %s -L %s/lib/ocaml %s -lcamlrun"
-            prefix !cstack !out prefix (inp ^ ".o") prefix
+    sprintf "%s/bin/wasi_cc -Wl,-z,stack-size=%d %s -o %s %s/lib/initruntime.o %s -L %s/lib/ocaml %s -lcamlrun"
+            prefix !cstack ccopts !out prefix (inp ^ ".o") prefix
             (List.map Filename.quote !cclib |> String.concat " ") in
   if not !quiet then
     eprintf "+ %s\n%!" cmd;
