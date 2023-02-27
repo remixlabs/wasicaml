@@ -162,4 +162,4 @@ test-wasicaml:
 	cd test && make
 
 test-tail-calls:
-	cd test && ./run -tail-call
+	cd test && ./run -tail-call -multivalue

@@ -69,13 +69,15 @@ type fpad =  (* function pad *)
     mutable fpad_scope : Wc_control.cfg_scope;
     mutable maxdepth : int;
     mutable need_appterm_common : bool;
-    mutable need_startover : bool;
+    mutable need_startover : bool;   (* back to subfunction selection *)
+    mutable need_selfrecurse : bool; (* self-recursion - only when tailcalls are enabled! *)
     mutable need_return : bool;
     mutable need_panic : bool;
     mutable need_tmp1_i32 : bool;
     mutable need_tmp2_i32 : bool;
     mutable need_tmp1_f64 : bool;
     mutable need_xalloc : bool;
+    mutable disallow_grab : bool;   (* Wgrab is only allowed at the beginning *)
   }
 
 (* Stack layout of a function with N arguments:
@@ -165,12 +167,14 @@ let empty_fpad() =
     maxdepth = 0;
     need_appterm_common = false;
     need_startover = false;
+    need_selfrecurse = false;
     need_return = false;
     need_panic = false;
     need_tmp1_i32 = false;
     need_tmp2_i32 = false;
     need_tmp1_f64 = false;
     need_xalloc = false;
+    disallow_grab = false;
   }
 
 let returncall name =
@@ -2490,15 +2494,24 @@ let appterm_direct gpad fpad funlabel numargs oldnumargs depth =
   assert(!enable_returncall);
   let _, letrec_label, _ = lookup_label gpad funlabel in
   let letrec_name = Hashtbl.find gpad.letrec_name letrec_label in
+  let goto_selfrecurse =
+    letrec_label = fpad.fpad_letrec_label
+    && numargs = oldnumargs in
   let sexpl =
     call_reinit_frame gpad fpad numargs oldnumargs depth
     @ pop_to_local "fp"   (* no need to set bp here *)
     @ (push_local "accu" |> pop_to_field "envptr" 0)
-    @ appterm_push_params numargs
-    @ [ L [ K "return_call";
-            ID letrec_name
-          ]
-      ] in
+    @ (if goto_selfrecurse then
+         [ L [ K "br"; ID "selfrecurse" ] ]
+       else
+         appterm_push_params numargs
+         @ [ L [ K "return_call";
+                 ID letrec_name
+               ]
+           ]
+      ) in
+  if goto_selfrecurse then
+    fpad.need_selfrecurse <- true;
   sexpl
 
 let appterm gpad fpad funlabel_opt numargs oldnumargs depth =
@@ -2515,6 +2528,7 @@ let appterm_args gpad fpad funlabel_opt funsrc argsrc oldnumargs depth =
   (* Wc_unstack must not emit Wappterm_args when tail calls are
      unavailable *)
   assert(!enable_returncall);
+  let newnumargs = List.length argsrc in
   (* save argsrc in local variables *)
   let arg_locals =
     List.map (fun src -> new_local fpad (repr_of_store src)) argsrc in
@@ -2531,7 +2545,6 @@ let appterm_args gpad fpad funlabel_opt funsrc argsrc oldnumargs depth =
   let accu_instrs =
     copy fpad funsrc (RealAccu { no_function = false }) None in
   (* fp = fp + old_num_args - new_num_args *)
-  let newnumargs = List.length argsrc in
   let fp_delta =
     oldnumargs - newnumargs in
   let fp_instrs =
@@ -2555,19 +2568,26 @@ let appterm_args gpad fpad funlabel_opt funsrc argsrc oldnumargs depth =
     |> List.flatten in
   let envptr_instrs =
     (push_local "accu" |> pop_to_field "envptr" 0) in
-  let params_instrs =
-    appterm_push_params newnumargs in
   let call_instrs =
     match funlabel_opt with
       | Some funlabel ->
           let _, letrec_label, _ = lookup_label gpad funlabel in
           let letrec_name = Hashtbl.find gpad.letrec_name letrec_label in
-          [ L [ K "return_call";
-                ID letrec_name
+          let goto_selfrecurse =
+            letrec_label = fpad.fpad_letrec_label
+            && newnumargs = oldnumargs in
+          if goto_selfrecurse then (
+            fpad.need_selfrecurse <- true;
+            [ L [ K "br"; ID "selfrecurse" ] ]
+          ) else
+            appterm_push_params newnumargs
+            @ [ L [ K "return_call";
+                    ID letrec_name
+                  ]
               ]
-          ]
       | None ->
-          push_field "accu" 0
+          appterm_push_params newnumargs
+          @ push_field "accu" 0
           @ [ L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
               L [ K "i32.shr_u" ];             (* which function to call *)
             ]
@@ -2585,7 +2605,6 @@ let appterm_args gpad fpad funlabel_opt funsrc argsrc oldnumargs depth =
   @ fp_instrs
   @ arg_instrs2
   @ envptr_instrs
-  @ params_instrs
   @ call_instrs
 
 let trap gpad fpad trylabel catchlabel depth =
@@ -2814,6 +2833,15 @@ let rec emit_instr gpad fpad instr =
           @ [ L [ K "br"; ID "return" ]]
         )
     | Wgrab arg ->
+        if fpad.disallow_grab then (
+          (* disallow_grab is set when there shouldn't be (another) Wgrab
+             after some structural analysis/transform
+           *)
+          let letrec_name =
+            Hashtbl.find gpad.letrec_name fpad.fpad_letrec_label in
+          eprintf "[DEBUG] function: %s\n%!" letrec_name;
+          assert false;
+        );
         grab fpad arg.numargs
     | Wclosurerec arg ->
         closurerec gpad fpad arg.descr arg.src arg.dest
@@ -2862,6 +2890,50 @@ and emit_instrs gpad fpad instrs =
     instrs
   |> List.rev
 
+let rec extract_grab instrs =
+  (* Extract the first Wgrab, optionally wrapped in a cascade of Wblock *)
+  match instrs with
+    | Wgrab _ as grab :: rest ->
+        (rest, Some grab)
+    | Wcomment _ as i :: rest ->
+        let rest_after_extract, grab_opt = extract_grab rest in
+        (i :: rest_after_extract, grab_opt)
+    | Wblock arg :: rest ->
+        ( match arg.label with
+            | Label _ ->
+                let body_after_extract, grab_opt = extract_grab arg.body in
+                (Wblock { arg with body = body_after_extract } :: rest,
+                 grab_opt
+                )
+            | Loop _ ->
+                (instrs, None)
+        )
+    | _ ->
+        (instrs, None)
+
+let emit_fblock_instrs gpad fpad instrs =
+  fpad.disallow_grab <- false;
+  let rest, grab_opt = extract_grab instrs in
+  match grab_opt with
+    | Some grab ->
+        let code_grab = emit_instrs gpad fpad [ grab ] in
+        fpad.disallow_grab <- true;
+        let code_rest = emit_instrs gpad fpad rest in
+        if fpad.need_selfrecurse then (
+          assert(!enable_returncall);
+          code_grab
+            @ [ L ( [ K "loop"; ID "selfrecurse"; BR ] @ code_rest) ]
+        ) else
+          code_grab @ code_rest
+    | None ->
+        fpad.disallow_grab <- true;
+        let code = emit_instrs gpad fpad instrs in
+        if fpad.need_selfrecurse then (
+          assert(!enable_returncall);
+          [ L ( [ K "loop"; ID "selfrecurse"; BR ] @ code) ]
+        ) else
+          code
+
 let emit_fblock gpad fpad fblock =
   let maxdepth = Wc_tracestack.max_stack_depth_of_fblock fblock in
   (* make maxdepth a bit larger than stricly necessary to completely avoid
@@ -2869,7 +2941,7 @@ let emit_fblock gpad fpad fblock =
   fpad.maxdepth <- if maxdepth > 0 then maxdepth + 2 else 0;
   let instrs =
     Wc_unstack.transl_fblock fpad.lpad fblock
-    |> emit_instrs gpad fpad in
+    |> emit_fblock_instrs gpad fpad in
   set_bp fpad
   @ (if !enable_deadbeef_check && fpad.maxdepth > 0 then
        [ L [ K "local.get"; ID "bp" ];
