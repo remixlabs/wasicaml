@@ -152,6 +152,8 @@ function bufferFindElements(buf, start, elements) {
     // argv[1]: the path of this script
     // argv[2]: the file with the wasm code
     // argv[3]...: the args to pass to the sandbox
+    // wasi-js uses console.log to print warnings, and this goes to stdout.
+    // This makes the warnings go to stderr:
     console.log = console.error;
     try {
         const wasm_code_filename = process.argv[2];
