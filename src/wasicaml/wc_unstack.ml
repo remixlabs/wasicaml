@@ -174,12 +174,11 @@ let stack_descr state =
     )
     state.camlstack;
   let uninit = ref [] in
-  Array.iteri
-    (fun i used ->
-      if not used && i >= cd - !rd then
-        uninit := (-cd+i) :: !uninit
-    )
-    stack;
+  for i = Array.length stack - 1 downto 0 do
+    let used = stack.(i) in
+    if not used && i >= cd - !rd then
+      uninit := (-cd+i) :: !uninit;
+  done;
   let stack_save_accu =
     state.realaccu <> ISet.empty ||
       ( match state.accu with RealAccu _ -> true | _ -> false) in
@@ -489,6 +488,18 @@ let straighten_all lpad state =
   assert(accu_is_realaccu_or_invalid state && state.realaccu = ISet.empty);
   let state, instrs2 = straighten_stack lpad state in
   (state, instrs1 @ instrs2)
+
+let spill_for_apply lpad state =
+  (* TODO: once there are RValue locals, these need to be moved to the
+     stack; and we need an "unspill" counterpart *)
+  let sdescr = stack_descr state in
+  let instrs =
+    List.map
+      (fun pos ->
+        Wcopy { src = Const 0; dest = RealStack pos }
+      )
+      sdescr.stack_uninit in
+  (instrs, sdescr.stack_depth)
 
 let localize_accu lpad state repr =
   match state.accu with
@@ -912,8 +923,13 @@ let transl_instr lpad state instr =
         let src = state.accu in
         (state, instrs_str @ [ Wswitch{labels_int; labels_blk; src} ])
     | Kapply num when num <= 3 ->
-        (* TODO: the args don't need to be straightened - they are duplicated
-           anyway *)
+        (* In the num <= 3 case, there is no reserved stack position for
+           saving env yet. Because of this, we cannot use "straighten"
+           to put the args onto the stack - they would end up on the
+           wrong positions. Instead, copy the args with crafted
+           Wcopy instructions to the right positions, and leave a gap
+           of one position for env.
+         *)
         let direct_opt = extract_directly_callable_function state.accu in
         let state =
           match direct_opt with
@@ -921,15 +937,17 @@ let transl_instr lpad state instr =
                 (* because Wapply_direct loads the function into accu: *)
                 { state with accu = real_accu }
             | None -> state in
-        let state, instrs_str = straighten_all lpad state in
-        let cd = state.camldepth in
+        let state, instrs_accu = straighten_accu lpad state in
+        let instrs_spill, actual_depth = spill_for_apply lpad state in
+        let delta = 1 in  (* make room for one additional position (env) *)
         let instrs_move =
           enum 0 num
           |> List.map
                (fun k ->
-                 Wcopy { src=RealStack(-cd+k); dest=RealStack(-cd+k-3) }
+                 let src = List.nth state.camlstack k in
+                 Wcopy { src; dest=RealStack(-actual_depth - num + k - delta) }
                ) in
-        let depth = cd+3 in
+        let depth = actual_depth+num+delta in
         let instr_apply =
           match direct_opt with
             | Some (global, path, funlabel, _) ->
@@ -937,16 +955,26 @@ let transl_instr lpad state instr =
             | None ->
                 Wapply { numargs=num; depth } in
         let instrs =
-          instrs_str
+          instrs_accu
+          @ instrs_spill
           @ instrs_move
-          @ [ Wcopy { src=Const 0; dest=RealStack(-cd+num-3) };
-              Wcopy { src=Const 0; dest=RealStack(-cd+num-2) };
-              Wcopy { src=Const 0; dest=RealStack(-cd+num-1) };
+          @ [ (* Wcopy { src=Const 0; dest=RealStack(-actual_depth-1) };
+                 -- the position for env - it is initialized by Wapply anyway
+               *)
               instr_apply
             ] in
         let state = state |> popn_camlstack num in
         (state, instrs)
     | Kapply num ->
+        (* In the num > 3 case, there was already a Kpush_retaddr that
+           made space for 3 additional values on the stack. Note that we
+           don't need 3 values but just one, so the other 2 positions are
+           unused. - We can use "straighten" here to ensure that the
+           args go to right stack positions. - Also note that the same
+           code as far num <= 3 would work as well, though I don't expect
+           that it saves instructions. (This might change when we pass
+           args to functions via wasm parameters, and not via the stack.)
+         *)
         let direct_opt = extract_directly_callable_function state.accu in
         let state =
           match direct_opt with

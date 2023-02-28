@@ -87,8 +87,12 @@ type label = Label of int | Loop of int
 
 type stack_descriptor =
   { stack_uninit : int list;
+    (* List of uninitialized stack positions (in the range -stack_depth to -1),
+       in ascending order *)
     stack_depth : int;
+    (* Depth of the stack - ignoring the uninitialized block at the top *)
     stack_save_accu : bool;
+    (* Whether the accu must be saved on the stack when a GC is possible *)
   }
 
 type unop =
