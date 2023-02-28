@@ -15,12 +15,23 @@ open Wc_instruct
    param 3: code pointer (overriding the one in the closure)
    param 4: fp
 
+   So far, the function args are passed via the bytecode stack.
+
    The envptr is a pointer to the stack location of the environment (env).
    This pointer is created when a function is called - the bytecode
-   interpreter uses 3 stack locations for PC, saved env, and extra_args,
-   but we use these 3 locations differently. PC and extra_args are set to
-   zero, and the location for env stores the environment of the function
-   being called (instead of the environment of the calling function).
+   interpreter reserves 3 stack locations for PC, saved env, and extra_args.
+   We also reserve stack locations upon function call but differently:
+    - need only one location and not three
+    - the one location stores the env of the called function, not the
+      env of the calling function
+
+   There are also two ways of invoking functions. If there are up to 3
+   args, the bytecode only includes the instructions to push the args
+   onto the stack, followed by Kapply. It is then the task of Kapply to
+   make room for the saved values (as explained). If, however, there are
+   more than 3 args, the bytecode includes a Kpush_retaddr instruction
+   which reserves 3 positions on the stack in advance. Although we only need
+   one of these, there is no fixup that would eliminate the other two.
  *)
 
 
@@ -2318,7 +2329,7 @@ let throw fpad =
 let apply_direct gpad fpad funlabel numargs depth =
   let _, letrec_label, _ = lookup_label gpad funlabel in
   let letrec_name = Hashtbl.find gpad.letrec_name letrec_label in
-  let env_pos = (-depth + numargs + 1) in
+  let env_pos = (-depth + numargs) in
   ( push_local "accu"
     |> pop_to_stack fpad env_pos
   )
@@ -2340,7 +2351,7 @@ let apply_direct gpad fpad funlabel numargs depth =
     ]
 
 let apply fpad numargs depth =
-  let env_pos = (-depth + numargs + 1) in
+  let env_pos = (-depth + numargs) in
   let codeptr = req_tmp1_i32 fpad in
   ( push_local "accu"
     |> pop_to_stack fpad env_pos
