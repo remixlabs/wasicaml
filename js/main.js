@@ -152,6 +152,7 @@ function bufferFindElements(buf, start, elements) {
     // argv[1]: the path of this script
     // argv[2]: the file with the wasm code
     // argv[3]...: the args to pass to the sandbox
+    console.log = console.error;
     try {
         const wasm_code_filename = process.argv[2];
         const args = process.argv.slice(3);
