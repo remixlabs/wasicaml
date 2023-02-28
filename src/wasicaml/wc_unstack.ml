@@ -880,13 +880,14 @@ let transl_instr lpad state instr =
             | None -> state in
         let state, instrs_str = straighten_all lpad state in
         let cd = state.camldepth in
+        let delta = 1 in
         let instrs_move =
           enum 0 num
           |> List.map
                (fun k ->
-                 Wcopy { src=RealStack(-cd+k); dest=RealStack(-cd+k-3) }
+                 Wcopy { src=RealStack(-cd+k); dest=RealStack(-cd+k-delta) }
                ) in
-        let depth = cd+3 in
+        let depth = cd+delta in
         let instr_apply =
           match direct_opt with
             | Some (global, path, funlabel, _) ->
@@ -896,8 +897,9 @@ let transl_instr lpad state instr =
         let instrs =
           instrs_str
           @ instrs_move
-          @ [ Wcopy { src=Const 0; dest=RealStack(-cd+num-3) };
+          @ [ (* Wcopy { src=Const 0; dest=RealStack(-cd+num-3) };
               Wcopy { src=Const 0; dest=RealStack(-cd+num-2) };
+               *)
               Wcopy { src=Const 0; dest=RealStack(-cd+num-1) };
               instr_apply
             ] in

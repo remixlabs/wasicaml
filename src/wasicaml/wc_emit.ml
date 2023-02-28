@@ -2318,7 +2318,7 @@ let throw fpad =
 let apply_direct gpad fpad funlabel numargs depth =
   let _, letrec_label, _ = lookup_label gpad funlabel in
   let letrec_name = Hashtbl.find gpad.letrec_name letrec_label in
-  let env_pos = (-depth + numargs + 1) in
+  let env_pos = (-depth + numargs) in
   ( push_local "accu"
     |> pop_to_stack fpad env_pos
   )
@@ -2340,7 +2340,7 @@ let apply_direct gpad fpad funlabel numargs depth =
     ]
 
 let apply fpad numargs depth =
-  let env_pos = (-depth + numargs + 1) in
+  let env_pos = (-depth + numargs) in
   let codeptr = req_tmp1_i32 fpad in
   ( push_local "accu"
     |> pop_to_stack fpad env_pos
