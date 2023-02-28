@@ -880,6 +880,13 @@ let transl_instr lpad state instr =
         let src = state.accu in
         (state, instrs_str @ [ Wswitch{labels_int; labels_blk; src} ])
     | Kapply num when num <= 3 ->
+        (* In the num <= 3 case, there is no reserved stack position for
+           saving env yet. Because of this, we cannot use "straighten"
+           to put the args onto the stack - they would end up on the
+           wrong positions. Instead, copy the args with crafted
+           Wcopy instructions to the right positions, and leave a gap
+           of one position for env.
+         *)
         let direct_opt = extract_directly_callable_function state.accu in
         let state =
           match direct_opt with
@@ -889,7 +896,7 @@ let transl_instr lpad state instr =
             | None -> state in
         let state, instrs_accu = straighten_accu lpad state in
         let instrs_spill, actual_depth = spill_for_apply lpad state in
-        let delta = 1 in
+        let delta = 1 in  (* make room for one additional position (env) *)
         let instrs_move =
           enum 0 num
           |> List.map
@@ -916,8 +923,15 @@ let transl_instr lpad state instr =
         let state = state |> popn_camlstack num in
         (state, instrs)
     | Kapply num ->
-        (* TODO: the args don't need to be straightened - they are duplicated
-           anyway *)
+        (* In the num > 3 case, there was already a Kpush_retaddr that
+           made space for 3 additional values on the stack. Note that we
+           don't need 3 values but just one, so the other 2 positions are
+           unused. - We can use "straighten" here to ensure that the
+           args go to right stack positions. - Also note that the same
+           code as far num <= 3 would work as well, though I don't expect
+           that it saves instructions. (This might change when we pass
+           args to functions via wasm parameters, and not via the stack.)
+         *)
         let direct_opt = extract_directly_callable_function state.accu in
         let state =
           match direct_opt with
