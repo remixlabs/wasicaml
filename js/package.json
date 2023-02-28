@@ -1,5 +1,5 @@
 {
   "dependencies": {
-    "@wasmer/wasi": "^0.12.0"
+    "wasi-js": "^1.7.3"
   }
 }
