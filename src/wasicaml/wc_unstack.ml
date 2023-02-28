@@ -908,7 +908,9 @@ let transl_instr lpad state instr =
           instrs_accu
           @ instrs_spill
           @ instrs_move
-          @ [ Wcopy { src=Const 0; dest=RealStack(-actual_depth-1) };
+          @ [ (* Wcopy { src=Const 0; dest=RealStack(-actual_depth-1) };
+                 -- the position for env - it is initialized by Wapply anyway
+               *)
               instr_apply
             ] in
         let state = state |> popn_camlstack num in
