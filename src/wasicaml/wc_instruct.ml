@@ -179,7 +179,7 @@ type winstruction =
                               oldnumargs:int; depth:int }
     (* Wappterm_direct_args is only used when tail-calls are enabled *)
   | Wreturn of { src:store; arity:int }
-  | Wgrab of { numargs:int }
+  | Wgrab of { arity:int }
   | Wclosurerec of { src:store list; dest:(store * int) list;
                      descr:stack_descriptor (* also "accu" can be used *)
                    }
@@ -365,7 +365,7 @@ let rec string_of_winstruction =
   | Wreturn arg ->
       sprintf "Wreturn(%s)" (string_of_store arg.src)
   | Wgrab arg ->
-      sprintf "Wgrab(num=%d)" arg.numargs
+      sprintf "Wgrab(arity=%d)" arg.arity
   | Wclosurerec arg ->
       sprintf "Wclosurerec(env=[%s], dest=[%s])"
               (List.map string_of_store arg.src |> String.concat ", ")

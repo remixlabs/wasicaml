@@ -167,9 +167,15 @@ let vtype repr =
     | RFloat ->
         TF64
 
-let empty_fpad() =
-  { lpad = Wc_unstack.empty_lpad ~enable_returncall:!enable_returncall ();
-    fpad_letrec_label = Main 0;
+let empty_fpad letrec_label =
+  let numeric_label =
+    match letrec_label with
+      | Func k -> k
+      | Main k -> k in
+  { lpad = Wc_unstack.empty_lpad
+             ~enable_returncall:!enable_returncall
+             numeric_label;
+    fpad_letrec_label = letrec_label;
     fpad_scope = { cfg_letrec_label = None;
                    cfg_func_label = 0;
                    cfg_try_labels = [];
@@ -730,7 +736,7 @@ let grab_helper gpad =
   (* generates a helper function:
      $grab_helper(extra_args, codeptr, fp)
    *)
-  let fpad = empty_fpad() in
+  let fpad = empty_fpad (Main 0) in
   let descr = empty_descr in
   assert(descr.stack_save_accu = false);
 
@@ -2853,7 +2859,7 @@ let rec emit_instr gpad fpad instr =
           eprintf "[DEBUG] function: %s\n%!" letrec_name;
           assert false;
         );
-        grab fpad arg.numargs
+        grab fpad (arg.arity-1)
     | Wclosurerec arg ->
         closurerec gpad fpad arg.descr arg.src arg.dest
     | Wraise arg ->
@@ -2902,23 +2908,10 @@ and emit_instrs gpad fpad instrs =
   |> List.rev
 
 let rec extract_grab instrs =
-  (* Extract the first Wgrab, optionally wrapped in a cascade of Wblock *)
+  (* Wc_unstack puts the Wgrab always in front *)
   match instrs with
     | Wgrab _ as grab :: rest ->
         (rest, Some grab)
-    | Wcomment _ as i :: rest ->
-        let rest_after_extract, grab_opt = extract_grab rest in
-        (i :: rest_after_extract, grab_opt)
-    | Wblock arg :: rest ->
-        ( match arg.label with
-            | Label _ ->
-                let body_after_extract, grab_opt = extract_grab arg.body in
-                (Wblock { arg with body = body_after_extract } :: rest,
-                 grab_opt
-                )
-            | Loop _ ->
-                (instrs, None)
-        )
     | _ ->
         (instrs, None)
 
@@ -3089,7 +3082,7 @@ let init_lpad_for_subfunc gpad fpad func_label =
   fpad.lpad.func_offset <- func_offset
 
 let generate_function scode gpad letrec_label func_name subfunc_labels export_flag =
-  let fpad = { (empty_fpad()) with fpad_letrec_label = letrec_label } in
+  let fpad = empty_fpad letrec_label in
   Hashtbl.add fpad.lpad.locals "accu" RValue;
   Hashtbl.add fpad.lpad.locals "bp" RValue;
   fpad.lpad.avoid_locals <- export_flag; (* avoid local vars in the long main function *)

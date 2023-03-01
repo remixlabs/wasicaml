@@ -53,7 +53,8 @@ open Wc_util
 type state =
   { camlstack : store list;
     (* where the contents are stored that are supposed to be on the
-       OCaml stack - in top to bottom order.
+       OCaml stack - in top to bottom order. This also includes the
+       args of the function at the very end.
 
        If an OCaml stack value is stored in the real stack, it is only
        allowed to store it at its original position or at a lower (newer)
@@ -64,9 +65,11 @@ type state =
        there must be no other value stored at the original position (so that we
        can always copy the value to its original position without first
        having to move some other value away).
+
+       List.length camlstack = camldepth + arity
      *)
     camldepth : int;
-    (* = List.length camlstack *)
+    (* the length of the stack except function arguments *)
     accu : store;
     (* where the accu is stored *)
     realaccu : ISet.t;
@@ -75,7 +78,7 @@ type state =
        logical accu value.
      *)
     arity : int;
-    (* number of args pf the current function - first set after Kgrab *)
+    (* number of args pf the current function *)
   }
 
 (* IDEA: there is sometimes code setting the accu, but then the accu
@@ -88,7 +91,9 @@ type state =
  *)
 
 type lpad =  (* local pad *)
-  { locals : (string, repr) Hashtbl.t;
+  { letrec_label : int;
+
+    locals : (string, repr) Hashtbl.t;
     (* IDEA: maybe switch to (string, repr * bool ref) Hashtbl.t. The bool
        is set to true when the local is actually used.
      *)
@@ -135,10 +140,10 @@ let empty_state =
     camldepth = 0;
     accu = Invalid;
     realaccu = ISet.empty;
-    arity = 1;
+    arity = 0;
   }
 
-let empty_lpad ~enable_returncall () =
+let empty_lpad ~enable_returncall letrec_label =
   { locals = Hashtbl.create 7;
     avoid_locals = false;
     loops = ISet.empty;
@@ -148,6 +153,7 @@ let empty_lpad ~enable_returncall () =
     environment = [| |];
     func_offset = 0;
     enable_returncall;
+    letrec_label;
   }
 
 let new_local lpad repr =
@@ -1067,10 +1073,17 @@ let transl_instr lpad state instr =
           @ [ instr_appterm ] in
         (state, instrs)
     | Kreturn slots ->
-        assert(state.camldepth + state.arity = slots);
+        if state.camldepth + state.arity <> slots then (
+          eprintf "[DEBUG] Assertion failed in letrec%d: Kreturn, arity=%d slots=%d\n" lpad.letrec_label state.arity slots;
+          assert false;
+        );
         (state, [ Wreturn { src=state.accu; arity=state.arity } ])
     | Kgrab num ->
-        ({state with arity = num+1}, [ Wgrab { numargs=num }])
+        if state.arity <> num+1 then (
+          eprintf "[DEBUG] Assertion failed in letrec%d: Kgrab, arity=%d num=%d\n" lpad.letrec_label state.arity num;
+          assert false;
+        );
+        (state, [ Wcomment (sprintf "omitted Kgrab %d" num) ])
     | Kclosure(lab, num) ->
         let state, instrs_flush = flush_accu lpad state in
         let src =
@@ -1202,12 +1215,40 @@ let transl_fblock lpad fblock =
       )
       block.instructions in
 
+  let rec extract_arity block =
+    extract_arity_instrs block block.instructions 0
+
+  and extract_arity_instrs block instrs k =
+    if k >= Array.length instrs then
+      raise Not_found;
+    match instrs.(k) with
+      | Label _ | Simple (Klabel _) ->
+          extract_arity_instrs block instrs (k+1)
+      | Simple (Kgrab num) ->
+          num+1
+      | Simple _ ->
+          raise Not_found
+      | Trap _ | TryReturn ->
+          raise Not_found
+      | Block inner ->
+          extract_arity inner
+      | NextMain _ ->
+          raise Not_found in
+
+  let arity =
+    try
+      extract_arity fblock.block
+    with
+      | Not_found ->
+          (* There's no Kgrab when the function only takes 1 arg. *)
+          1 in
+
   let get_state label =
     try  Hashtbl.find state_table label
-    with Not_found -> empty_state in
+    with Not_found -> { empty_state with arity } in
 
   let rec transl_block block loops =
-    let state = empty_state in
+    let state = { empty_state with arity } in
     (* eprintf "BLOCK\n%!";*)
     let upd_loops =
       match block.loop_label with
@@ -1284,5 +1325,9 @@ let transl_fblock lpad fblock =
       | None, None ->
           instrs in
   count_indegree fblock.block;
-  transl_block fblock.block ISet.empty
+  let instrs = transl_block fblock.block ISet.empty in
+  if arity > 1 then
+    Wgrab { arity } :: instrs
+  else
+    instrs
 
