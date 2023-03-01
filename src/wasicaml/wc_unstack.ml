@@ -67,6 +67,9 @@ type state =
        having to move some other value away).
 
        List.length camlstack = camldepth + arity
+
+       The first element of camlstack is for stack position -camldepth.
+       The last element of camlstack is for stack position arity-1.
      *)
     camldepth : int;
     (* the length of the stack except function arguments *)
@@ -77,8 +80,11 @@ type state =
        If additionally accu=RealAccu, the "accu" variable also keeps the
        logical accu value.
      *)
-    arity : int;
-    (* number of args pf the current function *)
+    arity : int option;
+    (* number of args pf the current function. This is unknown for
+       Wasm functions that are generated for "try" bodies, and so
+       arity=None in this case.-
+     *)
   }
 
 (* IDEA: there is sometimes code setting the accu, but then the accu
@@ -140,7 +146,7 @@ let empty_state =
     camldepth = 0;
     accu = Invalid;
     realaccu = ISet.empty;
-    arity = 0;
+    arity = None;
   }
 
 let empty_lpad ~enable_returncall letrec_label =
@@ -155,6 +161,21 @@ let empty_lpad ~enable_returncall letrec_label =
     enable_returncall;
     letrec_label;
   }
+
+let string_of_state state =
+  let camlstack =
+    List.map string_of_store state.camlstack
+    |> String.concat ", " in
+  let realaccu =
+    ISet.elements state.realaccu
+    |> List.map string_of_int
+    |> String.concat ", " in
+  sprintf "{camldepth=%d; arity=%s; camlstack=[%s]; accu=%s; realaccu={%s}"
+          state.camldepth
+          (match state.arity with None -> "n/a" | Some n -> string_of_int n)
+          camlstack
+          (string_of_store state.accu)
+          realaccu
 
 let new_local lpad repr =
   let k = Hashtbl.length lpad.locals in
@@ -204,11 +225,11 @@ let set_camlstack pos store state =
         state.camlstack in
     camlstack
   else
+    (* Cannot set pos >= 0 - these are the function args *)
     state.camlstack
 
 let pop_camlstack state =
   let cd = state.camldepth in
-  let cpos = (-cd) in
   match state.camlstack with
     | RealStack pos :: tl ->
         { state with
@@ -216,6 +237,7 @@ let pop_camlstack state =
           camldepth = cd - 1;
         }
     | (RealAccu _):: tl ->
+        let cpos = (-cd) in
         { state with
           camlstack = tl;
           camldepth = cd - 1;
@@ -234,7 +256,6 @@ let rec popn_camlstack number state =
 
 let push_camlstack store state =
   let cd = state.camldepth in
-  let cpos = (-cd-1) in
   match store with
     | RealStack pos ->
         { state with
@@ -242,6 +263,7 @@ let push_camlstack store state =
           camldepth = cd + 1;
         }
     | RealAccu _ ->
+        let cpos = (-cd-1) in
         { state with
           camlstack = store :: state.camlstack;
           camldepth = cd + 1;
@@ -269,10 +291,11 @@ let flush_accu lpad state =
       [] in
   let instrs =
     List.rev instrs_rev in
+  let cd = state.camldepth in
   let camlstack =
     List.mapi
       (fun i old ->
-        let pos = (-state.camldepth+i) in
+        let pos = (-cd+i) in
         if ISet.mem pos state.realaccu then (
           RealStack pos
         ) else
@@ -339,7 +362,8 @@ let flush_real_stack_only_accu_at lpad state pos =
      | _ ->
         (state, [])
 
-let patch camlstack depth patches =
+let patch state positions =
+  (* Fix up camlstack and set the positions to RealStack *)
   let rec recurse camlstack pos patches =
     match patches with
       | [] -> camlstack
@@ -353,9 +377,12 @@ let patch camlstack depth patches =
             match camlstack with
               | hd :: tl -> hd :: recurse tl (pos+1) patches
               | [] -> assert false in
-  recurse camlstack (-depth) (ISet.elements patches)
-    (* NB. exploiting that ISet.elements returns the elements in ascending
-       order *)
+  let cd = state.camldepth in
+  let camlstack =
+    recurse state.camlstack (-cd) (ISet.elements positions) in
+  (* NB. exploiting that ISet.elements returns the elements in ascending
+     order *)
+  { state with camlstack }
 
 let flush_real_stack_at lpad state pos =
   (* Ensure that any value at the stack position pos is saved to
@@ -381,12 +408,8 @@ let flush_real_stack_at lpad state pos =
     positions
     |> ISet.elements
     |> List.map (fun q -> Wcopy { src=RealStack pos; dest=RealStack q }) in
-  let camlstack =
-    patch state.camlstack cd positions in
   let state =
-    { state with
-      camlstack;
-    } in
+    patch state positions in
   (state, instrs1 @ instrs2)
 
 (*
@@ -606,6 +629,11 @@ let make_label lpad label =
     Label label
 
 let validate state =
+  ( match state.arity with
+      | None -> ()
+      | Some n ->
+          assert(List.length state.camlstack = state.camldepth + n)
+  );
   let d = state.camldepth in
   List.iteri
     (fun i st ->
@@ -688,11 +716,26 @@ let transl_instr lpad state instr =
     | Kconst _ ->
         assert false
     | Kacc sp ->
+        (*
+        ( match state.arity with
+            | Some n ->
+                if sp < 0 || sp >= state.camldepth + n then (
+                  eprintf "[DEBUG] Assertion failed in letrec%d, sp=%d\n" lpad.letrec_label sp;
+                  eprintf "[DEBUG] state=%s\n%!" (string_of_state state);
+                  assert false;
+                )
+            | None -> ()
+        );
+         *)
         let state =
-          if sp < state.camldepth then
-            { state with accu = List.nth state.camlstack sp }
-          else
-            { state with accu = RealStack (-state.camldepth + sp) } in
+         (*  match state.arity with
+            | Some _ ->
+                { state with accu = List.nth state.camlstack sp }
+            | None -> *)
+                if sp < state.camldepth then
+                  { state with accu = List.nth state.camlstack sp }
+                else
+                  { state with accu = RealStack (-state.camldepth + sp) } in
         (state, [])
     | Kpush ->
         let state = push_camlstack state.accu state in
@@ -1073,17 +1116,30 @@ let transl_instr lpad state instr =
           @ [ instr_appterm ] in
         (state, instrs)
     | Kreturn slots ->
-        if state.camldepth + state.arity <> slots then (
-          eprintf "[DEBUG] Assertion failed in letrec%d: Kreturn, arity=%d slots=%d\n" lpad.letrec_label state.arity slots;
-          assert false;
-        );
-        (state, [ Wreturn { src=state.accu; arity=state.arity } ])
+        ( match state.arity with
+            | Some n ->
+                if state.camldepth + n <> slots then (
+                  eprintf "[DEBUG] Assertion failed in letrec%d: Kreturn, arity=%d slots=%d\n" lpad.letrec_label n slots;
+                  assert false;
+                );
+                (state, [ Wreturn { src=state.accu; arity=n } ])
+            | None ->
+                (* Kreturn not allowed in "try" body *)
+                eprintf "[DEBUG] Assertion failed in letrec%d: Kreturn in try body\n" lpad.letrec_label;
+                assert false
+        )
     | Kgrab num ->
-        if state.arity <> num+1 then (
-          eprintf "[DEBUG] Assertion failed in letrec%d: Kgrab, arity=%d num=%d\n" lpad.letrec_label state.arity num;
-          assert false;
-        );
-        (state, [ Wcomment (sprintf "omitted Kgrab %d" num) ])
+        ( match state.arity with
+            | Some n ->
+                if n <> num+1 then (
+                  eprintf "[DEBUG] Assertion failed in letrec%d: Kgrab, arity=%d num=%d\n" lpad.letrec_label n num;
+                  assert false;
+                );
+                (state, [ Wcomment (sprintf "omitted Kgrab %d" num) ])
+            | None ->
+                eprintf "[DEBUG] Assertion failed in letrec%d: Kgrab in try body\n" lpad.letrec_label;
+                assert false;
+        )
     | Kclosure(lab, num) ->
         let state, instrs_flush = flush_accu lpad state in
         let src =
@@ -1237,18 +1293,34 @@ let transl_fblock lpad fblock =
 
   let arity =
     try
-      extract_arity fblock.block
+      Some(extract_arity fblock.block)
     with
       | Not_found ->
-          (* There's no Kgrab when the function only takes 1 arg. *)
-          1 in
+          (* There's no Kgrab when:
+              - the function only takes 1 arg
+              - the function is for a "try" body
+           *)
+          if fblock.scope.cfg_try_labels = [] then
+            Some 1
+          else
+            None (* "try" body *) in
+
+  let init_state =
+    let camlstack =
+      match arity with
+        | None -> []
+        | Some n -> enum 0 n |> List.map (fun k -> RealStack k) in
+    { empty_state with
+      arity;
+      camlstack;
+    } in
 
   let get_state label =
     try  Hashtbl.find state_table label
-    with Not_found -> { empty_state with arity } in
+    with Not_found -> init_state in
 
   let rec transl_block block loops =
-    let state = { empty_state with arity } in
+    let state = init_state in
     (* eprintf "BLOCK\n%!";*)
     let upd_loops =
       match block.loop_label with
@@ -1325,9 +1397,12 @@ let transl_fblock lpad fblock =
       | None, None ->
           instrs in
   count_indegree fblock.block;
-  let instrs = transl_block fblock.block ISet.empty in
-  if arity > 1 then
-    Wgrab { arity } :: instrs
-  else
-    instrs
+  let comment = Wcomment (sprintf "FBLOCK %s" (Wc_control.string_of_scope fblock.scope)) in
+  let instrs = comment :: transl_block fblock.block ISet.empty in
+  ( match arity with
+      | Some n when n > 1 ->
+          Wgrab { arity=n } :: instrs
+      | _ ->
+          instrs
+  )
 

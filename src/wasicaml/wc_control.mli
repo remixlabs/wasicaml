@@ -136,3 +136,5 @@ val recover_structure : cfg -> structured_code
   (* Analyze the loop/jump structure of the code *)
 
 val validate : structured_code -> unit
+
+val string_of_scope : cfg_scope -> string
