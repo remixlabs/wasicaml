@@ -32,6 +32,9 @@ open Wc_instruct
    more than 3 args, the bytecode includes a Kpush_retaddr instruction
    which reserves 3 positions on the stack in advance. Although we only need
    one of these, there is no fixup that would eliminate the other two.
+
+   In order to indicate an exception to the caller, the function can
+   simply return NULL. The exception must be put in domain_field_exn_bucket.
  *)
 
 
@@ -392,6 +395,13 @@ let debug2_var x0 var =
     L [ K "call"; ID "debug2" ]
   ]
 
+let debugcnt = ref 0
+
+let debugmark() =
+  let n = !debugcnt in
+  incr debugcnt;
+  debug2 100 n
+
 let deadbeef_init =
   (* IBM mainframes used to initialize fresh memory with 0xdeadbeef *)
   [ L ( [ [ K "func";
@@ -482,6 +492,27 @@ let deadbeef_check =
         ] |> List.flatten
       )
   ]
+
+let throw fpad =
+  (* the exception value must be in domain_field_exn_bucket *)
+  if fpad.fpad_scope.cfg_main && fpad.fpad_scope.cfg_try_labels = [] then
+    (* in outermost scope there is no caller - prefer to throw
+       a real exception
+     *)
+    [ L [ K "call"; ID "wasicaml_throw" ];
+      L [ K "unreachable" ]
+    ]
+  else if fpad.fpad_scope.cfg_try_labels = [] then
+    (* a normal function, but outside a "try" block *)
+    [ L [ K "i32.const"; N (I32 0l) ];
+      L [ K "return" ]
+    ]
+  else
+    (* XXX *)
+    (* inside a "try" block: the result is returned via exn_result *)
+    [ L [ K "i32.const"; N (I32 0l) ];
+      L [ K "return" ]
+    ]
 
 let stack_init fpad descr =
   (* put zeros into the uninitialized stack positions *)
@@ -593,6 +624,27 @@ let alloc_fast =
       )
   ]
 
+let wrap_alloc_small_dispatch() =
+  [ L [ K "func";
+        ID "wrap_alloc_small_dispatch";
+        L [ K "param"; ID "wosize"; K "i32" ];
+        L [ K "param"; ID "flags"; K "i32" ];
+        L [ K "param"; ID "nallocs"; K "i32" ];
+        L [ K "param"; ID "encoded_alloc_lens"; K "i32" ];
+        BR;
+        L [ K "result"; C "dummy"; K "i32" ];
+
+        L [ K "local.get"; ID "wosize" ];
+        L [ K "local.get"; ID "flags" ];
+        L [ K "local.get"; ID "nallocs" ];
+        L [ K "local.get"; ID "encoded_alloc_lens" ];
+        L [ K "call"; ID "caml_alloc_small_dispatch" ];
+
+        L [ K "i32.const"; N (I32 1l) ];  (* = success code *)
+        L [ K "return" ];
+      ];
+  ]
+
 let alloc_slow() =
   [ L ( [ [ K "func";
             ID "alloc_slow";
@@ -632,11 +684,23 @@ let alloc_slow() =
           );
 
           (* caml_alloc_small_dispatch(wosize, CAML_FROM_C, 1, NULL) *)
+          [ L [ K "i32.const"; ID "wrap_alloc_small_dispatch" ]];
           push_local "wosize";
           push_const (Int32.of_int caml_from_c);
           push_const 1l;
           push_const 0l;
-          [ L [ K "call"; ID "caml_alloc_small_dispatch" ]];
+          [ L [ K "call"; ID "wasicaml_wraptry4" ];
+            L [ K "i32.eqz" ];
+            L [ K "if";
+                L ( [ K "then";
+                      L [ K "i32.const"; N (I32 0l) ];
+                      L [ K "i32.const"; N (I32 1l) ];
+                    ] @ (if !enable_multireturn then [] else
+                           [ L [ K "global.set"; ID "retval2" ] ]) @
+                      [ L [ K "return" ]]
+                  )
+              ]
+          ];
 
           push_domain_field domain_field_young_ptr;
           pop_to_local "ptr";
@@ -697,16 +761,27 @@ let alloc_non_atom fpad descr size tag =
                     call_alloc_slow();
                     pop_to_local "accu";
                     pop_to_local ptr;
+                    [ L [ K "local.get"; ID ptr ];
+                      L [ K "i32.eqz" ];
+                      L [ K "if";
+                          L ([K "then" ] @ throw fpad)
+                        ]
+                    ]
                   ] |> List.flatten
                 )
             ];
         ];
       ] |> List.flatten
     else
-      [ L [ K "i32.const"; N (I32 (Int32.of_int size)) ];
+      [ L [ K "i32.const"; ID "caml_alloc_shr" ];
+        L [ K "i32.const"; N (I32 (Int32.of_int size)) ];
         L [ K "i32.const"; N (I32 (Int32.of_int tag)) ];
-        L [ K "call"; ID "caml_alloc_shr" ];
-        L [ K "local.set"; ID ptr ];
+        L [ K "call"; ID "wasicaml_wraptry2" ];
+        L [ K "local.tee"; ID ptr ];
+        L [ K "i32.eqz" ];
+        L [ K "if";
+            L ([K "then"] @ throw fpad)
+          ]
       ] in
   (code, ptr, young)
 
@@ -747,15 +822,24 @@ let grab_helper gpad =
           ];
 
           setup_for_gc fpad descr;
-          [ L [ K "local.get"; ID "extra_args" ];
+          [ L [ K "i32.const"; ID "caml_alloc_small" ];
+            L [ K "local.get"; ID "extra_args" ];
             L [ K "i32.const"; N (I32 4l) ];
             L [ K "i32.add" ];
             L [ K "i32.const"; N (I32 (Int32.of_int closure_tag))];
-            L [ K "call"; ID "caml_alloc_small" ];
+            L [ K "call"; ID "wasicaml_wraptry2" ];
             L [ K "local.set"; ID "accu" ];
           ];
           restore_after_gc fpad descr;  (* won't overwrite accu *)
-
+          [ L [ K "local.get"; ID "accu" ];
+            L [ K "i32.eqz" ];
+            L [ K "if";
+                L [ K "then";
+                    L [ K "i32.const"; N (I32 0l) ];
+                    L [ K "return" ]
+                  ]
+              ]
+          ];
           (push_env |> pop_to_field "accu" 2);
 
           push_const 0l;
@@ -2135,6 +2219,12 @@ let closurerec gpad fpad descr src_list dest_list =
     |> List.flatten in
   sexpl_mb @ sexpl_dest
 
+let wraptry n =
+  if n = 1 then
+    "wasicaml_wraptry"
+  else
+    sprintf "wasicaml_wraptry%d" n
+
 let c_call gpad fpad descr src_list name =
   let descr = { descr with stack_save_accu = false } in (* it is overwritten *)
   let sexpl_setup = setup_for_gc fpad descr in
@@ -2146,19 +2236,30 @@ let c_call gpad fpad descr src_list name =
       src_list |> List.flatten in
    *)
   let sexpl_args =
-    List.map
-      (fun src -> push_as fpad src RValue)
-      src_list in
+    [ L [ K "i32.const"; ID name ] ]
+    @ List.concat_map
+        (fun src -> push_as fpad src RValue)
+        src_list in
   let sexpl_call =
-    [ L [ K "call"; ID name ]]
+    [ L [ K "call";
+          ID (wraptry (List.length src_list))
+        ]
+    ]
     @ pop_to_local "accu" in
+  let sexpl_exncheck =
+    [ L [ K "local.get"; ID "accu" ];
+      L [ K "i32.eqz" ];
+      L [ K "if";
+          L ([K "then"] @ throw fpad)
+        ]
+    ] in
   let p_i32 = L [ K "param"; K "i32" ] in
   let r_i32 = L [ K "result"; K "i32" ] in
   let ty = (src_list |> List.map (fun _ -> p_i32)) @ [ r_i32 ] in
   Hashtbl.replace gpad.primitives name ty;
   (* debug2 20 0 *)
   (* @ sexpl_debug_args *)
-  sexpl_setup @ List.flatten sexpl_args @ sexpl_call @ sexpl_restore
+  sexpl_setup @ sexpl_args @ sexpl_call @ sexpl_restore @ sexpl_exncheck
   (* @ debug2 20 1 *)
 
 let c_call_vector gpad fpad descr numargs depth name =
@@ -2166,17 +2267,25 @@ let c_call_vector gpad fpad descr numargs depth name =
   let sexpl_setup = setup_for_gc fpad descr in
   let sexpl_restore = restore_after_gc fpad descr in
   let sexpl_call =
-    push_field_addr "fp" (-depth)
+    [ L [ K "i32.const"; ID name ] ]
+    @ push_field_addr "fp" (-depth)
     @ push_const (Int32.of_int numargs)
-    @ [ L [ K "call"; ID name ]]
+    @ [ L [ K "call"; ID "wasicaml_wraptry2" ]]
     @ pop_to_local "accu" in
+  let sexpl_exncheck =
+    [ L [ K "local.get"; ID "accu" ];
+      L [ K "i32.eqz" ];
+      L [ K "if";
+          L ([K "then"] @ throw fpad)
+        ]
+    ] in
   let ty =
     [ L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
       L [ K "result"; K "i32" ] ] in
   Hashtbl.replace gpad.primitives name ty;
   (* debug2 20 0 *)
-  sexpl_setup @ sexpl_call @ sexpl_restore
+  sexpl_setup @ sexpl_call @ sexpl_restore @ sexpl_exncheck
 
 let string_label =
   function
@@ -2303,28 +2412,6 @@ let return() =
     L [ K "local.get"; ID "accu" ];
     L [ K "return" ];
   ]
-
-let throw fpad =
-  (* the exception value must be in domain_field_exn_bucket *)
-  if fpad.fpad_scope.cfg_main && fpad.fpad_scope.cfg_try_labels = [] then
-    (* in outermost scope there is no caller - prefer to throw
-       a real exception
-     *)
-    [ L [ K "call"; ID "wasicaml_throw" ];
-      L [ K "unreachable" ]
-    ]
-  else if fpad.fpad_scope.cfg_try_labels = [] then
-    (* a normal function, but outside a "try" block *)
-    [ L [ K "i32.const"; N (I32 0l) ];
-      L [ K "return" ]
-    ]
-  else
-    (* inside a "try" block: the result is returned via exn_result *)
-    [ L [ K "i32.const"; N (I32 0l) ];
-      L [ K "global.set"; ID "exn_result" ];
-      L [ K "i32.const"; N (I32 0l) ];
-      L [ K "return" ]
-    ]
 
 let apply_direct gpad fpad funlabel numargs depth =
   let _, letrec_label, _ = lookup_label gpad funlabel in
@@ -2625,7 +2712,6 @@ let trap gpad fpad trylabel catchlabel depth =
   (* if (caught): accu = Caml_state->exn_bucket; jump lab *)
   (* else: accu = global "exn_result" *)
   (* at end of try function: global "exn_result" = accu *)
-  let local1 = req_tmp1_i32 fpad in
   let local2 = req_tmp2_i32 fpad in
   let sexpl_stack =
     (push_const 0l |> pop_to_stack fpad (-depth-1))
@@ -2655,29 +2741,26 @@ let trap gpad fpad trylabel catchlabel depth =
       ]
     (* @ debug2 30 0 *)
     @ [ L [ K "call"; ID "wasicaml_wraptry4" ];
-        L [ K "local.set"; ID local1 ];
+        L [ K "local.set"; ID "accu" ];
       ]
     (* @ debug2 30 1 *)
     @ ( push_local local2
         |> pop_to_domain_field domain_field_local_roots
       )
-    @ [ L [ K "local.get"; ID local1 ];
-        L [ K "global.get"; ID "exn_result" ];
+    @ [ L [ K "local.get"; ID "accu" ];
         L [ K "i32.eqz" ];
-        L [ K "i32.or" ];
         L [ K "if";
-            L [ K "then";
-                L [ K "global.get"; ID "wasicaml_domain_state" ];
-                L [ K "i32.load";
-                    K (sprintf "offset=0x%lx" (Int32.of_int (8 * domain_field_exn_bucket)));
-                    K "align=2"
-                  ];
-                L [ K "local.set"; ID "accu" ];
-                L [ K "br"; ID (sprintf "label%d" catchlabel) ]
-              ]
-          ];
-        L [ K "global.get"; ID "exn_result" ];
-        L [ K "local.set"; ID "accu" ]
+            L ( [ K "then";
+                  L [ K "global.get"; ID "wasicaml_domain_state" ];
+                  L [ K "i32.load";
+                      K (sprintf "offset=0x%lx" (Int32.of_int (8 * domain_field_exn_bucket)));
+                      K "align=2"
+                    ];
+                  L [ K "local.set"; ID "accu" ];
+                  L [ K "br"; ID (sprintf "label%d" catchlabel) ]
+                ]
+              )
+          ]
       ] in
   sexpl_stack @ sexpl_try
 
@@ -2868,11 +2951,7 @@ let rec emit_instr gpad fpad instr =
         trap gpad fpad arg.trylabel arg.catchlabel arg.depth
     | Wtryreturn arg ->
         push_as fpad arg.src RValue
-        @ [ L [ K "global.set"; ID "exn_result" ];
-            L [ K "i32.const"; N (I32 0l) ];
-            (* L ( K "block" :: debug2 1 3); *)
-            L [ K "return" ]
-          ]
+        @ [ L [ K "return" ] ]
     | Wnextmain { label } ->
         push_local "accu"  (* sic! *)
         @ push_local "extra_args"
@@ -3226,7 +3305,6 @@ let globals() =
     "wasicaml_domain_state", true, TI32;
     "wasicaml_atom_table", true, TI32;
     "wasicaml_stack_threshold", true, TI32;
-    "exn_result", true, TI32;
   ]
   @ if !enable_multireturn then [] else
       [ "retval2", true, TI32;
@@ -3262,8 +3340,35 @@ let imp_functions =
     [];
     "env", "caml_raise_stack_overflow",
     [];
+    "env", "wasicaml_wraptry",
+    [ L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "result"; K "i32" ]
+    ];
+    "env", "wasicaml_wraptry2",
+    [ L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "result"; K "i32" ]
+    ];
+    "env", "wasicaml_wraptry3",
+    [ L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "result"; K "i32" ]
+    ];
     "env", "wasicaml_wraptry4",
     [ L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
+      L [ K "result"; K "i32" ]
+    ];
+    "env", "wasicaml_wraptry5",
+    [ L [ K "param"; K "i32" ];
+      L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
@@ -3443,6 +3548,7 @@ let generate scode exe get_defname globals_table =
   @ wasicaml_get_data_size Wc_reader.(Array1.dim exe.data)
   @ alloc_fast
   @ alloc_slow()
+  @ wrap_alloc_small_dispatch()
   @ grab_helper gpad
   @ return_helper()
   @ appterm_helper()
