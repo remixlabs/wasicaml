@@ -18,38 +18,6 @@ let local_branch_labels =
   | Kswitch (la1,la2) -> Array.to_list la1 @ Array.to_list la2
   | _ -> []
 
-let rec dump block indent =
-  let open Wc_control in
-  let open Wc_util in
-  let istr = String.make (4*indent) ' ' in
-  eprintf "%sBLOCK %s%s\n"
-          istr
-          ( match block.loop_label with
-              | Some l -> sprintf "loop=%d" l
-              | None -> ""
-          )
-          ( match block.break_label with
-              | Some l -> sprintf "break=%d" l
-              | None -> ""
-          );
-  Array.iter
-    (function
-     | Label label ->
-         eprintf "%sLABEL %d\n" istr label
-     | Simple i ->
-         eprintf "%s%s\n" istr (string_of_kinstruction i)
-     | Trap { trylabel; catchlabel; poplabel } ->
-         eprintf "%sTrap try=%d catch=%d pop=%s\n" istr trylabel catchlabel
-                 (Option.map string_of_int poplabel |> Option.value ~default:"")
-     | TryReturn ->
-         eprintf "%sTryReturn\n" istr
-     | NextMain label ->
-         eprintf "%sNextMain %d\n" istr label
-     | Block inner ->
-         dump inner (indent+1)
-    )
-    block.instructions
-
 let max_stack_depth_of_fblock fblock =
   let open Wc_control in
   let depth_table = Hashtbl.create 7 in
@@ -64,7 +32,7 @@ let max_stack_depth_of_fblock fblock =
             eprintf "[DEBUG] Bad function: %d\n" fblock.scope.cfg_func_label;
             eprintf "[DEBUG] Bad label: %d\n" label;
             eprintf "[DEBUG] d=%d depth=%d\n" d depth;
-            dump fblock.block 0;
+            dump_block fblock.block 0;
             assert false;
           )
         with
@@ -87,13 +55,13 @@ let max_stack_depth_of_fblock fblock =
               update_depth_table depth labels;
               let depth' = Wc_traceinstr.trace_stack_instr depth i in
               (max depth' max_depth, depth')
-          | Trap { catchlabel; poplabel=Some pop } ->
-              update_depth_table depth [ catchlabel; pop ];
-              (max_depth, depth)
-          | Trap { catchlabel; poplabel=None } ->
+          | Trap { labels = {trylabel; catchlabel}; poplabel=Some pop } ->
+              update_depth_table (depth+4) [ trylabel; pop ];
               update_depth_table depth [ catchlabel ];
               (max_depth, depth)
-          | TryReturn ->
+          | Trap { labels = {trylabel; catchlabel}; poplabel=None } ->
+              update_depth_table (depth+4) [ trylabel ];
+              update_depth_table depth [ catchlabel ];
               (max_depth, depth)
           | NextMain _ ->
               (max_depth, depth)

@@ -41,7 +41,8 @@ let trace_stack_instr depth instr =
         let num_funcs = List.length funcs in
         depth-(max (num-1) 0)+num_funcs
     | Koffsetclosure _ -> depth
-    | Kpushtrap _ | Kpoptrap -> depth
+    | Kpushtrap _ -> depth+4
+    | Kpoptrap -> depth-4
     | Kcheck_signals -> depth
     | Kgetmethod -> depth
     | Kgetpubmet _ -> depth+1

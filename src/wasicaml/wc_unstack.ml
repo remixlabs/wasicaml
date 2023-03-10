@@ -45,7 +45,10 @@ type state =
  *)
 
 type lpad =  (* local pad *)
-  { locals : (string, repr) Hashtbl.t;
+  { mutable scope : Wc_control.cfg_scope;
+    (* The scope of the current block *)
+
+    locals : (string, repr) Hashtbl.t;
     (* IDEA: maybe switch to (string, repr * bool ref) Hashtbl.t. The bool
        is set to true when the local is actually used.
      *)
@@ -58,6 +61,7 @@ type lpad =  (* local pad *)
 
     indegree : (int, int) Hashtbl.t;
     (* how many nodes jump to this node (identified by label). A negative
+
        indegree means that no optimizations must be done for this label.
      *)
 
@@ -95,8 +99,9 @@ let empty_state =
     arity = 1;
   }
 
-let empty_lpad ~enable_returncall () =
-  { locals = Hashtbl.create 7;
+let empty_lpad ~enable_returncall scope =
+  { scope;
+    locals = Hashtbl.create 7;
     avoid_locals = false;
     loops = ISet.empty;
     indegree = Hashtbl.create 7;
@@ -556,13 +561,15 @@ let make_label lpad label =
   else
     Label label
 
-let validate state =
+let validate state debug_prefix =
   let d = state.camldepth in
   List.iteri
     (fun i st ->
       match st with
         | RealStack pos -> assert(pos = (-d+i))
-        | _ -> assert false
+        | _ ->
+            eprintf "[DEBUG] Failed assertion, %s. st=%s\n" debug_prefix (string_of_store st);
+            assert false
     )
     state.camlstack;
   assert(match state.accu with
@@ -592,10 +599,10 @@ let branch lpad state label =
   let instr_br = Wbranch { label=make_label lpad label } in
   try
     let dest_state = Hashtbl.find lpad.state_table label in
-    validate dest_state;
+    validate dest_state (sprintf "dest_state, branch to %d" label);
     let (state, instrs1) = straighten_accu_for_branch lpad state in
     let (state, instrs2) = straighten_stack lpad state in
-    validate state;
+    validate state (sprintf "state, branch to %d" label);
     assert(state.camldepth = dest_state.camldepth);
     (* state and dest_state can at most differ in accu *)
     let instrs =
@@ -872,7 +879,7 @@ let transl_instr lpad state instr =
     | Kswitch (labels_int, labels_blk) ->
         let state = norm_accu state in
         let state, instrs_str = straighten_all lpad state in
-        validate state;
+        validate state (sprintf "state, Kswitch");
         Array.iter (update_state_table lpad state) labels_int;
         Array.iter (update_state_table lpad state) labels_blk;
         let labels_int = Array.map (make_label lpad) labels_int in
@@ -1097,7 +1104,10 @@ let transl_instr lpad state instr =
           (state, instrs)
     | Krestart ->
         (state, [])
-    | Kpushtrap _ | Kpoptrap ->
+    | Kpushtrap _ ->
+        assert false   (* replaced by Trap, see below *)
+    | Kpoptrap ->
+        let state = popn_camlstack 4 state in
         (state, [])
     | Kraise kind ->
         (state, [ Wraise { src=state.accu; kind }])
@@ -1142,8 +1152,13 @@ let transl_fblock lpad fblock =
       (function
        | Block b ->
            count_indegree b
-       | Trap { catchlabel } ->
-           incr_indegree catchlabel
+       | Trap { labels={trylabel; catchlabel}; poplabel } ->
+           disable_indegree trylabel;
+           disable_indegree catchlabel;
+           ( match poplabel with
+               | Some lab -> disable_indegree lab
+               | None -> ()
+           )
        | Simple i ->
            (match i with
               | (I.Kbranch lab | Kbranchif lab | Kbranchifnot lab) ->
@@ -1154,7 +1169,7 @@ let transl_fblock lpad fblock =
               | _ ->
                   ()
              )
-       | Label _ | TryReturn | NextMain _ ->
+       | Label _ | NextMain _ ->
            ()
       )
       block.instructions in
@@ -1178,7 +1193,8 @@ let transl_fblock lpad fblock =
                 (* eprintf "LABEL %d\n" label; *)
                 let state = get_state label in
                 let comment = Wcomment (sprintf "Label %d (depth=%d)" label state.camldepth) in
-                (state, comment :: acc)
+                let cscope = Wcomment (string_of_scope block.block_scope) in
+                (state, comment ::cscope ::  acc)
             | Simple i ->
                 lpad.loops <- upd_loops;
                 let next_state, instrs = transl_instr lpad state i in
@@ -1191,35 +1207,27 @@ let transl_fblock lpad fblock =
                 let comment =
                   Wcomment ("***" ^ Wc_util.string_of_kinstruction i) in
                 (next_state, List.rev_append (comment :: instrs) acc)
-            | Trap { trylabel; catchlabel; poplabel } ->
+            | Trap { labels={trylabel; catchlabel}; poplabel } ->
                 let state, instrs_str = straighten_all lpad state in
                 let accu = real_accu in
-                let state = { state with accu } in
+                let state_catch = { state with accu } in
+                (* The bytecode interpreter needs 4 stack position for
+                   saving stuff. We don't need that here. *)
+                let state = push_camlstack (Const 0) state_catch in
+                let state = push_camlstack (Const 0) state in
+                let state = push_camlstack (Const 0) state in
+                let state = push_camlstack (Const 0) state in
+                let state, instrs_str2 = straighten_all lpad state in
                 let instrs =
                   [ Wcomment (sprintf "***Trap(try=%d,catch=%d)" trylabel catchlabel) ]
                   @ instrs_str
-                  @ [ Wtrap { trylabel;
-                              catchlabel;
-                              depth=state.camldepth
-                            };
-                      ( match poplabel with
-                          | None ->
-                              (* e.g. "try raise Foo with Foo -> ..." *)
-                              Wunreachable
-                          | Some pop ->
-                              Wbranch { label=Label pop }
-                      )
-                    ] in
-                update_state_table lpad state catchlabel;
+                  @ instrs_str2
+                  @ [ Wbranch { label=Label trylabel } ] in
+                update_state_table lpad state trylabel;
+                update_state_table lpad state_catch catchlabel;
                 Option.iter
                   (update_state_table lpad state)
                   poplabel;
-                (state, List.rev_append instrs acc)
-            | TryReturn ->
-                let instrs =
-                  [ Wcomment "***TryReturn";
-                    Wtryreturn { src=state.accu }
-                  ] in
                 (state, List.rev_append instrs acc)
             | Block inner ->
                 let instrs = transl_block inner upd_loops in
@@ -1232,14 +1240,21 @@ let transl_fblock lpad fblock =
         (state, [])
         block.instructions in
     let instrs = List.rev instrs_rev in
+    let scope = block.block_scope in
     match block.loop_label, block.break_label with
       | Some _, Some _ -> assert false
       | Some label, None ->
-          [ Wblock { label=Loop label; body=instrs } ]
+          [ Wblock { label=Loop label; scope; body=instrs } ]
       | None, Some label ->
-          [ Wblock { label=Label label; body=instrs } ]
+          [ Wblock { label=Label label; scope; body=instrs } ]
       | None, None ->
           instrs in
   count_indegree fblock.block;
-  transl_block fblock.block ISet.empty
+  try
+    transl_block fblock.block ISet.empty
+  with
+    | any ->
+        eprintf "[DEBUG] Failing block %s:\n" (Wc_control.string_of_scope fblock.scope);
+        Wc_control.dump_block fblock.block 0;
+        raise any
 

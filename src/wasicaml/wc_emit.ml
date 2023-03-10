@@ -148,6 +148,9 @@ let domain_field_external_raise = 23
 let domain_field_exn_bucket = 24
 let domain_field_local_roots = 36
 
+let global_field_zero_divide = 5       (* ZERO_DIVIDE_EXN *)
+let global_field_stack_overflow = 8    (* STACK_OVERFLOW_EXN *)
+
 let double_size = 2
 let double_tag = 253
 let double_array_tag = 254
@@ -170,14 +173,20 @@ let vtype repr =
     | RFloat ->
         TF64
 
+let empty_scope =
+  let open Wc_control in
+  { cfg_letrec_label = None;
+    cfg_func_label = 0;
+    cfg_try_labels = [];
+    cfg_main = false
+  }
+
 let empty_fpad() =
-  { lpad = Wc_unstack.empty_lpad ~enable_returncall:!enable_returncall ();
+  { lpad = Wc_unstack.empty_lpad
+             ~enable_returncall:!enable_returncall
+             empty_scope;
     fpad_letrec_label = Main 0;
-    fpad_scope = { cfg_letrec_label = None;
-                   cfg_func_label = 0;
-                   cfg_try_labels = [];
-                   cfg_main = false
-                 };
+    fpad_scope = empty_scope;
     maxdepth = 0;
     need_appterm_common = false;
     need_startover = false;
@@ -223,26 +232,6 @@ let req_tmp1_f64 fpad =
   )
   else new_local fpad RFloat
 
-let set_bp_1 fpad =
-  [ L [ K "i32.const"; N (I32 (Int32.of_int (4 * fpad.maxdepth))) ];
-    L [ K "i32.sub" ];
-    L [ K "local.tee"; ID "bp" ];
-    L [ K "global.get"; ID "wasicaml_stack_threshold" ];
-    L [ K "i32.lt_u" ];
-    L [ K "if";
-        L [ K "then";
-            L [ K "call"; ID "caml_raise_stack_overflow" ];
-          ]
-      ]
-  ]
-
-let set_bp fpad =
-  if fpad.maxdepth = 0 then
-    []
-  else
-    [ L [ K "local.get"; ID "fp" ] ]
-    @ set_bp_1 fpad
-
 let push_const n =
   [ L [ K "i32.const"; N (I32 n) ]]
 
@@ -251,13 +240,6 @@ let push_local var =
 
 let pop_to_local var =
   [ L [ K "local.set"; ID var ]]
-
-let pop_to_fp fpad =
-  if fpad.maxdepth = 0 then
-    pop_to_local "fp"
-  else
-    [ L [ K "local.tee"; ID "fp" ]]
-    @ set_bp_1 fpad
 
 let load_offset offset =
   if offset >= 0 then
@@ -493,26 +475,124 @@ let deadbeef_check =
       )
   ]
 
+let push_global offset =
+  [ L [ K "global.get";
+        ID "wasicaml_global_data";
+      ];
+    L [ K "i32.load" ];
+    L [ K "i32.load";
+        K (sprintf "offset=0x%lx" (Int32.of_int (4 * offset)));
+        K "align=2";
+      ]
+  ]
+
+let follow_path path =
+  List.map
+    (fun field ->
+      L [ K "i32.load";
+          K (sprintf "offset=0x%lx" (Int32.of_int (4 * field)));
+          K "align=2";
+        ]
+    )
+    path
+
 let throw fpad =
   (* the exception value must be in domain_field_exn_bucket *)
-  if fpad.fpad_scope.cfg_main && fpad.fpad_scope.cfg_try_labels = [] then
+  if fpad.lpad.scope.cfg_main && fpad.lpad.scope.cfg_try_labels = [] then
     (* in outermost scope there is no caller - prefer to throw
        a real exception
      *)
     [ L [ K "call"; ID "wasicaml_throw" ];
       L [ K "unreachable" ]
     ]
-  else if fpad.fpad_scope.cfg_try_labels = [] then
-    (* a normal function, but outside a "try" block *)
-    [ L [ K "i32.const"; N (I32 0l) ];
-      L [ K "return" ]
-    ]
   else
-    (* XXX *)
-    (* inside a "try" block: the result is returned via exn_result *)
-    [ L [ K "i32.const"; N (I32 0l) ];
-      L [ K "return" ]
-    ]
+    match fpad.lpad.scope.cfg_try_labels with
+      | [] ->
+          (* a normal function, but outside a "try" block *)
+          [ L [ K "i32.const"; N (I32 0l) ];
+            L [ K "return" ]
+          ]
+      | { catchlabel } :: _ ->
+          (* it is expected that the accu contains the exception value *)
+          push_domain_field domain_field_exn_bucket
+          @ pop_to_local "accu"
+          @ [ L [ K "br"; ID (sprintf "label%d" catchlabel) ] ]
+
+let raise_predef_exn fpad which drops =
+  (* which: e.g. "div_by_zero", "stack_overflow" *)
+  ( Wc_util.enum 0 drops |> List.map (fun _ -> L [ K "drop" ]) )
+  @ (if fpad.lpad.scope.cfg_main && fpad.lpad.scope.cfg_try_labels = [] then
+       [ L [ K "call"; ID ("pick_" ^ which) ];
+         L [ K "drop" ];
+         L [ K "call"; ID "wasicaml_throw" ];
+         L [ K "unreachable" ]
+       ]
+     else
+       match fpad.lpad.scope.cfg_try_labels with
+         | [] ->
+             if !enable_returncall then
+               [ L [ K "return_call"; ID ("ret_" ^ which) ] ]
+             else
+               [ L [ K "call"; ID ("ret_" ^ which) ];
+                 L [ K "return" ];
+                 L [ K "unreachable" ]   (* because of a bug in LLVM assembler *)
+               ]
+         | { catchlabel } :: _ ->
+             [ L [ K "call"; ID ("pick_" ^ which) ];
+               L [ K "local.set"; ID "accu" ];
+               L [ K "br"; ID (sprintf "label%d" catchlabel) ]
+             ]
+    )
+
+let raise_div_by_zero fpad drops =
+  raise_predef_exn fpad "div_by_zero" drops
+
+let raise_stack_overflow fpad drops =
+  raise_predef_exn fpad "stack_overflow" drops
+
+let pick_predef_exn name which =
+  [ L ( [ [ K "func";
+            ID ("pick_" ^ name);
+            BR;
+            L [ K "result"; C "exn"; K "i32" ];
+            L [ K "local"; ID "exn"; K "i32" ];
+          ];
+          push_global which;
+          pop_to_local "exn";
+          push_local "exn" |>
+            pop_to_domain_field domain_field_exn_bucket;
+          push_local "exn";
+          [ L [ K "return" ] ]
+        ] |> List.flatten
+      )
+  ]
+
+let ret_predef_exn name =
+  [ L ( [ [ K "func";
+            ID ("ret_" ^ name);
+            BR;
+            L [ K "result"; C "exn"; K "i32" ];
+            BR;
+            L [ K "call"; ID ("pick_" ^ name) ];
+            L [ K "drop" ];
+            L [ K "i32.const"; N (I32 0l) ];
+            L [ K "return" ];
+          ]
+        ] |> List.flatten
+      )
+  ]
+
+let pick_div_by_zero =
+  pick_predef_exn "div_by_zero" global_field_zero_divide
+
+let ret_div_by_zero =
+  ret_predef_exn "div_by_zero"
+  
+let pick_stack_overflow =
+  pick_predef_exn "stack_overflow" global_field_stack_overflow
+
+let ret_stack_overflow =
+  ret_predef_exn "stack_overflow"
 
 let stack_init fpad descr =
   (* put zeros into the uninitialized stack positions *)
@@ -1537,27 +1617,6 @@ let convert fpad repr_from repr_to descr_opt =
     | _ ->
         assert false (* TODO *)
 
-let push_global offset =
-  [ L [ K "global.get";
-        ID "wasicaml_global_data";
-      ];
-    L [ K "i32.load" ];
-    L [ K "i32.load";
-        K (sprintf "offset=0x%lx" (Int32.of_int (4 * offset)));
-        K "align=2";
-      ]
-  ]
-
-let follow_path path =
-  List.map
-    (fun field ->
-      L [ K "i32.load";
-          K (sprintf "offset=0x%lx" (Int32.of_int (4 * field)));
-          K "align=2";
-        ]
-    )
-    path
-
 let push fpad store =
   (* put the value in store onto the wasm stack *)
   match store with
@@ -1638,6 +1697,34 @@ let rec drop n l =
       | [] -> []
   else
     l
+
+let set_bp_1 fpad =
+  [ L [ K "i32.const"; N (I32 (Int32.of_int (4 * fpad.maxdepth))) ];
+    L [ K "i32.sub" ];
+    L [ K "local.tee"; ID "bp" ];
+    L [ K "global.get"; ID "wasicaml_stack_threshold" ];
+    L [ K "i32.lt_u" ];
+    L [ K "if";
+        L (K "then" ::
+             raise_stack_overflow fpad 0
+          )
+      ]
+  ]
+
+let set_bp fpad =
+  if fpad.maxdepth = 0 then
+    []
+  else
+    [ L [ K "local.get"; ID "fp" ] ]
+    @ set_bp_1 fpad
+
+let pop_to_fp fpad =
+  if fpad.maxdepth = 0 then
+    pop_to_local "fp"
+  else
+    [ L [ K "local.tee"; ID "fp" ]]
+    @ set_bp_1 fpad
+
 
 let emit_unary gpad fpad op src1 dest =
   match op with
@@ -1855,17 +1942,22 @@ let emit_binary gpad fpad op src1 src2 dest =
                   fpad src1 src2 dest RInt
                   [ L [ K "i32.div_s" ]]
             | _ ->
-                let local = req_tmp1_i32 fpad in
+                let local1 = req_tmp1_i32 fpad in
+                let local2 = req_tmp2_i32 fpad in
                 emit_int_binary
                   fpad src1 src2 dest RInt
-                  [ L [ K "local.tee"; ID local ];
+                  [ L [ K "local.set"; ID local2 ];
+                    L [ K "local.set"; ID local1 ];
+                    L [ K "local.get"; ID local2 ];
                     L [ K "i32.eqz" ];
                     L [ K "if";
-                        L [ K "then";
-                            L [ K "call"; ID "caml_raise_zero_divide" ]
-                          ]
+                        L ( [ [ K "then" ];
+                              raise_div_by_zero fpad 0
+                            ] |> List.flatten
+                          )
                       ];
-                    L [ K "local.get"; ID local ];
+                    L [ K "local.get"; ID local1 ];
+                    L [ K "local.get"; ID local2 ];
                     L [ K "i32.div_s" ]
                   ]
         )
@@ -1876,17 +1968,22 @@ let emit_binary gpad fpad op src1 src2 dest =
                   fpad src1 src2 dest RInt
                   [ L [ K "i32.rem_s" ]]
             | _ ->
-                let local = req_tmp1_i32 fpad in
+                let local1 = req_tmp1_i32 fpad in
+                let local2 = req_tmp2_i32 fpad in
                 emit_int_binary
                   fpad src1 src2 dest RInt
-                  [ L [ K "local.tee"; ID local ];
+                  [ L [ K "local.set"; ID local2 ];
+                    L [ K "local.set"; ID local1 ];
+                    L [ K "local.get"; ID local2 ];
                     L [ K "i32.eqz" ];
                     L [ K "if";
-                        L [ K "then";
-                            L [ K "call"; ID "caml_raise_zero_divide" ]
-                          ]
+                        L ( [ [ K "then" ];
+                              raise_div_by_zero fpad 0
+                            ] |> List.flatten
+                          )
                       ];
-                    L [ K "local.get"; ID local ];
+                    L [ K "local.get"; ID local1 ];
+                    L [ K "local.get"; ID local2 ];
                     L [ K "i32.rem_s" ]
                   ]
         )
@@ -2705,71 +2802,15 @@ let appterm_args gpad fpad funlabel_opt funsrc argsrc oldnumargs depth =
   @ envptr_instrs
   @ call_instrs
 
-let trap gpad fpad trylabel catchlabel depth =
-  (* push 4 values onto stack: 0, 0, 0, extra_args *)
-  (* get function pointer and codeptr *)
-  (* caught = wasicaml_wraptry4(f, env, extra_args, codeptr, fp - depth) *)
-  (* if (caught): accu = Caml_state->exn_bucket; jump lab *)
-  (* else: accu = global "exn_result" *)
-  (* at end of try function: global "exn_result" = accu *)
-  let local2 = req_tmp2_i32 fpad in
-  let sexpl_stack =
-    (push_const 0l |> pop_to_stack fpad (-depth-1))
-    @ (push_const 0l |> pop_to_stack fpad (-depth-2))
-    @ (push_const 0l |> pop_to_stack fpad (-depth-3))
-    @ (push_local "extra_args" |> pop_to_stack fpad (-depth-4))
-    @ (if !enable_deadbeef_check then
-         [ L [ K "local.get"; ID "fp" ];
-           L [ K "i32.const"; N (I32 (Int32.of_int (4 * (depth + 4)))) ];
-           L [ K "i32.sub" ];
-           L [ K "local.get"; ID "fp" ];
-           L [ K "call"; ID "deadbeef_check" ]
-         ]
-       else
-         []
-      ) in
-  let sexpl_try =
-    push_domain_field domain_field_local_roots
-    @ pop_to_local local2
-    @ push_wasmptr gpad trylabel
-    @ push_local "envptr"
-    @ push_local "extra_args"
-    @ push_codeptr gpad trylabel
-    @ push_local "fp"
-    @ [ L [ K "i32.const"; N (I32 (Int32.of_int (4 * (depth + 4))))];
-        L [ K "i32.sub" ]
-      ]
-    (* @ debug2 30 0 *)
-    @ [ L [ K "call"; ID "wasicaml_wraptry4" ];
-        L [ K "local.set"; ID "accu" ];
-      ]
-    (* @ debug2 30 1 *)
-    @ ( push_local local2
-        |> pop_to_domain_field domain_field_local_roots
-      )
-    @ [ L [ K "local.get"; ID "accu" ];
-        L [ K "i32.eqz" ];
-        L [ K "if";
-            L ( [ K "then";
-                  L [ K "global.get"; ID "wasicaml_domain_state" ];
-                  L [ K "i32.load";
-                      K (sprintf "offset=0x%lx" (Int32.of_int (8 * domain_field_exn_bucket)));
-                      K "align=2"
-                    ];
-                  L [ K "local.set"; ID "accu" ];
-                  L [ K "br"; ID (sprintf "label%d" catchlabel) ]
-                ]
-              )
-          ]
-      ] in
-  sexpl_stack @ sexpl_try
-
 let rec emit_instr gpad fpad instr =
   match instr with
     | Wcomment s ->
         []
     | Wblock arg ->
-        ( match arg.label with
+        let old_scope = fpad.lpad.scope in
+        fpad.lpad.scope <- arg.scope;
+        let instrs =
+          match arg.label with
             | Label lab ->
                 [ L ( [ K "block";
                         ID (sprintf "label%d" lab);
@@ -2786,8 +2827,9 @@ let rec emit_instr gpad fpad instr =
                       ]
                       @ emit_instrs gpad fpad arg.body
                     )
-                ]
-        )
+                ] in
+        fpad.lpad.scope <- old_scope;
+        instrs
     | Wcond { cond; ontrue; onfalse } ->
         emit_instr gpad fpad (if !cond then ontrue else onfalse)
     | Wcopy arg ->
@@ -2947,8 +2989,6 @@ let rec emit_instr gpad fpad instr =
             |> pop_to_domain_field domain_field_extern_sp
           )
         @ throw fpad
-    | Wtrap arg ->
-        trap gpad fpad arg.trylabel arg.catchlabel arg.depth
     | Wtryreturn arg ->
         push_as fpad arg.src RValue
         @ [ L [ K "return" ] ]
@@ -3003,6 +3043,7 @@ let rec extract_grab instrs =
 
 let emit_fblock_instrs gpad fpad instrs =
   fpad.disallow_grab <- false;
+  fpad.lpad.scope <- fpad.fpad_scope;
   let rest, grab_opt = extract_grab instrs in
   match grab_opt with
     | Some grab ->
@@ -3336,10 +3377,6 @@ let imp_functions =
     [ L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
     ];
-    "env", "caml_raise_zero_divide",
-    [];
-    "env", "caml_raise_stack_overflow",
-    [];
     "env", "wasicaml_wraptry",
     [ L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
@@ -3546,6 +3583,10 @@ let generate scode exe get_defname globals_table =
   @ wasicaml_init
   @ wasicaml_get_data
   @ wasicaml_get_data_size Wc_reader.(Array1.dim exe.data)
+  @ pick_div_by_zero
+  @ ret_div_by_zero
+  @ pick_stack_overflow
+  @ ret_stack_overflow
   @ alloc_fast
   @ alloc_slow()
   @ wrap_alloc_small_dispatch()
