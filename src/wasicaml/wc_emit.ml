@@ -91,6 +91,7 @@ type fpad =  (* function pad *)
     mutable need_tmp2_i32 : bool;
     mutable need_tmp1_f64 : bool;
     mutable need_xalloc : bool;
+    mutable need_lroots : bool;
     mutable disallow_grab : bool;   (* Wgrab is only allowed at the beginning *)
   }
 
@@ -197,6 +198,7 @@ let empty_fpad() =
     need_tmp2_i32 = false;
     need_tmp1_f64 = false;
     need_xalloc = false;
+    need_lroots = false;
     disallow_grab = false;
   }
 
@@ -735,6 +737,7 @@ let alloc_slow() =
             L [ K "param"; ID "accu"; K "i32" ];
             BR;
             L [ K "result"; C "ptr"; K "i32" ];
+            L [ K "local"; ID "lroots"; K "i32" ];
           ];
           if !enable_multireturn then [
               L [ K "result"; C "out_accu"; K "i32" ];
@@ -764,13 +767,17 @@ let alloc_slow() =
           );
 
           (* caml_alloc_small_dispatch(wosize, CAML_FROM_C, 1, NULL) *)
+          push_domain_field domain_field_local_roots;
+          pop_to_local "lroots";
           [ L [ K "i32.const"; ID "wrap_alloc_small_dispatch" ]];
           push_local "wosize";
           push_const (Int32.of_int caml_from_c);
           push_const 1l;
           push_const 0l;
-          [ L [ K "call"; ID "wasicaml_wraptry4" ];
-            L [ K "i32.eqz" ];
+          [ L [ K "call"; ID "wasicaml_wraptry4" ] ];
+          push_local "lroots"
+          |> pop_to_domain_field domain_field_local_roots;
+          [ L [ K "i32.eqz" ];
             L [ K "if";
                 L ( [ K "then";
                       L [ K "i32.const"; N (I32 0l) ];
@@ -852,17 +859,25 @@ let alloc_non_atom fpad descr size tag =
             ];
         ];
       ] |> List.flatten
-    else
-      [ L [ K "i32.const"; ID "caml_alloc_shr" ];
-        L [ K "i32.const"; N (I32 (Int32.of_int size)) ];
-        L [ K "i32.const"; N (I32 (Int32.of_int tag)) ];
-        L [ K "call"; ID "wasicaml_wraptry2" ];
-        L [ K "local.tee"; ID ptr ];
-        L [ K "i32.eqz" ];
-        L [ K "if";
-            L ([K "then"] @ throw fpad)
-          ]
-      ] in
+    else (
+      fpad.need_lroots <- true;
+      push_domain_field domain_field_local_roots
+      @ pop_to_local "lroots"
+      @ [ L [ K "i32.const"; ID "caml_alloc_shr" ];
+          L [ K "i32.const"; N (I32 (Int32.of_int size)) ];
+          L [ K "i32.const"; N (I32 (Int32.of_int tag)) ];
+          L [ K "call"; ID "wasicaml_wraptry2" ];
+        ]
+      @ ( push_local "lroots"
+          |> pop_to_domain_field domain_field_local_roots
+        )
+      @ [ L [ K "local.tee"; ID ptr ];
+          L [ K "i32.eqz" ];
+          L [ K "if";
+              L ([K "then"] @ throw fpad)
+            ]
+        ]
+    ) in
   (code, ptr, young)
 
 let alloc fpad descr size tag =
@@ -899,9 +914,12 @@ let grab_helper gpad =
             L [ K "result"; K "i32" ];
             L [ K "local"; ID "accu"; K "i32" ];
             L [ K "local"; ID "i"; K "i32" ];
+            L [ K "local"; ID "lroots"; K "i32" ];
           ];
 
           setup_for_gc fpad descr;
+          push_domain_field domain_field_local_roots;
+          pop_to_local "lroots";
           [ L [ K "i32.const"; ID "caml_alloc_small" ];
             L [ K "local.get"; ID "extra_args" ];
             L [ K "i32.const"; N (I32 4l) ];
@@ -910,6 +928,8 @@ let grab_helper gpad =
             L [ K "call"; ID "wasicaml_wraptry2" ];
             L [ K "local.set"; ID "accu" ];
           ];
+          push_local "lroots"
+          |> pop_to_domain_field domain_field_local_roots;
           restore_after_gc fpad descr;  (* won't overwrite accu *)
           [ L [ K "local.get"; ID "accu" ];
             L [ K "i32.eqz" ];
@@ -2323,6 +2343,7 @@ let wraptry n =
     sprintf "wasicaml_wraptry%d" n
 
 let c_call gpad fpad descr src_list name =
+  fpad.need_lroots <- true;
   let descr = { descr with stack_save_accu = false } in (* it is overwritten *)
   let sexpl_setup = setup_for_gc fpad descr in
   let sexpl_restore = restore_after_gc fpad descr in
@@ -2332,6 +2353,12 @@ let c_call gpad fpad descr src_list name =
       (fun src -> push_const 21l @ push_as fpad src RValue @ [ L [ K "call"; ID "debug2" ]])
       src_list |> List.flatten in
    *)
+  let sexpl_save_lroots =
+    push_domain_field domain_field_local_roots
+    @ pop_to_local "lroots" in
+  let sexpl_restore_lroots =
+    push_local "lroots"
+    |> pop_to_domain_field domain_field_local_roots in
   let sexpl_args =
     [ L [ K "i32.const"; ID name ] ]
     @ List.concat_map
@@ -2356,13 +2383,21 @@ let c_call gpad fpad descr src_list name =
   Hashtbl.replace gpad.primitives name ty;
   (* debug2 20 0 *)
   (* @ sexpl_debug_args *)
-  sexpl_setup @ sexpl_args @ sexpl_call @ sexpl_restore @ sexpl_exncheck
+  sexpl_setup @ sexpl_save_lroots @ sexpl_args @ sexpl_call
+  @ sexpl_restore_lroots @ sexpl_restore @ sexpl_exncheck
   (* @ debug2 20 1 *)
 
 let c_call_vector gpad fpad descr numargs depth name =
+  fpad.need_lroots <- true;
   let descr = { descr with stack_save_accu = false } in (* it is overwritten *)
   let sexpl_setup = setup_for_gc fpad descr in
   let sexpl_restore = restore_after_gc fpad descr in
+  let sexpl_save_lroots =
+    push_domain_field domain_field_local_roots
+    @ pop_to_local "lroots" in
+  let sexpl_restore_lroots =
+    push_local "lroots"
+    |> pop_to_domain_field domain_field_local_roots in
   let sexpl_call =
     [ L [ K "i32.const"; ID name ] ]
     @ push_field_addr "fp" (-depth)
@@ -2382,7 +2417,8 @@ let c_call_vector gpad fpad descr numargs depth name =
       L [ K "result"; K "i32" ] ] in
   Hashtbl.replace gpad.primitives name ty;
   (* debug2 20 0 *)
-  sexpl_setup @ sexpl_call @ sexpl_restore @ sexpl_exncheck
+  sexpl_setup @ sexpl_save_lroots @ sexpl_call
+  @ sexpl_restore_lroots @ sexpl_restore @ sexpl_exncheck
 
 let string_label =
   function
@@ -3277,6 +3313,8 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
 
   if fpad.need_xalloc then
     Hashtbl.add fpad.lpad.locals "xalloc" RValue;
+  if fpad.need_lroots then
+    Hashtbl.add fpad.lpad.locals "lroots" RValue;
   if fpad.need_tmp1_i32 then
     Hashtbl.add fpad.lpad.locals "tmp1_i32" RValue;
   if fpad.need_tmp2_i32 then
