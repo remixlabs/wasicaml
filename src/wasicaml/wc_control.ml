@@ -400,6 +400,8 @@ let split_main_function cfg =
           | I.Kswitch(plist,qlist) ->
               Array.iter exclude plist;
               Array.iter exclude qlist;
+          | I.Kpushtrap lab ->
+              set_depth (!d-4) lab
           | _ ->
               ()
       done;
