@@ -63,6 +63,20 @@ open Wc_instruct
    caught, and it is then jumped to the exception handler. Outside such
    a block nothing special is done, and exceptions fall through to the
    caller - this is the fast path.
+
+   Note some details of the mechanism:
+
+   - We need to save and restore the pointer to local roots when an
+     exception is caught. This is simply because C functions do not
+     remove local roots before they throw an exception, and the restoration
+     needs to be done by the caller. - This type of save&restore is
+     done by the generated code, here in this module.
+   - There is also a (hidden) pointer to the top of the C shadow stack.
+     This pointer also needs to be restored when an exception is caught.
+     We force the C compiler to generate such code by defining a local
+     variable in the wasicaml_wraptry functions. This variable is also
+     declared as "volatile" so that it cannot be optimized away, even
+     if it is not used for anything.
  *)
 
 type wasm_value_type =
