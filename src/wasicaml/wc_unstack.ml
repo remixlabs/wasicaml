@@ -81,10 +81,7 @@ type state =
        logical accu value.
      *)
     arity : int option;
-    (* number of args pf the current function. This is unknown for
-       Wasm functions that are generated for "try" bodies, and so
-       arity=None in this case.-
-     *)
+    (* number of args pf the current function *)
   }
 
 (* IDEA: there is sometimes code setting the accu, but then the accu
@@ -722,7 +719,6 @@ let transl_instr lpad state instr =
     | Kconst _ ->
         assert false
     | Kacc sp ->
-        (*
         ( match state.arity with
             | Some n ->
                 if sp < 0 || sp >= state.camldepth + n then (
@@ -730,18 +726,15 @@ let transl_instr lpad state instr =
                   eprintf "[DEBUG] state=%s\n%!" (string_of_state state);
                   assert false;
                 )
-            | None -> ()
+            | None ->
+                assert false
         );
-         *)
         let state =
-         (*  match state.arity with
+          match state.arity with
             | Some _ ->
                 { state with accu = List.nth state.camlstack sp }
-            | None -> *)
-                if sp < state.camldepth then
-                  { state with accu = List.nth state.camlstack sp }
-                else
-                  { state with accu = RealStack (-state.camldepth + sp) } in
+            | None ->
+                assert false in
         (state, [])
     | Kpush ->
         let state = push_camlstack state.accu state in
@@ -1130,8 +1123,6 @@ let transl_instr lpad state instr =
                 );
                 (state, [ Wreturn { src=state.accu; arity=n } ])
             | None ->
-                (* Kreturn not allowed in "try" body *)
-                eprintf "[DEBUG] Assertion failed in letrec%d: Kreturn in try body\n" lpad.letrec_label;
                 assert false
         )
     | Kgrab num ->
@@ -1143,7 +1134,6 @@ let transl_instr lpad state instr =
                 );
                 (state, [ Wcomment (sprintf "omitted Kgrab %d" num) ])
             | None ->
-                eprintf "[DEBUG] Assertion failed in letrec%d: Kgrab in try body\n" lpad.letrec_label;
                 assert false;
         )
     | Kclosure(lab, num) ->
