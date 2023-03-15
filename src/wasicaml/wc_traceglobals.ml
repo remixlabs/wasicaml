@@ -117,7 +117,7 @@ let trace_globals_of_fblock globals_table fblock =
             eprintf "[DEBUG] Bad label: %d\n" label;
             eprintf "[DEBUG] stack.length=%d lstack.length=%d\n"
                     stack.length lstack.length;
-            Wc_tracestack.dump fblock.block 0;
+            Wc_control.dump_block fblock.block 0;
             assert false;
           );
           let merged = merge_stacks stack lstack in
@@ -127,6 +127,19 @@ let trace_globals_of_fblock globals_table fblock =
               Hashtbl.add shape_table label stack
       )
       labels in
+
+  let push shape d =
+    let nstack = Array.make d Unknown |> Array.to_list in
+    { stack = nstack @ shape.stack;
+      length = shape.length + d;
+      accu = Unknown
+    } in
+
+  let pop shape d =
+    { stack = delete d shape.stack;
+      length = shape.length - d;
+      accu = Unknown
+    } in
 
   let trace_instr shape i =
     match i with
@@ -197,16 +210,9 @@ let trace_globals_of_fblock globals_table fblock =
       | _ ->
           let d = Wc_traceinstr.trace_stack_instr 0 i in
           if d > 0 then
-            let nstack = Array.make d Unknown |> Array.to_list in
-            { stack = nstack @ shape.stack;
-              length = shape.length + d;
-              accu = Unknown
-            }
+            push shape d
           else if d < 0 then
-            { stack = delete (-d) shape.stack;
-              length = shape.length + d;
-              accu = Unknown
-            }
+            pop shape (-d)
           else
             { shape with accu = Unknown } in
 
@@ -224,14 +230,16 @@ let trace_globals_of_fblock globals_table fblock =
               update_shape_table shape labels;
               let stack' = trace_instr shape i in
               stack'
-          | Trap { catchlabel; poplabel=Some pop } ->
-              update_shape_table shape [ catchlabel; pop ];
-              shape
-          | Trap { catchlabel; poplabel=None } ->
+          | Trap { labels={trylabel; catchlabel}; poplabel=Some pop } ->
+              let trap_shape = push shape 4 in
               update_shape_table shape [ catchlabel ];
-              shape
-          | TryReturn ->
-              shape
+              update_shape_table trap_shape [ trylabel; pop ];
+              trap_shape
+          | Trap { labels={trylabel; catchlabel}; poplabel=None } ->
+              let trap_shape = push shape 4 in
+              update_shape_table shape [ catchlabel ];
+              update_shape_table trap_shape [ trylabel ];
+              trap_shape
           | NextMain _ ->
               shape
           | Block inner ->

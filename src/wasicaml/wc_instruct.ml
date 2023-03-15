@@ -139,7 +139,7 @@ type terneffect =
 
 type winstruction =
   | Wcomment of string
-  | Wblock of { label:label; body:winstruction list }
+  | Wblock of { label:label; scope:Wc_control.cfg_scope; body:winstruction list }
   | Wcond of { cond:bool ref; ontrue:winstruction; onfalse:winstruction }
   | Wcopy of { src:store; dest:store }   (* only non-allocating copies *)
   | Walloc of { src:store; dest:store; descr:stack_descriptor }
@@ -184,7 +184,6 @@ type winstruction =
                      descr:stack_descriptor (* also "accu" can be used *)
                    }
   | Wraise of { src:store; kind:Lambda.raise_kind }
-  | Wtrap of { trylabel:int; catchlabel:int; depth:int }
   | Wtryreturn of { src:store }
   | Wnextmain of { label:int }
   | Wstop
@@ -377,9 +376,6 @@ let rec string_of_winstruction =
                |> String.concat ",")
   | Wraise arg ->
       sprintf "Wraise(%s)" (string_of_store arg.src)
-  | Wtrap arg ->
-      sprintf "Wtrap(try label%d catch label%d, depth=%d)"
-              arg.trylabel arg.catchlabel arg.depth
   | Wtryreturn arg ->
       sprintf "Wtryreturn(%s)" (string_of_store arg.src)
   | Wnextmain arg ->

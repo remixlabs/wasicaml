@@ -39,7 +39,8 @@ type structured_code =
    }
 
  and block =
-   { loop_label : int option;
+   { block_scope : cfg_scope;
+     loop_label : int option;
      (* a label pointing to the beginning of this block, for jumping back *)
      instructions : instruction array;
      (* what to execute *)
@@ -52,8 +53,7 @@ type structured_code =
    | Block of block
    | Label of int   (* precedes a sequence of Simple instructions *)
    | Simple of I.instruction
-   | Trap of { trylabel: int; catchlabel: int; poplabel: int option }
-   | TryReturn
+   | Trap of full_trap_labels
    | NextMain of int
 
  and cfg_scope =
@@ -62,19 +62,25 @@ type structured_code =
        belongs *)
     cfg_func_label : int;
     (* label of current function, or 0 for the init block *)
-    cfg_try_labels : int list;
+    cfg_try_labels : trap_labels list;
     (* surrounding "try" sections, inner to outer *)
     cfg_main : bool;
     (* this is a main scope *)
   }
 
-type trap_info =
-  | Trap_push of int * int option
-  | Trap_pop of int * int
+ and trap_labels =
+   { trylabel: int;
+     catchlabel: int;
+   }
 
-type try_info =
-  | Try_entry of int
-  | Try_exit
+ and full_trap_labels =
+   { labels: trap_labels;
+     poplabel: int option
+   }
+
+type trap_info =
+  | Trap_push of full_trap_labels
+  | Trap_pop of trap_labels
 
 (* try/catch:
 
@@ -84,10 +90,7 @@ type try_info =
      cfg_succ = [ outer_2_label; catch_label ]
    try_label:
      cfg_try = Try_entry exit_label
-     ... finally any jump to outer_2_label is replaced by new exit_label
-   exit_label:
-     cfg_try = Try_exit
-     no instructions (symbolic node)
+     ... finally jumps to pop_label
    pop_label:
      Kpoptrap;
      cfg_trap = Trap_pop(try_label, exit_label)
@@ -99,7 +102,6 @@ type cfg_node =
     (* label of this sequence of non-jumping instructions *)
     (* if cfg_node_label = cfg_func_label, this node is the beginning of
        a function/init block *)
-    cfg_try : try_info option;
     cfg_trap : trap_info option;
     (* whether this is the start of a "try" section *)
     mutable cfg_loops : int list;
@@ -138,3 +140,4 @@ val recover_structure : cfg -> structured_code
 val validate : structured_code -> unit
 
 val string_of_scope : cfg_scope -> string
+val dump_block : block -> int -> unit
