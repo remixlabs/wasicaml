@@ -10,6 +10,7 @@ init=""
 out=""
 noexe=0
 nextout=0
+eh=0
 for arg in "$@"; do
     if [ $nextout -gt 0 ]; then
         out="$arg"
@@ -25,6 +26,8 @@ for arg in "$@"; do
             noexe=1 ;;
         -o)
             nextout=1 ;;
+        -mexception-handling)
+            eh=1 ;;
         -shared)
             echo "Shared libs not supported" >&2
             exit 1 ;;
@@ -41,7 +44,11 @@ done
 genwrapper=0
 if [ $noexe -eq 0 ]; then
     genwrapper=1
-    init="$root/lib/initwasi.o -Wl,--stack-first -lwasi-emulated-process-clocks"
+    initobjs="$root/lib/initwasi.o"
+    if [ $eh -gt 0 ]; then
+        initobjs="$root/lib/initwasi_eh.o $root/lib/initwasi_eh_helpers.o"
+    fi
+    init="$initobjs -Wl,--stack-first -lwasi-emulated-process-clocks"
     case "$out" in
         *.wasm)
             genwrapper=0

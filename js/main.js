@@ -29,11 +29,36 @@ class OCamlExn extends Error {
 function wasicaml_try(session) {
     return function(f, ctx) {
         try {
-            session.instance.exports.wasicaml_call(f, ctx);
-            return 0;
+            return session.instance.exports.wasicaml_call(f, ctx);
         } catch (e) {
             if (e instanceof OCamlExn) {
-                return 1;
+                return 0;
+            } else
+                throw e;
+        }
+    }
+}
+
+function wasicaml_try2(session) {
+    return function(f, ctx1, ctx2) {
+        try {
+            return session.instance.exports.wasicaml_call2(f, ctx1, ctx2);
+        } catch (e) {
+            if (e instanceof OCamlExn) {
+                return 0;
+            } else
+                throw e;
+        }
+    }
+}
+
+function wasicaml_try3(session) {
+    return function(f, ctx1, ctx2, ctx3) {
+        try {
+            return session.instance.exports.wasicaml_call3(f, ctx1, ctx2, ctx3);
+        } catch (e) {
+            if (e instanceof OCamlExn) {
+                return 0;
             } else
                 throw e;
         }
@@ -43,11 +68,23 @@ function wasicaml_try(session) {
 function wasicaml_try4(session) {
     return function(f, ctx1, ctx2, ctx3, ctx4) {
         try {
-            session.instance.exports.wasicaml_call4(f, ctx1, ctx2, ctx3, ctx4);
-            return 0;
+            return session.instance.exports.wasicaml_call4(f, ctx1, ctx2, ctx3, ctx4);
         } catch (e) {
             if (e instanceof OCamlExn) {
-                return 1;
+                return 0;
+            } else
+                throw e;
+        }
+    }
+}
+
+function wasicaml_try5(session) {
+    return function(f, ctx1, ctx2, ctx3, ctx4, ctx5) {
+        try {
+            return session.instance.exports.wasicaml_call5(f, ctx1, ctx2, ctx3, ctx4, ctx5);
+        } catch (e) {
+            if (e instanceof OCamlExn) {
+                return 0;
             } else
                 throw e;
         }
@@ -125,7 +162,10 @@ async function instantiate(wasm_mod, args) {
     const importObject =
           { wasi_snapshot_preview1: wasi_imports,
             wasicaml: { "wasicaml_try": wasicaml_try(session),
+                        "wasicaml_try2": wasicaml_try2(session),
+                        "wasicaml_try3": wasicaml_try3(session),
                         "wasicaml_try4": wasicaml_try4(session),
+                        "wasicaml_try5": wasicaml_try5(session),
                         "wasicaml_throw": wasicaml_throw(session),
                         "wasicaml_system": wasicaml_system(session),
                         "wasicaml_rename": wasicaml_rename(session)

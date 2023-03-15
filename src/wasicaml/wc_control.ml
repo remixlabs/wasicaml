@@ -15,7 +15,8 @@ type structured_code =
    }
 
  and block =
-   { loop_label : int option;
+   { block_scope : cfg_scope;
+     loop_label : int option;
      instructions : instruction array;
      break_label : int option;
    }
@@ -24,29 +25,33 @@ type structured_code =
    | Block of block
    | Label of int
    | Simple of I.instruction
-   | Trap of { trylabel: int; catchlabel: int; poplabel: int option }
-   | TryReturn
+   | Trap of full_trap_labels
    | NextMain of int
 
  and cfg_scope =
   { cfg_letrec_label : int option;
     cfg_func_label : int;
-    cfg_try_labels : int list;
+    cfg_try_labels : trap_labels list;
     cfg_main : bool;
   }
 
-type trap_info =
-  | Trap_push of int * int option
-  | Trap_pop of int * int
+ and trap_labels =
+   { trylabel: int;
+     catchlabel: int;
+   }
 
-type try_info =
-  | Try_entry of int
-  | Try_exit
+ and full_trap_labels =
+   { labels: trap_labels;
+     poplabel: int option
+   }
+
+type trap_info =
+  | Trap_push of full_trap_labels
+  | Trap_pop of trap_labels
 
 type cfg_node =
   { cfg_scope : cfg_scope;
     cfg_node_label : int;
-    cfg_try : try_info option;
     cfg_trap : trap_info option;
     mutable cfg_loops : int list;
     cfg_succ : int list;
@@ -61,6 +66,9 @@ type cfg =
     mutable labels : ISet.t;
   }
 
+let string_of_labels lab =
+  sprintf "[try:%d,catch:%d]" lab.trylabel lab.catchlabel
+
 let string_of_scope s =
   sprintf "[letrec=%s,func=%d,try=%s]"
           ( match s.cfg_letrec_label with
@@ -68,7 +76,36 @@ let string_of_scope s =
               | Some l -> string_of_int l
           )
           s.cfg_func_label
-          (List.map string_of_int s.cfg_try_labels |> String.concat ",")
+          (List.map string_of_labels s.cfg_try_labels |> String.concat ",")
+
+let rec dump_block block indent =
+  let open Wc_util in
+  let istr = String.make (4*indent) ' ' in
+  eprintf "%sBLOCK %s%s\n"
+          istr
+          ( match block.loop_label with
+              | Some l -> sprintf "loop=%d" l
+              | None -> ""
+          )
+          ( match block.break_label with
+              | Some l -> sprintf "break=%d" l
+              | None -> ""
+          );
+  Array.iter
+    (function
+     | Label label ->
+         eprintf "%sLABEL %d\n" istr label
+     | Simple i ->
+         eprintf "%s%s\n" istr (string_of_kinstruction i)
+     | Trap { labels = { trylabel; catchlabel }; poplabel } ->
+         eprintf "%sTrap try=%d catch=%d pop=%s\n" istr trylabel catchlabel
+                 (Option.map string_of_int poplabel |> Option.value ~default:"")
+     | NextMain label ->
+         eprintf "%sNextMain %d\n" istr label
+     | Block inner ->
+         dump_block inner (indent+1)
+    )
+    block.instructions
 
 let detect_loops ctx =
   let visited = ref ISet.empty in
@@ -124,10 +161,7 @@ let detect_loops ctx =
   IMap.iter
     (fun label node ->
         let is_entry =
-          label = node.cfg_scope.cfg_func_label ||
-            match node.cfg_try with
-              | Some (Try_entry _) -> true
-              | _ -> false in
+          label = node.cfg_scope.cfg_func_label in
       if is_entry then
         recurse ISet.empty label
     )
@@ -158,19 +192,13 @@ let not_continuing instr =
     | Kstop -> true
     | _ -> false
 
-let is_trapping instr =
+let match_pushtrap instr =
   match instr with
-    | I.Kpushtrap _ -> true
-    | _ -> false
+    | I.Kpushtrap catchlabel -> Some catchlabel
+    | _ -> None
 
 let create_cfg code labels =
   let labels = ref labels in
-  let max_label = ref (Array.length code - 1) in
-  let new_label () =
-    let label = !max_label + 1 in
-    labels := ISet.add label !labels;
-    max_label := label;
-    label in
   let nodes = Hashtbl.create 7 in
   let queued = Hashtbl.create 7 in
   let pushtraps = ref IMap.empty in
@@ -229,77 +257,55 @@ let create_cfg code labels =
         )
         flabs
     done;
+    let pushtrap_opt = match_pushtrap code.(start + !n - 1) in
+    let is_poptrap = code.(start) = Kpoptrap in
     let last_no_cont = not_continuing code.(start + !n - 1) in
     let last_clabs = if last_no_cont then [] else [start + !n] in
     let last_jlabs = jump_labels code.(start + !n - 1) in
     let cfg_succ = last_clabs @ last_jlabs in
-    let is_pushtrap = is_trapping code.(start + !n - 1) in
-    let is_poptrap = code.(start) = Kpoptrap in
     let cfg_final, cfg_length =
       match code.(start + !n - 1) with
         | Kbranch lab as instr ->
             (Some instr, !n-1)
         | _ ->
-            if last_no_cont || is_pushtrap then
+            if last_no_cont || pushtrap_opt <> None then
               (None, !n)
             else
               (Some (I.Kbranch (start + !n)), !n) in
-    let cfg_try =
-      match cfg_scope.cfg_try_labels with
-        | lab :: _ when lab = start ->
-            let exit_label = new_label () in
-            let exit_node =
-              { cfg_scope;
-                cfg_node_label = exit_label;
-                cfg_try = Some Try_exit;
-                cfg_trap = None;
-                cfg_loops = [];  (* later *)
-                cfg_succ = [];
-                cfg_length = 0;
-                cfg_final = None;
-                cfg_next_main = None;
-              } in
-            Hashtbl.replace nodes exit_label exit_node;
-            Some (Try_entry exit_label)
-        | _ -> None in
-    if is_pushtrap then
+    if pushtrap_opt <> None then
       pushtraps := IMap.add (start + !n) start !pushtraps;
     let cfg_trap =
-      if is_pushtrap then
-        Some (Trap_push (start + !n, None))
-      else if is_poptrap then
-        match popfrom with
-          | None ->
-              eprintf "[DEBUG] start=%d n=%d\n%!" start !n;
-              assert false
-          | Some lab ->
-              (* Fix up cfg_succ in the corresponding Trap_push node: *)
-              let push_label =
-                try IMap.find lab !pushtraps
-                with Not_found -> assert false in
-              let push_node = Hashtbl.find nodes push_label in
-              let push_node' =
-                { push_node with
-                  cfg_trap = ( match push_node.cfg_trap with
-                                 | Some (Trap_push(try_label, _)) ->
-                                     Some (Trap_push(try_label, Some start))
-                                 | _ -> assert false
-                             );
-                  cfg_succ = start :: List.tl push_node.cfg_succ
-                } in
-              Hashtbl.replace nodes push_label push_node';
-              let try_node = Hashtbl.find nodes lab in
-              let exit_node =
-                match try_node.cfg_try with
-                  | Some (Try_entry l) -> l
-                  | _ -> assert false in
-              Some (Trap_pop (lab, exit_node))
-      else
-        None in
+      match pushtrap_opt with
+        | Some catchlabel ->
+            let labels = { trylabel=start + !n; catchlabel } in
+            Some (Trap_push { labels; poplabel=None })
+        | None ->
+            if is_poptrap then
+              match popfrom with
+                | None ->
+                    eprintf "[DEBUG] start=%d n=%d\n%!" start !n;
+                    assert false
+                | Some labels ->
+                    (* Fix up in the corresponding Trap_push node: *)
+                    let push_label =
+                      try IMap.find labels.trylabel !pushtraps
+                      with Not_found -> assert false in
+                    let push_node = Hashtbl.find nodes push_label in
+                    let push_node' =
+                      { push_node with
+                        cfg_trap = ( match push_node.cfg_trap with
+                                       | Some (Trap_push { labels }) ->
+                                           Some (Trap_push { labels; poplabel = Some start })
+                                       | _ -> assert false
+                                   );
+                      } in
+                    Hashtbl.replace nodes push_label push_node';
+                    Some (Trap_pop labels)
+            else
+              None in
     let cfg_node =
       { cfg_scope;
         cfg_node_label = start;
-        cfg_try;
         cfg_trap;
         cfg_loops = [];  (* later *)
         cfg_succ;
@@ -311,13 +317,19 @@ let create_cfg code labels =
     if not last_no_cont then (
       let next = start + !n in
       let scope =
-        if is_pushtrap then
-          { cfg_scope with cfg_try_labels = next :: cfg_scope.cfg_try_labels }
-        else
-          if code.(next) = Kpoptrap then
-            { cfg_scope with cfg_try_labels = List.tl cfg_scope.cfg_try_labels }
-          else
-            cfg_scope in
+        match pushtrap_opt with
+          | Some catchlabel ->
+              let labels = { trylabel = next; catchlabel } in
+              { cfg_scope with
+                cfg_try_labels = labels :: cfg_scope.cfg_try_labels
+              }
+          | None ->
+              if code.(next) = Kpoptrap then
+                { cfg_scope with
+                  cfg_try_labels = List.tl cfg_scope.cfg_try_labels
+                }
+              else
+                cfg_scope in
       let popfrom =
         if code.(next) = Kpoptrap then
           Some (List.hd cfg_scope.cfg_try_labels)
@@ -337,40 +349,13 @@ let create_cfg code labels =
       )
       last_jlabs
   done;
-  (* Fixup: all jumps to a Trap_pop are changed to the Try_exit node
-     (except in the Trap_push node)
-   *)
-  let map_label lab =
-    try
-      let n = Hashtbl.find nodes lab in
-      match n.cfg_trap with
-        | Some (Trap_pop(_, exit_label)) ->
-            exit_label
-        | _ ->
-            lab
-    with Not_found -> lab in
   let nodemap = ref IMap.empty in
-  Hashtbl.iter
-    (fun label node ->
-      let node =
-        match node.cfg_trap with
-          | Some (Trap_push _) ->
-              (* there's only the Kpushtrap in it, which needs not to be
-                 fixed up *)
-              node
-          | _ ->
-              { node with
-                cfg_succ = List.map map_label node.cfg_succ;
-                cfg_final = ( match node.cfg_final with
-                                | None -> None
-                                | Some instr ->
-                                    Some (Wc_reader.map_label_in_instr map_label instr)
-                            );
-              } in
-      nodemap := IMap.add label node !nodemap
-    )
-    nodes;
-  let code = Array.map (Wc_reader.map_label_in_instr map_label) code in
+   Hashtbl.iter
+     (fun label node ->
+       (* eprintf "LABEL %d: SCOPE %s\n" label (string_of_scope node.cfg_scope); *)
+       nodemap := IMap.add label node !nodemap
+     )
+     nodes;
   let cfg =
     { nodes = !nodemap;
       code;
@@ -415,6 +400,8 @@ let split_main_function cfg =
           | I.Kswitch(plist,qlist) ->
               Array.iter exclude plist;
               Array.iter exclude qlist;
+          | I.Kpushtrap lab ->
+              set_depth (!d-4) lab
           | _ ->
               ()
       done;
@@ -474,19 +461,19 @@ let recover_structure ctx =
       try IMap.find label !in_degree
       with Not_found -> 0 in
    in_degree := IMap.add label (deg+1) !in_degree;
-    if deg = 0 then (
-      let node =
-        try IMap.find label ctx.nodes
-        with Not_found -> assert false in
-      let trail' = ISet.add label trail in
-      let eff_succ =
-        List.filter
-          (fun lab ->
-            not (ISet.mem lab trail')
-          )
-          node.cfg_succ in
-      List.iter (inc_degree trail') eff_succ
-    ) in
+   if deg = 0 then (
+     let node =
+       try IMap.find label ctx.nodes
+       with Not_found -> assert false in
+     let trail' = ISet.add label trail in
+     let eff_succ =
+       List.filter
+         (fun lab ->
+           not (ISet.mem lab trail')
+         )
+         node.cfg_succ in
+     List.iter (inc_degree trail') eff_succ
+   ) in
   let rec dec_degree trail label =
     let deg =
       try IMap.find label !in_degree
@@ -503,8 +490,7 @@ let recover_structure ctx =
             not (ISet.mem lab trail')
           )
           node.cfg_succ in
-      ( [label] :: List.map (dec_degree trail') eff_succ )
-      |> List.flatten
+      label :: List.concat_map (dec_degree trail') eff_succ
     ) else
       [] in
 
@@ -532,19 +518,13 @@ let recover_structure ctx =
                    match instr with
                      | I.Kpushtrap catchlabel ->
                          ( match node.cfg_trap with
-                             | Some(Trap_push(trylabel, poplabel)) ->
-                                 Trap { trylabel; catchlabel; poplabel }
+                             | Some(Trap_push { labels; poplabel }) ->
+                                 Trap { labels; poplabel }
                              | _ ->
                                  assert false
                          )
                      | _ -> Simple instr
                  )
-            |> (fun a1 ->
-              match node.cfg_try with
-                | Some Try_exit ->
-                    Array.append a1 [| TryReturn |]
-                | _ -> a1
-            )
             |> (fun a1 ->
               match node.cfg_final with
                 | None -> a1
@@ -569,12 +549,13 @@ let recover_structure ctx =
               match labels' with
                 | [] -> None
                 | lab :: _ -> Some lab in
-            let inner' =
-              [ { loop_label = None;
-                  break_label;
-                  instructions
-                }
-              ] in
+            let b =
+              { block_scope = node.cfg_scope;
+                loop_label = None;
+                break_label;
+                instructions
+              } in
+            let inner' = [ b ] in
             build_block node_loop loops_started inner' labels'
           else
             let loop_start_label =
@@ -588,7 +569,8 @@ let recover_structure ctx =
             let loop_body =
               build_block node_loop (node_loop :: loops_started) [] loop_labels in
             let loop_block =
-              { loop_label = node_loop;
+              { block_scope = node.cfg_scope;
+                loop_label = node_loop;
                 break_label = None;
                 instructions = [| Block loop_body |]
               } in
@@ -601,7 +583,8 @@ let recover_structure ctx =
                 | [] -> None
                 | lab :: _ -> Some lab in
             let inner' =
-              [ { loop_label = None;
+              [ { block_scope = node.cfg_scope;
+                  loop_label = None;
                   break_label;
                   instructions;
                 }
@@ -614,7 +597,8 @@ let recover_structure ctx =
                   let instructions =
                     List.map (fun b -> Block b) inner
                     |> Array.of_list in
-                  { loop_label = None;
+                  { block_scope = (List.hd inner).block_scope;
+                    loop_label = None;
                     break_label = None;
                     instructions
                   }
@@ -623,10 +607,7 @@ let recover_structure ctx =
     IMap.filter_map
       (fun label node ->
         let is_entry =
-          label = node.cfg_scope.cfg_func_label ||
-            match node.cfg_try with
-              | Some (Try_entry _) -> true
-              | _ -> false in
+          label = node.cfg_scope.cfg_func_label in
         if is_entry then (
           inc_degree ISet.empty label;
           let sorted_block_labels = dec_degree ISet.empty label in
@@ -688,10 +669,8 @@ let validate scode =
                   let labels = Wc_reader.get_labels_in_instr instr in
                   List.iter (validate_label labels_in_scope func_label last_label) labels
           )
-      | Trap { catchlabel } ->
+      | Trap { labels = { catchlabel } } ->
           validate_label labels_in_scope func_label last_label catchlabel
-      | TryReturn ->
-          ()
       | Label _ ->
           ()
       | NextMain _ ->
