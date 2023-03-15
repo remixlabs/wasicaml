@@ -545,7 +545,7 @@ let throw fpad =
     (* in outermost scope there is no caller - prefer to throw
        a real exception
      *)
-    [ L [ K "call"; ID "wasicaml_throw" ];
+    [ L [ K "call"; ID "wasicaml_wrapthrow" ];
       L [ K "unreachable" ]
     ]
   else
@@ -567,7 +567,7 @@ let raise_predef_exn fpad which drops =
   @ (if fpad.lpad.scope.cfg_main && fpad.lpad.scope.cfg_try_labels = [] then
        [ L [ K "call"; ID ("pick_" ^ which) ];
          L [ K "drop" ];
-         L [ K "call"; ID "wasicaml_throw" ];
+         L [ K "call"; ID "wasicaml_wrapthrow" ];
          L [ K "unreachable" ]
        ]
      else
@@ -3634,7 +3634,7 @@ let imp_functions =
     [ L [ K "param"; K "i32" ];
       L [ K "param"; K "i32" ];
     ];
-    "wasicaml", "wasicaml_throw",
+    "wasicaml", "wasicaml_wrapthrow",
     [];
   ]
 

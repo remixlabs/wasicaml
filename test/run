@@ -50,6 +50,9 @@ while [ $# -gt 0 ]; do
 	-multivalue)
 	    args="$args -enable-multivalue"
 	    shift ;;
+        -eh)
+            args="$args -enable-exception-handling"
+            shift ;;
 	-ocamlopt)
 	    with_ocamlopt=1
 	    shift ;;

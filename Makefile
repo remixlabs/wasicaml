@@ -87,11 +87,29 @@ configure-ocaml:
 		--prefix=$(prefix)
 	echo PRIMS_IR=true >> ocaml/Makefile.config
 
+LIBS = \
+	lib/initwasi.o \
+	lib/initwasi_eh.o \
+	lib/initwasi_eh_helpers.o \
+	lib/initruntime.o
+
 lib/initwasi.o: src/initwasi.c
 	mkdir -p lib
 	$(WASI_SDK)/bin/clang --sysroot=$(WASI_SDK)/share/wasi-sysroot \
 		-Iinclude \
 		-O -o lib/initwasi.o -c src/initwasi.c
+
+lib/initwasi_eh.o: src/initwasi.c
+	mkdir -p lib
+	$(WASI_SDK)/bin/clang --sysroot=$(WASI_SDK)/share/wasi-sysroot \
+		-Iinclude -DWASM_EH -mexception-handling \
+		-O -o lib/initwasi_eh.o -c src/initwasi.c
+
+lib/initwasi_eh_helpers.o: src/initwasi_eh_helpers.s
+	mkdir -p lib
+	$(WASI_SDK)/bin/clang --sysroot=$(WASI_SDK)/share/wasi-sysroot \
+		-mexception-handling \
+		-O -o lib/initwasi_eh_helpers.o -c src/initwasi_eh_helpers.s
 
 lib/initruntime.o: src/initruntime.c
 	mkdir -p lib
@@ -130,9 +148,8 @@ install-js:
 install-ocaml:
 	cd ocaml && make install
 
-install-lib: lib/initwasi.o lib/initruntime.o
-	cp lib/initwasi.o $(prefix)/lib
-	cp lib/initruntime.o $(prefix)/lib
+install-lib: $(LIBS)
+	cp $(LIBS) $(prefix)/lib
 
 install2: install-wasicaml
 
