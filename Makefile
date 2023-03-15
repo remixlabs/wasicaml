@@ -180,3 +180,6 @@ test-wasicaml:
 
 test-tail-calls:
 	cd test && ./run -tail-call -multivalue
+
+test-exc-handling:
+	cd test && ./run -eh -multivalue
