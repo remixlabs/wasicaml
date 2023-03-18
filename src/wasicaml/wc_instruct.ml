@@ -41,6 +41,11 @@ type store =
      *)
   | Const of int
     (* it's a constant *)
+  | LocalPos of int
+    (* it's in the local variable corresponding to RealStack. The name is
+       arg%d if the position is positive (function arguments), and
+       pos(-%d) otherwise (local stack positions). Representation is RValue.
+     *)
   | Local of repr * string
     (* stored in a local variable with the given name.
        There cannot be heap-allocated values in local variables, i.e.
@@ -92,7 +97,10 @@ type stack_descriptor =
     stack_depth : int;
     (* Depth of the stack - ignoring the uninitialized block at the top *)
     stack_save_accu : bool;
-    (* Whether the accu must be saved on the stack when a GC is possible *)
+    (* whether to save the accu before the GC *)
+    stack_save_locals : ISet.t;
+    (* Which local variables (pos%d and arg%d) must be saved to the stack
+       before GC *)
   }
 
 type unop =
@@ -198,7 +206,7 @@ let repr_comparable_as_i32 r1 r2 =
 
 let repr_of_store =
   function
-  | RealStack _ -> RValue
+  | RealStack _ | LocalPos _ -> RValue
   | Const _ -> RInt
   | Local(repr, _) -> repr
   | RealAccu _ -> RValue
@@ -220,12 +228,17 @@ let empty_descr =
   { stack_uninit = [];
     stack_depth = 0;
     stack_save_accu = false;
+    stack_save_locals = ISet.empty;
   }
+
+let string_of_localPos pos =
+  if pos <= 0 then sprintf "pos%d" (-pos) else sprintf "arg%d" pos
 
 let string_of_store =
   function
   | RealStack pos -> sprintf "fp[%d]" pos
   | RealAccu _ -> "accu"
+  | LocalPos pos -> string_of_localPos pos
   | Const k -> sprintf "%d" k
   | Local(repr, name) -> name
   | Atom k -> sprintf "atom%d" k

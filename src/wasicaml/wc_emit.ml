@@ -1722,6 +1722,8 @@ let push fpad store =
         push_const (Int32.of_int x)
     | RealStack pos ->
         push_stack fpad pos
+    | LocalPos pos ->
+        push_local (Wc_instruct.string_of_localPos pos)
     | Atom tag ->
         alloc_atom fpad tag
     | TracedGlobal(Glb glb_offset, path, _) ->
@@ -1767,6 +1769,9 @@ let pop_to fpad store repr descr_opt code_value =
     | RealStack pos ->
         (code_value @ tovalue_alloc fpad repr descr_opt)
         |> pop_to_stack fpad pos
+    | LocalPos pos ->
+        (code_value @ tovalue_alloc fpad repr descr_opt)
+        @ pop_to_local (Wc_instruct.string_of_localPos pos)
     | _ ->
         assert false
 
@@ -1781,6 +1786,9 @@ let copy fpad src dest descr_opt =
     | RealStack pos ->
         push_alloc_as fpad src RValue descr_opt
         |>  pop_to_stack fpad pos
+    | LocalPos pos ->
+        push_alloc_as fpad src RValue descr_opt
+        @ pop_to_local (Wc_instruct.string_of_localPos pos)
     | _ ->
         assert false
 
@@ -3488,7 +3496,9 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
     Hashtbl.add fpad.lpad.locals "tmp1_f64" RValue;
 
   let locals =
-    Hashtbl.fold (fun name vtype acc -> (name,vtype) :: acc) fpad.lpad.locals [] in
+    Hashtbl.fold (fun name vtype acc -> (name,vtype) :: acc) fpad.lpad.locals []
+    @ (Hashtbl.fold (fun pos _ acc -> (string_of_localPos pos,RValue) :: acc) fpad.lpad.localPos [])
+  in
 
   let letrec =
     [ L ( [ K "func";
