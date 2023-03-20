@@ -220,7 +220,7 @@ let empty_scope =
   { cfg_letrec_label = None;
     cfg_func_label = 0;
     cfg_try_labels = [];
-    cfg_is_pop_label = false;
+    (* cfg_is_pop_label = false; *)
     cfg_main = false
   }
 
