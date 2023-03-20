@@ -164,7 +164,7 @@ type winstruction =
   | Wmakefloatblock of { src:store list;
                          descr:stack_descriptor  } (* dest is always RealAccu *)
   | Wccall of { name:string; src:store list;
-                descr:stack_descriptor }
+                descr:stack_descriptor option }
     (* up to 5 args; dest is always RealAccu *)
   | Wccall_vector of { name:string; numargs:int; depth:int;
                        descr:stack_descriptor }

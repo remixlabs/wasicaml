@@ -48,8 +48,9 @@
 (* TODO
 
    - Wc_emit.throw: save all locals to stack positions
-   - save/restore when calling C functions
-   - save/restore when allocating (slow_alloc only)
+   - if avoid_locals, set the limit to 0
+   - make limit configurable. Check code size!
+   - check stack overflow
  *)
 
 open Printf
@@ -1091,30 +1092,24 @@ let transl_instr lpad state instr =
         (state, instrs)
     | Kccall (name, num) when num <= 5 ->
         let noalloc = Hashtbl.mem Wc_prims.prims_noalloc name in
-        let state, instrs_save =
-          if noalloc then
-            state, []
-          else
-            save_locals lpad state in
+        let state, instrs_adjust = adjust_locals lpad state in
         let state, instrs_flush = flush_accu lpad state in
         let src =
           (state.accu :: list_prefix (num-1) state.camlstack)
           |> List.map (real_store_d lpad state) in
-        let descr = stack_descr state in
+        let descr =
+          if noalloc then
+            None
+          else
+            Some { (stack_descr state) with stack_save_accu = false } in
         let no_function = Hashtbl.mem Wc_prims.prims_non_func_result name in
         let state =
           { state with accu = RealAccu { no_function }}
           |> popn_camlstack_disregard_accu (num-1) in
-        let state, instrs_restore =
-          if noalloc then
-            state, []
-          else
-            adjust_locals lpad state in
         let instrs =
-          instrs_save
+          instrs_adjust
           @ instrs_flush
-          @ [ Wccall { name; src; descr } ]
-          @ instrs_restore in
+          @ [ Wccall { name; src; descr } ] in
         (state, instrs)
     | Kccall (name, num) ->
         let state, instrs_save = save_locals lpad state in
@@ -1147,7 +1142,7 @@ let transl_instr lpad state instr =
         (state, instrs)
     | Kbranchifnot label ->
         let state, instrs_adjust = adjust_locals lpad state in
-        let (state, instrs_br) = branch lpad state label in
+        let (state_br, instrs_br) = branch lpad state label in
         let src = state.accu |> real_store_d lpad state in
         let instrs =
           instrs_adjust
