@@ -107,7 +107,7 @@ type state =
 
 type lpad =  (* local pad *)
   { letrec_label : int;
-    mutable scope : Wc_control.cfg_scope;
+    scope : Wc_control.cfg_scope;
     (* The scope of the current block *)
 
     locals : (string, repr) Hashtbl.t;
@@ -117,7 +117,7 @@ type lpad =  (* local pad *)
 
     localPos : (int, unit) Hashtbl.t;
 
-    mutable avoid_locals : bool;
+    avoid_locals : bool;
     (* try not to allocate locals in this function *)
 
     local_limit : int;
@@ -125,7 +125,7 @@ type lpad =  (* local pad *)
        just a preference - the actual number can be higher or lower
      *)
 
-    mutable loops : ISet.t;
+    loops : ISet.t ref;
     (* which labels are loop labels *)
 
     indegree : (int, int) Hashtbl.t;
@@ -137,15 +137,15 @@ type lpad =  (* local pad *)
     state_table : (int, state) Hashtbl.t;
     (* the start state by label *)
 
-    mutable globals_table : (int, Wc_traceglobals.initvalue) Hashtbl.t;
+    globals_table : (int, Wc_traceglobals.initvalue) Hashtbl.t;
     (* knowledge about the globals *)
 
-    mutable environment : Wc_traceglobals.initvalue array;
+    environment : Wc_traceglobals.initvalue array;
     (* knowledge about the environment of this function - can be the empty
        array if nothing is known
      *)
 
-    mutable func_offset : int;
+    func_offset : int;
     (* knowledge about the environment: this function is at position
        func_offset in the environment (only when environment <> [])
      *)
@@ -170,12 +170,20 @@ let empty_state =
   }
 
 let empty_lpad ~enable_returncall scope letrec_label =
+  let local_limit =
+    (* inside a try label do not prefer local variables over stack positions,
+       as we need to be able to jump to the catchlabel at any time
+     *)
+    if Wc_control.(scope.cfg_try_labels) = [] then
+      5 (* TODO: configure this *)
+    else
+      0 in
   { scope;
     locals = Hashtbl.create 7;
     localPos = Hashtbl.create 7;
     avoid_locals = false;
-    local_limit = 5;  (* TODO: configure this *)
-    loops = ISet.empty;
+    local_limit;
+    loops = ref ISet.empty;
     indegree = Hashtbl.create 7;
     state_table = Hashtbl.create 7;
     globals_table = Hashtbl.create 1;
@@ -184,6 +192,14 @@ let empty_lpad ~enable_returncall scope letrec_label =
     enable_returncall;
     letrec_label;
   }
+
+let lpad_with ~scope lpad =
+  let local_limit =
+    if Wc_control.(scope.cfg_try_labels) = [] then
+      lpad.local_limit
+    else
+      0 in
+  { lpad with scope; local_limit }
 
 let decl_store lpad store =
   match store with
@@ -706,7 +722,7 @@ let global_offset ident =
   int_of_string name
 
 let make_label lpad label =
-  if ISet.mem label lpad.loops then
+  if ISet.mem label !(lpad.loops) then
     Loop label
   else
     Label label
@@ -1114,7 +1130,7 @@ let transl_instr lpad state instr =
     | Kccall (name, num) ->
         let state, instrs_save = save_locals lpad state in
         let state, instrs_str = straighten_all lpad state in
-        let descr = stack_descr state in
+        let descr = { (stack_descr state) with stack_save_accu = false } in
         let depth = state.camldepth+1 in
         let no_function = Hashtbl.mem Wc_prims.prims_non_func_result name in
         let state =
@@ -1430,8 +1446,10 @@ let transl_instr lpad state instr =
     | Kpushtrap _ ->
         assert false   (* replaced by Trap, see below *)
     | Kpoptrap ->
-        let state, instrs = popn_camlstack lpad 4 state in
-        (state, instrs)
+        let trap_state = { state with localthold = -state.camldepth } in
+        let state, instrs_restore = adjust_locals lpad trap_state in
+        let state, instrs_pop = popn_camlstack lpad 4 state in
+        (state, instrs_restore @ instrs_pop)
     | Kraise kind ->
         (* Convention: no local variables on "catch" *)
         let state, instrs_save = save_locals lpad state in
@@ -1548,6 +1566,7 @@ let transl_fblock lpad fblock =
     with Not_found -> init_state in
 
   let rec transl_block block loops =
+    let lpad = lpad_with ~scope:block.block_scope lpad in
     let state = init_state in
     (* eprintf "BLOCK\n%!";*)
     let upd_loops =
@@ -1565,7 +1584,7 @@ let transl_fblock lpad fblock =
                 let cscope = Wcomment (string_of_scope block.block_scope) in
                 (state, comment ::cscope ::  acc)
             | Simple i ->
-                lpad.loops <- upd_loops;
+                lpad.loops := upd_loops;
                 let next_state, instrs = transl_instr lpad state i in
                 (*
                 eprintf "%s predepth=%d postdepth=%d\n%!"
@@ -1578,7 +1597,7 @@ let transl_fblock lpad fblock =
                 (next_state, List.rev_append (comment :: instrs) acc)
             | Trap { labels={trylabel; catchlabel}; poplabel } ->
                 (* Convention: no local variables on "catch" *)
-                let state, instrs_save = save_locals lpad state in
+                let state, instrs_save1 = save_locals lpad state in
                 let state, instrs_str = straighten_all lpad state in
                 let accu = real_accu in
                 let state_catch = { state with accu } in
@@ -1588,13 +1607,13 @@ let transl_fblock lpad fblock =
                 let state = push_camlstack (Const 0) state in
                 let state = push_camlstack (Const 0) state in
                 let state = push_camlstack (Const 0) state in
-                let state, instrs_adjust = adjust_locals lpad state in
+                let state, instrs_save2 = save_locals lpad state in
                 let state, instrs_str2 = straighten_all lpad state in
                 let instrs =
                   [ Wcomment (sprintf "***Trap(try=%d,catch=%d)" trylabel catchlabel) ]
-                  @ instrs_save
+                  @ instrs_save1
                   @ instrs_str
-                  @ instrs_adjust
+                  @ instrs_save2
                   @ instrs_str2
                   @ [ Wbranch { label=Label trylabel } ] in
                 update_state_table lpad state trylabel;

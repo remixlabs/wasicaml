@@ -119,7 +119,7 @@ type gpad =  (* global pad *)
   }
 
 type fpad =  (* function pad *)
-  { lpad : Wc_unstack.lpad;
+  { mutable lpad : Wc_unstack.lpad;
     fpad_letrec_label : letrec_label;
     mutable fpad_scope : Wc_control.cfg_scope;
     mutable maxdepth : int;
@@ -220,6 +220,7 @@ let empty_scope =
   { cfg_letrec_label = None;
     cfg_func_label = 0;
     cfg_try_labels = [];
+    cfg_is_pop_label = false;
     cfg_main = false
   }
 
@@ -864,10 +865,8 @@ let alloc_slow() =
                         L [ K "if";
                             L ( [ K "then";
                                   L [ K "i32.const"; N (I32 0l) ];
-                                  L [ K "i32.const"; N (I32 1l) ];
-                                ] @ (if !enable_multireturn then [] else
-                                       [ L [ K "global.set"; ID "retval2" ] ]) @
-                                  [ L [ K "return" ]]
+                                  L [ K "return" ]
+                                ]
                               )
                           ]
                       ]
@@ -3047,8 +3046,9 @@ let rec emit_instr gpad fpad instr =
     | Wcomment s ->
         []
     | Wblock arg ->
-        let old_scope = fpad.lpad.scope in
-        fpad.lpad.scope <- arg.scope;
+        let old_lpad = fpad.lpad in
+        let new_lpad = Wc_unstack.lpad_with ~scope:arg.scope old_lpad in
+        fpad.lpad <- new_lpad;
         let instrs =
           match arg.label with
             | Label lab ->
@@ -3068,7 +3068,7 @@ let rec emit_instr gpad fpad instr =
                       @ emit_instrs gpad fpad arg.body
                     )
                 ] in
-        fpad.lpad.scope <- old_scope;
+        fpad.lpad <- old_lpad;
         instrs
     | Wcond { cond; ontrue; onfalse } ->
         emit_instr gpad fpad (if !cond then ontrue else onfalse)
@@ -3276,7 +3276,8 @@ let rec extract_grab instrs =
 
 let emit_fblock_instrs gpad fpad instrs =
   fpad.disallow_grab <- false;
-  fpad.lpad.scope <- fpad.fpad_scope;
+  let lpad = Wc_unstack.lpad_with ~scope:fpad.fpad_scope fpad.lpad in
+  fpad.lpad <- lpad;
   let rest, grab_opt = extract_grab instrs in
   match grab_opt with
     | Some grab ->
@@ -3438,15 +3439,19 @@ let init_lpad_for_subfunc gpad fpad func_label =
     ( try Hashtbl.find gpad.glbfun_table func_label
       with Not_found -> 0, [| |]
     ) in
-  fpad.lpad.environment <- environment;
-  fpad.lpad.func_offset <- func_offset
+  fpad.lpad <- { fpad.lpad with
+                 environment;
+                 func_offset
+               }
 
 let generate_function scode gpad letrec_label func_name subfunc_labels export_flag =
   let fpad = empty_fpad letrec_label in
   Hashtbl.add fpad.lpad.locals "accu" RValue;
   Hashtbl.add fpad.lpad.locals "bp" RValue;
-  fpad.lpad.avoid_locals <- export_flag; (* avoid local vars in the long main function *)
-  fpad.lpad.globals_table <- gpad.globals_table;
+  fpad.lpad <- { fpad.lpad with
+                 avoid_locals = export_flag; (* avoid local vars in the long main function *)
+                 globals_table = gpad.globals_table;
+               };
 
   let subfunc_pairs =
     List.map
