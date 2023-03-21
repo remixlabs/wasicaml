@@ -123,6 +123,7 @@ type fpad =  (* function pad *)
     fpad_letrec_label : letrec_label;
     mutable fpad_scope : Wc_control.cfg_scope;
     mutable maxdepth : int;
+    mutable have_bp : bool;
     mutable need_appterm_common : bool;
     mutable need_startover : bool;   (* back to subfunction selection *)
     mutable need_selfrecurse : bool; (* self-recursion - only when tailcalls are enabled! *)
@@ -235,6 +236,7 @@ let empty_fpad letrec_label =
     fpad_letrec_label = letrec_label;
     fpad_scope = empty_scope;
     maxdepth = 0;
+    have_bp = false;
     need_appterm_common = false;
     need_startover = false;
     need_selfrecurse = false;
@@ -349,7 +351,7 @@ let push_global_field_addr var_base field =
   ]
 
 let push_stack fpad pos =
-  if pos >= 0 then
+  if pos >= 0 || not fpad.have_bp then
     push_field "fp" pos
   else
     push_field "bp" (pos + fpad.maxdepth)
@@ -402,7 +404,7 @@ let pop_to_domain_field field code_value =
     ]
 
 let pop_to_stack fpad pos code_value =
-  if pos >= 0 then
+  if pos >= 0 || not fpad.have_bp then
     pop_to_field "fp" pos code_value
   else
     pop_to_field "bp" (pos + fpad.maxdepth) code_value
@@ -1826,6 +1828,7 @@ let rec drop n l =
     l
 
 let set_bp_1 fpad =
+  fpad.have_bp <- true;
   [ L [ K "i32.const"; N (I32 (Int32.of_int (4 * fpad.maxdepth))) ];
     L [ K "i32.sub" ];
     L [ K "local.tee"; ID "bp" ];
