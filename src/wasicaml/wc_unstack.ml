@@ -47,10 +47,11 @@
 
 (* TODO
 
-   - Wc_emit.throw: save all locals to stack positions
+   - Wc_emit.throw: save all locals to stack positions - OK
    - if avoid_locals, set the limit to 0
    - make limit configurable. Check code size!
    - check stack overflow
+   - Kappterm: if the args are already in registers, do not allocate new regs
  *)
 
 open Printf
@@ -560,8 +561,9 @@ let straighten_stack_at lpad state pos =
           (state, [])
       | _ ->
           assert(not (List.mem (RealStack pos) state.camlstack));
+          let src = store |> real_store_d lpad state in
           let dest = RealStack pos |> real_store_d lpad state in
-          let instrs = [ Wcopy { src=store; dest } ] in
+          let instrs = [ Wcopy { src; dest } ] in
           let state =
             { state with
               camlstack = set_camlstack pos (RealStack pos) state;
@@ -1446,6 +1448,10 @@ let transl_instr lpad state instr =
     | Kpushtrap _ ->
         assert false   (* replaced by Trap, see below *)
     | Kpoptrap ->
+        (* when the trap jumps to the pop label, the whole camlstack is
+           stored in the real stack, and no value is in a local variable.
+           We should load values into variables:
+         *)
         let trap_state = { state with localthold = -state.camldepth } in
         let state, instrs_restore = adjust_locals lpad trap_state in
         let state, instrs_pop = popn_camlstack lpad 4 state in

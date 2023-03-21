@@ -3125,10 +3125,6 @@ let rec emit_instr gpad fpad instr =
         @ push_local ptr
         @ pop_to_local "accu"
     | Wccall arg ->
-        (* TODO: maintain a list of noalloc primitives *)
-        (* TODO: maintain a list of unit primitives (set accu=Const 0 instead),
-           or more generally, primitives that never return functions
-         *)
         c_call gpad fpad arg.descr arg.src arg.name
     | Wccall_vector arg ->
         c_call_vector gpad fpad arg.descr arg.numargs arg.depth arg.name
