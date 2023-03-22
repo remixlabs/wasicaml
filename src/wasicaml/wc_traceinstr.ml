@@ -8,9 +8,11 @@ open Wc_types
 let trace_stack_max depth instr =
   (* some instructions need temporarily additional stack positions *)
   match instr with
-    | I.Kapply num -> if num < 4 then depth+3 else depth
+    | I.Kapply num -> if num < 4 then depth+num+1 else depth
     | Kappterm(num,slots) -> max depth (depth-slots+num)
     | Kpushtrap _ -> depth+4
+    | ( Kmakeblock _ | Kmakefloatblock _ ) -> depth+1  (* for accu *)
+    | ( Kclosure _ | Kclosurerec _ ) -> depth+1 (* for accu *)
     | _ -> depth
 
 let trace_stack_instr depth instr =

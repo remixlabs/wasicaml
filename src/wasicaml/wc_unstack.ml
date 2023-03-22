@@ -2,56 +2,16 @@
    This code is free software, see the file LICENSE for details.
  *)
 
-(* SPILLING:
-
-   - camlstack: must also represent the args (so that args can go into
-     locals)
-
-     new invariant: List.length camlstack = camldepth + arity
-
-     * arity should be set early (now easy as we extract Wgrab)
-
-   - create a new type of locals with RValue representation
-     names: "arg%d" and "pos%d". "arg%d" is the local for the
-     n-th argument. "pos%d" is the local for the n-th pushed value.
-
-     store: LocalPos, LocalArg
-
-     The invariants for camlstack also apply to the corresponding locals.
-
-      * state: add a new field num_val_locals
-
-   - stack descriptor
-      * enhance it
-      * ensure that all Winstruction have the stack descriptor
-      * do the spilling in setup_for_gc/restore_after_gc
-      * ensure we know the max stack size
-
-   - function calls:
-      * enhance "straighten" so that arg and val locals are written to
-        the stack.
-
-        EXPERIMENT: use spilling instead
-
-   - new function: limit_locals
-      * if there are more than N locals, stash some locals away so
-        we only have N ones
-      * if avoid_locals: N = 0
-
-   - branches
-
-   - Arith operation + PUSH:
-      * avoid the accu, but put the result directly into the right
-        local
- *)
-
 (* TODO
 
    - Wc_emit.throw: save all locals to stack positions - OK
    - if avoid_locals, set the limit to 0
    - make limit configurable. Check code size!
-   - check stack overflow
+   - check stack overflow - OK
    - Kappterm: if the args are already in registers, do not allocate new regs
+   - Kapply: enhance "straighten" so that values are directly written to the
+     stack
+   - Arith operation + PUSH: put the result directly into the right register
  *)
 
 open Printf
@@ -249,10 +209,19 @@ let new_local lpad repr =
   Hashtbl.add lpad.locals s repr;
   s
 
-let stack_descr state =
-  let stack_save_accu =
-    state.realaccu <> ISet.empty ||
-      ( match state.accu with RealAccu _ -> true | _ -> false) in
+let stack_save_accu_if_used state =
+  state.realaccu <> ISet.empty ||
+    ( match state.accu with RealAccu _ -> true | _ -> false)
+
+let stack_save_accu_if_used_here l =
+  List.exists
+    (function
+     | RealAccu _ -> true
+     | _ -> false
+    )
+    l
+
+let stack_descr state stack_save_accu =
   let stack_save_locals =
     ref ISet.empty in
   let cd = state.camldepth in
@@ -616,7 +585,7 @@ let straighten_all lpad state =
   (state, instrs1 @ instrs2)
 
 let init_stack lpad state =
-  let sdescr = stack_descr state in
+  let sdescr = stack_descr state false in
   let instrs =
     List.map
       (fun pos ->
@@ -1062,7 +1031,7 @@ let transl_instr lpad state instr =
         let state, instrs_flush = flush_accu lpad state in
         let temp_name = new_local lpad RFloat in
         let temp = Local(RFloat, temp_name) in
-        let descr = stack_descr state in
+        let descr = stack_descr state false in
         let accu = real_accu_no_func in
         let instrs =
           instrs_adjust
@@ -1081,7 +1050,8 @@ let transl_instr lpad state instr =
         let src =
           (state.accu :: list_prefix (size-1) state.camlstack)
           |> List.map (real_store_d lpad state) in
-        let descr = stack_descr state in
+        let stack_save_accu = stack_save_accu_if_used_here src in
+        let descr = stack_descr state stack_save_accu in
         let accu = real_accu_no_func in
         let state =
           { state with accu}
@@ -1098,7 +1068,8 @@ let transl_instr lpad state instr =
         let src =
           (state.accu :: list_prefix (size-1) state.camlstack)
           |> List.map (real_store_d lpad state) in
-        let descr = stack_descr state in
+        let stack_save_accu = stack_save_accu_if_used_here src in
+        let descr = stack_descr state stack_save_accu in
         let accu = real_accu_no_func in
         let state =
           { state with accu }
@@ -1119,7 +1090,7 @@ let transl_instr lpad state instr =
           if noalloc then
             None
           else
-            Some { (stack_descr state) with stack_save_accu = false } in
+            Some (stack_descr state false) in
         let no_function = Hashtbl.mem Wc_prims.prims_non_func_result name in
         let state =
           { state with accu = RealAccu { no_function }}
@@ -1132,7 +1103,7 @@ let transl_instr lpad state instr =
     | Kccall (name, num) ->
         let state, instrs_save = save_locals lpad state in
         let state, instrs_str = straighten_all lpad state in
-        let descr = { (stack_descr state) with stack_save_accu = false } in
+        let descr = stack_descr state false in
         let depth = state.camldepth+1 in
         let no_function = Hashtbl.mem Wc_prims.prims_non_func_result name in
         let state =
@@ -1373,7 +1344,8 @@ let transl_instr lpad state instr =
           else
             (state.accu :: list_prefix (num-1) state.camlstack)
             |> List.map (real_store_d lpad state) in
-        let descr = stack_descr state in
+        let stack_save_accu = stack_save_accu_if_used_here src in
+        let descr = stack_descr state stack_save_accu in
         let accu = real_accu in
         let state =
           { state with accu }
@@ -1387,7 +1359,6 @@ let transl_instr lpad state instr =
         let state, instrs_save = save_locals lpad state in
         let state, instrs_flush = flush_accu lpad state in
         (* flush_accu because we allow the accu to be used *)
-        let descr = stack_descr state in
         let num_stack = max (num-1) 0 in
         let src =
           if num = 0 then
@@ -1395,6 +1366,8 @@ let transl_instr lpad state instr =
           else
             (state.accu :: list_prefix num_stack state.camlstack)
             |> List.map (real_store_d lpad state) in
+        let stack_save_accu = stack_save_accu_if_used_here src in
+        let descr = stack_descr state stack_save_accu in
         let state = state |> popn_camlstack_disregard_accu num_stack in
         let start_dest = -state.camldepth-1 in
         let dest =
