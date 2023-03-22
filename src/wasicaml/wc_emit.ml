@@ -1828,7 +1828,6 @@ let rec drop n l =
     l
 
 let set_bp_1 fpad =
-  fpad.have_bp <- true;
   [ L [ K "i32.const"; N (I32 (Int32.of_int (4 * fpad.maxdepth))) ];
     L [ K "i32.sub" ];
     L [ K "local.tee"; ID "bp" ];
@@ -3303,6 +3302,7 @@ let emit_fblock gpad fpad fblock =
   (* make maxdepth a bit larger than stricly necessary to completely avoid
      bp[k] with k<0 *)
   fpad.maxdepth <- if maxdepth > 0 then maxdepth + 2 else 0;
+  fpad.have_bp <- maxdepth > 0;
   let instrs =
     Wc_unstack.transl_fblock fpad.lpad fblock
     |> emit_fblock_instrs gpad fpad in
