@@ -163,6 +163,10 @@ let enable_returncall = ref false
 let enable_deadbeef_check = ref false
 (* debugging: check that there is no uninitialized memory on the stack *)
 
+let local_limit = ref 5
+(* try not to put more than this number of values into local variables *)
+
+
 let code_pointer_shift = 12
   (* OCaml code pointers:
       - Bit 0: always 1
@@ -232,6 +236,7 @@ let empty_fpad letrec_label =
       | Main k -> k in
   { lpad = Wc_unstack.empty_lpad
              ~enable_returncall:!enable_returncall
+             ~local_limit:!local_limit
              empty_scope numeric_label;
     fpad_letrec_label = letrec_label;
     fpad_scope = empty_scope;
@@ -262,21 +267,21 @@ let new_local fpad repr =
   Wc_unstack.new_local fpad.lpad repr
 
 let req_tmp1_i32 fpad =
-  if fpad.lpad.avoid_locals then (
+  if fpad.lpad.local_limit = 0 then (
     fpad.need_tmp1_i32 <- true;
     "tmp1_i32"
   )
   else new_local fpad RInt
 
 let req_tmp2_i32 fpad =
-  if fpad.lpad.avoid_locals then (
+  if fpad.lpad.local_limit = 0 then (
     fpad.need_tmp2_i32 <- true;
     "tmp2_i32"
   )
   else new_local fpad RInt
 
 let req_tmp1_f64 fpad =
-  if fpad.lpad.avoid_locals then (
+  if fpad.lpad.local_limit = 0 then (
     fpad.need_tmp1_f64 <- true;
     "tmp1_f64"
   )
@@ -3468,7 +3473,8 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
   Hashtbl.add fpad.lpad.locals "accu" RValue;
   Hashtbl.add fpad.lpad.locals "bp" RValue;
   fpad.lpad <- { fpad.lpad with
-                 avoid_locals = export_flag; (* avoid local vars in the long main function *)
+                 local_limit = if export_flag then 0 else fpad.lpad.local_limit;
+                   (* avoid local vars in the long main function *)
                  globals_table = gpad.globals_table;
                };
 

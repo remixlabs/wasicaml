@@ -2,19 +2,6 @@
    This code is free software, see the file LICENSE for details.
  *)
 
-(* TODO
-
-   - Wc_emit.throw: save all locals to stack positions - OK
-   - if avoid_locals, set the limit to 0
-   - make limit configurable. Check code size!
-   - check stack overflow - OK
-   - Kappterm: if the args are already in registers, do not allocate new
-     regs - OK
-   - Kapply: enhance "straighten" so that values are directly written to the
-     stack - OK
-   - Wadjust - OK
- *)
-
 open Printf
 open Wc_types
 open Wc_instruct
@@ -79,9 +66,6 @@ type lpad =  (* local pad *)
 
     localPos : (int, unit) Hashtbl.t;
 
-    avoid_locals : bool;
-    (* try not to allocate locals in this function *)
-
     local_limit : int;
     (* how many stack positions should be kept in local variables. This is
        just a preference - the actual number can be higher or lower
@@ -131,19 +115,18 @@ let empty_state =
     localthold = 0;
   }
 
-let empty_lpad ~enable_returncall scope letrec_label =
+let empty_lpad ~enable_returncall ~local_limit scope letrec_label =
   let local_limit =
     (* inside a try label do not prefer local variables over stack positions,
        as we need to be able to jump to the catchlabel at any time
      *)
     if Wc_control.(scope.cfg_try_labels) = [] then
-      5 (* TODO: configure this *)
+      local_limit
     else
       0 in
   { scope;
     locals = Hashtbl.create 7;
     localPos = Hashtbl.create 7;
-    avoid_locals = false;
     local_limit;
     loops = ref ISet.empty;
     indegree = Hashtbl.create 7;
@@ -625,7 +608,7 @@ let localize_accu lpad state repr =
 let unary_operation ?(no_function=false) lpad state op_repr op_code =
   let src1 = state.accu |> real_store_d lpad state in
   let op_repr =
-    if lpad.avoid_locals then RValue else op_repr in
+    if lpad.local_limit = 0 then RValue else op_repr in
   match op_repr with
     | RValue ->
         (* result goes into accu *)
@@ -650,7 +633,7 @@ let binary_operation ?(no_function=false) lpad state op_repr op_code =
   let src1 = state.accu |> real_store_d lpad state in
   let src2 = List.hd state.camlstack |> real_store_d lpad state in
   let op_repr =
-    if lpad.avoid_locals then RValue else op_repr in
+    if lpad.local_limit = 0 then RValue else op_repr in
   match op_repr with
     | RValue ->
         (* result goes into accu *)

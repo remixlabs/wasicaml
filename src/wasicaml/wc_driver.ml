@@ -55,6 +55,17 @@ let size_table s get_defname =
   |> SMap.bindings
   |> List.sort (fun (l1,s1) (l2,s2) -> s1-s2)
 
+let compact_code =
+  function
+  | "low" ->
+      Wc_emit.local_limit := 10
+  | "medium" ->
+      Wc_emit.local_limit := 5
+  | "high" ->
+      Wc_emit.local_limit := 0
+  | _ ->
+      assert false
+
 let main() =
   let out = ref "a.out" in   (* let's be traditional *)
   let inp = ref None in
@@ -86,6 +97,9 @@ let main() =
 
       "-enable-deadbeef-check", Arg.Set Wc_emit.enable_deadbeef_check,
       "   enable stack initialization check (debug)";
+
+      "-compact-code", Arg.Symbol(["low"; "medium"; "high"], compact_code),
+      "   emit more compact wasm code (high) or faster code (low)";
     ]
     (fun arg ->
       if !inp <> None then
