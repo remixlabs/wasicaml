@@ -147,6 +147,7 @@ type terneffect =
 
 type winstruction =
   | Wcomment of string
+  | Wadjust of { depth:int; old_localthold:int; new_localthold:int }
   | Wblock of { label:label; scope:Wc_control.cfg_scope; body:winstruction list }
   | Wcond of { cond:bool ref; ontrue:winstruction; onfalse:winstruction }
   | Wcopy of { src:store; dest:store }   (* only non-allocating copies *)
@@ -278,6 +279,13 @@ let extract_directly_callable_function st =
 let rec string_of_winstruction =
   function
   | Wcomment s -> s
+  | Wadjust { depth; old_localthold; new_localthold } ->
+      if old_localthold = new_localthold then
+        sprintf "Wadjust(depth:%d, localthold:%d)" depth old_localthold
+      else
+        sprintf "Wadjust(depth:%d, localthold:%d->%d%s)"
+                depth old_localthold new_localthold
+                (if new_localthold = -depth then ", save all locals to stack" else "")
   | Wblock arg ->
       ( match arg.label with
           | Label k ->
@@ -399,3 +407,215 @@ let rec string_of_winstruction =
       "Wnop"
   | Wunreachable ->
       "Wunreachable"
+
+let real_accu = RealAccu { no_function=false }
+
+let rec destinations instr =
+  match instr with
+    | Wblock p ->
+        List.map destinations p.body |> List.flatten
+    | Wcond p ->
+        destinations (if !(p.cond) then p.ontrue else p.onfalse)
+    | Wif p ->
+        List.map destinations p.body |> List.flatten
+    | Wcopy p -> [ p.dest ]
+    | Walloc p -> [ p.dest ]
+    | Wunary p -> [ p.dest ]
+    | Wbinary p -> [ p.dest ]
+
+    | Wunaryeffect _ | Wbinaryeffect _ | Wternaryeffect _ | Wbranch _
+      | Wswitch _ | Wappterm _ | Wappterm_args _ | Wappterm_direct _
+      | Wappterm_direct_args _ | Wreturn _ | Wgrab _ | Wraise _
+      | Wtryreturn _ | Wnextmain _ | Wstop | Wnop | Wunreachable
+      | Wcomment _ | Wadjust _ ->
+        []
+
+    | Wenv _ | Wcopyenv _ | Wgetglobal _ | Wmakeblock _ | Wmakefloatblock _
+      | Wccall _ | Wccall_vector _ | Wapply _ | Wapply_direct _ ->
+        [ real_accu ]
+
+    | Wclosurerec p ->
+        List.map (fun (st, _) -> st) p.dest
+
+let rec replace_src f_replace instr =
+  match instr with
+    | Wblock p ->
+        Wblock { p with body = List.map (replace_src f_replace) p.body }
+    | Wif p ->
+        Wif { p with body = List.map (replace_src f_replace) p.body }
+    | Wcond p ->
+        Wcond { p with
+                ontrue = replace_src f_replace p.ontrue;
+                onfalse = replace_src f_replace p.onfalse;
+              }
+    | Wcopy p ->
+        Wcopy { p with src = f_replace p.src }
+    | Walloc p ->
+        Walloc { p with src = f_replace p.src }
+    | Wunary p ->
+        Wunary { p with src1 = f_replace p.src1 }
+    | Wunaryeffect p ->
+        Wunaryeffect { p with src1 = f_replace p.src1 }
+    | Wbinary p ->
+        Wbinary { p with
+                  src1 = f_replace p.src1;
+                  src2 = f_replace p.src2
+                }
+    | Wbinaryeffect p ->
+        Wbinaryeffect { p with
+                        src1 = f_replace p.src1;
+                        src2 = f_replace p.src2
+                      }
+    | Wternaryeffect p ->
+        Wternaryeffect { p with
+                         src1 = f_replace p.src1;
+                         src2 = f_replace p.src2;
+                         src3 = f_replace p.src3
+                       }
+    | Wmakeblock p ->
+        Wmakeblock { p with src = List.map f_replace p.src }
+    | Wmakefloatblock p ->
+        Wmakefloatblock { p with src = List.map f_replace p.src }
+    | Wccall p ->
+        Wccall { p with src = List.map f_replace p.src }
+    | Wappterm_args p ->
+        Wappterm_args { p with argsrc = List.map f_replace p.argsrc;
+                               funsrc = f_replace p.funsrc
+                      }
+    | Wappterm_direct_args p ->
+        Wappterm_direct_args { p with argsrc = List.map f_replace p.argsrc;
+                                      funsrc = f_replace p.funsrc
+                             }
+    | Wreturn p ->
+        Wreturn { p with src = f_replace p.src }
+    | Wclosurerec p ->
+        Wclosurerec { p with src = List.map f_replace p.src }
+    | Wraise p ->
+        Wraise { p with src = f_replace p.src }
+    | Wtryreturn p ->
+        Wtryreturn { src = f_replace p.src }
+
+    | Wccall_vector _ | Wbranch _ | Wswitch _ | Wapply _
+      | Wapply_direct _ | Wappterm _ | Wappterm_direct _ | Wgrab _ | Wnextmain _
+      | Wstop | Wnop | Wunreachable | Wcomment _ | Wadjust _
+      | Wenv _ | Wcopyenv _ | Wgetglobal _ ->
+        (* either doesn't read, or the source is always the accu *)
+        instr
+
+let only_localpos =
+  function
+  | LocalPos p -> Some p
+  | _ -> None
+
+(* The following optimization is not yet working correctly. The idea is
+   to remove Wcopy instructions when the copy can also be done by
+   replacing dest with src in all following instructions of the same
+   sequence of instructions (block). This works when:
+    - dest is not used beyond the current block
+      (this is already checked with the liveness set)
+    - There are no conflicting Wcopy instructions lateron
+      (this is still missing)
+
+   Also, we are so far only looking at LocalPos stores. I think this is
+   too short-sightened and Accu should also be covered.
+
+   An example of conflicting Wcopy instructions so we cannot eliminate
+   the first Wcopy by replacing pos1 with pos2:
+    Wcopy(dest=pos1; src=pos2)
+    Wcopy(dest=pos2; src=pos3)
+    Wdosomething(src=pos1, ...)
+ *)
+
+(*
+let rec woptimize instrs =
+  let instrs_with_liveness, _ =
+    List.fold_right
+      (fun instr (acc_instrs, acc_liveness) ->
+        let instr_with = (instr, acc_liveness) in
+        match instr with
+          | Wadjust p ->
+              let positions =
+                Wc_util.enum (-p.depth) (p.old_localthold + p.depth)
+                |> List.fold_left
+                     (fun acc p -> ISet.add p acc) ISet.empty in
+              (instr_with :: acc_instrs,
+               Some positions)
+          | Wblock p ->
+              (instr_with :: acc_instrs, None)
+          | _ ->
+              ( match acc_liveness with
+                  | None ->
+                      (instr_with :: acc_instrs, None)
+                  | Some set ->
+                      let dests =
+                        destinations instr
+                        |> List.filter_map only_localpos in
+                      let set' =
+                        List.fold_left
+                          (fun acc x -> ISet.remove x acc) set dests in
+                      (instr_with :: acc_instrs, Some set')
+              )
+      )
+      instrs
+      ( [], None ) in
+  let _, instrs =
+    List.fold_left
+      (fun (replacements, acc_instrs) (instr, liveness_opt) ->
+        match instr with
+          | Wblock p ->
+              (* Don't enter blocks: *)
+              (IMap.empty, instr :: acc_instrs)
+          | _ ->
+              let dests =
+                destinations instr
+                |> List.filter_map only_localpos in
+              let instr_changed = ref false in
+              let instr' =
+                replace_src
+                  (function
+                   | LocalPos p as store ->
+                       ( try
+                           let store' =
+                             IMap.find p replacements in
+                           instr_changed := true;
+                           store'
+                         with Not_found -> store
+                       )
+                   | other -> other
+                  )
+                  instr in
+              let comment =
+                if !instr_changed then
+                  [ Wcomment ("rewritten: " ^  string_of_winstruction instr) ]
+                else
+                  [] in
+              let replacements' =
+                List.fold_left
+                  (fun acc p -> IMap.remove p acc) replacements dests in
+              let default() =
+                (replacements', instr' :: (comment @ acc_instrs)) in
+              ( match liveness_opt with
+                  | None ->
+                      default()
+                  | Some liveness ->
+                      (* liveness: whether this position is needed beyond
+                         that the following instructions might read it *)
+                      ( match instr' with
+                          (* TODO: restrict to src=LocalPos | Accu *)
+                          | Wcopy { src; dest = LocalPos p }
+                                when not (ISet.mem p liveness) ->
+                              (* drop this Wcopy: *)
+                              let replacements'' =
+                                IMap.add p src replacements' in
+                              let comment =
+                                Wcomment ("dropped: " ^  string_of_winstruction instr) in
+                              (replacements'', comment :: acc_instrs)
+                          | _ ->
+                              default()
+                      )
+              )
+      )
+      (IMap.empty, [])
+      instrs_with_liveness in
+  List.rev instrs
+ *)

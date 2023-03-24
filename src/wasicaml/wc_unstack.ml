@@ -12,6 +12,12 @@
    - Kapply: enhance "straighten" so that values are directly written to the
      stack
    - Arith operation + PUSH: put the result directly into the right register
+
+   - Wadjust
+   - post-process instruction sequence
+       rev order: figure out which locals are alive, use Wadjust
+       reg order: keep an replacement
+       so far only Wcopy
  *)
 
 open Printf
@@ -778,16 +784,18 @@ let adjust_locals lpad state =
       |> List.filter (fun pos -> pos >= 0 || ISet.mem pos live_positions)
       |> List.map (fun pos -> ignore(decl_store lpad (LocalPos pos)); pos)
       |> List.map (fun pos -> Wcopy { src=RealStack pos; dest=LocalPos pos }) in
+  let wadjust_final =
+    Wadjust { depth=state.camldepth;
+              old_localthold=new_localthold;
+              new_localthold } in
   let instrs =
     if instrs = [] then
-      []
+      [ wadjust_final ]
     else
-      let n =
-        if lpad.local_limit = 0 then "save_locals" else "adjust_locals" in
-      [ Wcomment (sprintf "%s threshold=%d limit=%d" n new_localthold lpad.local_limit) ]
+      [ Wadjust { depth=state.camldepth; old_localthold; new_localthold } ]
       @ instrs
       @ [ Wcomment (sprintf "state: %s\n" (string_of_state state)) ]
-      @ [ Wcomment (sprintf "done_%s" n) ] in
+      @ [ wadjust_final ] in
   (state, instrs)
 
 let save_locals lpad state =
@@ -1561,7 +1569,11 @@ let transl_fblock lpad fblock =
                 let state = get_state label in
                 let comment = Wcomment (sprintf "Label %d (depth=%d)" label state.camldepth) in
                 let cscope = Wcomment (string_of_scope block.block_scope) in
-                (state, comment ::cscope ::  acc)
+                let wadjust =
+                  Wadjust { depth=state.camldepth;
+                            old_localthold=state.localthold;
+                            new_localthold=state.localthold } in
+                (state, wadjust :: comment ::cscope ::  acc)
             | Simple i ->
                 lpad.loops := upd_loops;
                 let next_state, instrs = transl_instr lpad state i in
@@ -1611,7 +1623,13 @@ let transl_fblock lpad fblock =
         )
         (state, [])
         block.instructions in
-    let instrs = List.rev instrs_rev in
+    let wadjust_after =
+      Wadjust { depth=state.camldepth;
+                old_localthold=state.localthold;
+                new_localthold=state.localthold } in
+    let instrs =
+      List.rev (wadjust_after :: instrs_rev) in
+    (* |> Wc_instruct.woptimize *)
     let scope = block.block_scope in
     match block.loop_label, block.break_label with
       | Some _, Some _ -> assert false

@@ -3047,6 +3047,8 @@ let rec emit_instr gpad fpad instr =
   match instr with
     | Wcomment s ->
         []
+    | Wadjust _ ->
+        []
     | Wblock arg ->
         let old_lpad = fpad.lpad in
         let new_lpad = Wc_unstack.lpad_with ~scope:arg.scope old_lpad in
