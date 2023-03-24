@@ -10,14 +10,8 @@
    - check stack overflow - OK
    - Kappterm: if the args are already in registers, do not allocate new regs
    - Kapply: enhance "straighten" so that values are directly written to the
-     stack
-   - Arith operation + PUSH: put the result directly into the right register
-
-   - Wadjust
-   - post-process instruction sequence
-       rev order: figure out which locals are alive, use Wadjust
-       reg order: keep an replacement
-       so far only Wcopy
+     stack - OK
+   - Wadjust - OK
  *)
 
 open Printf
@@ -749,17 +743,19 @@ let norm_accu state =
     | _ ->
         state
 
+let get_live_positions state =
+  List.fold_left
+    (fun acc st ->
+      match st with
+        | RealStack pos | LocalPos pos -> ISet.add pos acc
+        | _ -> acc
+    )
+    ISet.empty (state.accu :: state.camlstack)
+
 let adjust_locals lpad state =
   let old_localthold = state.localthold in
   let new_localthold = min (-state.camldepth + lpad.local_limit) 0 in
-  let live_positions =
-    List.fold_left
-      (fun acc st ->
-        match st with
-          | RealStack pos | LocalPos pos -> ISet.add pos acc
-          | _ -> acc
-      )
-      ISet.empty (state.accu :: state.camlstack) in
+  let live_positions = get_live_positions state in
   let accu =
     match state.accu with
       | RealStack pos when pos < new_localthold ->
@@ -801,6 +797,70 @@ let adjust_locals lpad state =
 let save_locals lpad state =
   (* all locals are copied to their corresponding stack positions *)
   adjust_locals { lpad with local_limit = 0 } state
+
+let save_locals_and_straighten_all lpad state =
+  (* like save_locals followed by straighten_all, only that fewer instructions
+     are generated. The code is not really faster but just a little bit more
+     compact.
+   *)
+  let old_localthold = state.localthold in
+  let new_localthold = -state.camldepth in
+  let state, instrs_str = straighten_all lpad state in
+  (* Now, we change all Wcopy instructions writing to LocalPos to Wcopy
+     instructions writing to RealStack:
+   *)
+  let covered_positions = ref ISet.empty in
+  let instrs_str_fixedup =
+    List.map
+      (function
+       | Wcopy { src; dest=LocalPos pos } when pos < 0 ->
+           let src =
+             match src with
+               | LocalPos p when ISet.mem p !covered_positions ->
+                   RealStack p
+               | _ -> src in
+           covered_positions := ISet.add pos !covered_positions;
+           Wcopy { src; dest=RealStack pos }
+       | instr ->
+           instr
+      )
+      instrs_str in
+  let live_positions =
+    get_live_positions state in
+  let missing_positions =
+    ISet.diff live_positions !covered_positions in
+  let instrs_save =
+    Wc_util.enum new_localthold (old_localthold - new_localthold)
+    |> List.filter (fun pos -> pos >= 0 || ISet.mem pos missing_positions)
+    |> List.map (fun pos -> ignore(decl_store lpad (LocalPos pos)); pos)
+    |> List.map (fun pos -> Wcopy { src=LocalPos pos; dest=RealStack pos }) in
+  let accu =
+    match state.accu with
+      | RealStack pos when pos < new_localthold ->
+          LocalPos pos
+      | LocalPos pos when pos >= new_localthold ->
+          RealStack pos
+      | accu ->
+          accu in
+  let state =
+    { state with
+      localthold = new_localthold;
+      accu
+    } in
+  let wadjust_final =
+    Wadjust { depth=state.camldepth;
+              old_localthold=new_localthold;
+              new_localthold } in
+  let instrs =
+    [ Wcomment "save_locals_and_straighten_all";
+      Wadjust { depth=state.camldepth;
+                old_localthold;
+                new_localthold } ]
+    @ instrs_str_fixedup
+    @ instrs_save
+    @ [ Wcomment (sprintf "state: %s\n" (string_of_state state)) ]
+    @ [ wadjust_final ] in
+  (state, instrs)
 
 let branch lpad state label =
   let expected_localthold = min (-state.camldepth + lpad.local_limit) 0 in
@@ -1109,8 +1169,7 @@ let transl_instr lpad state instr =
           @ [ Wccall { name; src; descr } ] in
         (state, instrs)
     | Kccall (name, num) ->
-        let state, instrs_save = save_locals lpad state in
-        let state, instrs_str = straighten_all lpad state in
+        let state, instrs_savestr = save_locals_and_straighten_all lpad state in
         let descr = stack_descr state false in
         let depth = state.camldepth+1 in
         let no_function = Hashtbl.mem Wc_prims.prims_non_func_result name in
@@ -1119,8 +1178,7 @@ let transl_instr lpad state instr =
           |> popn_camlstack_disregard_accu (num-1) in
         let state, instrs_adjust = adjust_locals lpad state in
         let instrs =
-          instrs_save
-          @ instrs_str
+          instrs_savestr
           @ [ Wcopy { src=real_accu; dest=RealStack(-depth) };
               Wccall_vector { name; numargs=num; depth; descr }]
           @ instrs_adjust in
@@ -1225,8 +1283,7 @@ let transl_instr lpad state instr =
                 (* because Wapply_direct loads the function into accu: *)
                 { state with accu = real_accu }
             | None -> state in
-        let state, instrs_str = straighten_all lpad state in
-        let state, instrs_save = save_locals lpad state in
+        let state, instrs_savestr = save_locals_and_straighten_all lpad state in
         let depth = state.camldepth in
         let instr_apply =
           match direct_opt with
@@ -1237,8 +1294,7 @@ let transl_instr lpad state instr =
         let state = state |> popn_camlstack_disregard_accu (num+3) in
         let state, instrs_adjust = adjust_locals lpad state in
         let instrs =
-          instrs_str
-          @ instrs_save
+          instrs_savestr
           @ [ instr_apply ]
           @ instrs_adjust in
         (state, instrs)
@@ -1588,8 +1644,8 @@ let transl_fblock lpad fblock =
                 (next_state, List.rev_append (comment :: instrs) acc)
             | Trap { labels={trylabel; catchlabel}; poplabel } ->
                 (* Convention: no local variables on "catch" *)
-                let state, instrs_save1 = save_locals lpad state in
-                let state, instrs_str = straighten_all lpad state in
+                let state, instrs_savestr1 =
+                  save_locals_and_straighten_all lpad state in
                 let accu = real_accu in
                 let state_catch = { state with accu } in
                 (* The bytecode interpreter needs 4 stack position for
@@ -1598,14 +1654,12 @@ let transl_fblock lpad fblock =
                 let state = push_camlstack (Const 0) state in
                 let state = push_camlstack (Const 0) state in
                 let state = push_camlstack (Const 0) state in
-                let state, instrs_save2 = save_locals lpad state in
-                let state, instrs_str2 = straighten_all lpad state in
+                let state, instrs_savestr2 =
+                  save_locals_and_straighten_all lpad state in
                 let instrs =
                   [ Wcomment (sprintf "***Trap(try=%d,catch=%d)" trylabel catchlabel) ]
-                  @ instrs_save1
-                  @ instrs_str
-                  @ instrs_save2
-                  @ instrs_str2
+                  @ instrs_savestr1
+                  @ instrs_savestr2
                   @ [ Wbranch { label=Label trylabel } ] in
                 update_state_table lpad state trylabel;
                 update_state_table lpad state_catch catchlabel;
