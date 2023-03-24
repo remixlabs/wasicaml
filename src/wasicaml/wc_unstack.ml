@@ -8,7 +8,8 @@
    - if avoid_locals, set the limit to 0
    - make limit configurable. Check code size!
    - check stack overflow - OK
-   - Kappterm: if the args are already in registers, do not allocate new regs
+   - Kappterm: if the args are already in registers, do not allocate new
+     regs - OK
    - Kapply: enhance "straighten" so that values are directly written to the
      stack - OK
    - Wadjust - OK

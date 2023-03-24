@@ -2965,24 +2965,43 @@ let appterm_args gpad fpad funlabel_opt funsrc argsrc oldnumargs depth =
      unavailable *)
   assert(!enable_returncall);
   let newnumargs = List.length argsrc in
+  let fp_delta = oldnumargs - newnumargs in
   (* save argsrc in local variables *)
   let arg_locals =
-    List.map (fun src -> new_local fpad (repr_of_store src)) argsrc in
+    List.mapi
+      (fun i src ->
+        match src with
+          | RealStack pos ->
+              if fp_delta <> 0 || pos <> i then
+                let repr = repr_of_store src in
+                Local(repr, new_local fpad repr)
+              else
+                src
+          | RealAccu _ -> (* because accu gets destroyed *)
+              let repr = repr_of_store src in
+              Local(repr, new_local fpad repr)
+          | _ -> src
+      )
+      argsrc in
   let arg_instrs1 =
     List.map2
-      (fun src localname ->
-        let dest = Local(repr_of_store src, localname) in
-        copy fpad src dest None
+      (fun src local ->
+        if src = local then
+          []
+        else
+          copy fpad src local None
       )
       argsrc
       arg_locals
     |> List.flatten in
   (* set "accu" to the function pointer: *)
   let accu_instrs =
-    copy fpad funsrc (RealAccu { no_function = false }) None in
+    match funsrc with
+      | RealAccu _ ->
+          []
+      | _ ->
+          copy fpad funsrc (RealAccu { no_function = false }) None in
   (* fp = fp + old_num_args - new_num_args *)
-  let fp_delta =
-    oldnumargs - newnumargs in
   let fp_instrs =
     if fp_delta = 0 then
       []
@@ -2994,13 +3013,12 @@ let appterm_args gpad fpad funlabel_opt funsrc argsrc oldnumargs depth =
       ] in
   let arg_instrs2 =
     List.map2
-      (fun src (localname, i) ->
-        let src = Local(repr_of_store src, localname) in
+      (fun src (src, i) ->
         let dest = RealStack i in
         copy fpad src dest None
       )
       argsrc
-      (List.mapi (fun i localname -> (localname, i)) arg_locals)
+      (List.mapi (fun i local -> (local, i)) arg_locals)
     |> List.flatten in
   let envptr_instrs =
     (push_local "accu" |> pop_to_field "envptr" 0) in
