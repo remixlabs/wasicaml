@@ -116,6 +116,8 @@ type gpad =  (* global pad *)
     (* knowledge about the globals *)
     mutable glbfun_table : (int,  int * Wc_traceglobals.initvalue array) Hashtbl.t;
     (* for each letrec function: knowledge about its environment *)
+    funcprops_table : (int, Wc_tracefuncs.funcprops) Hashtbl.t;
+    (* knowledge about functions *)
   }
 
 type fpad =  (* function pad *)
@@ -2678,14 +2680,27 @@ let return() =
     L [ K "return" ];
   ]
 
+let use_env gpad funlabel numargs =
+  let funcprops = Wc_tracefuncs.get_funcprops gpad.funcprops_table funlabel in
+  funcprops.use_env ||
+    ( match funcprops.func_arity with
+        | None -> true
+        | Some n -> n <> numargs
+    )
+
 let apply_direct_no_eh gpad fpad funlabel numargs depth =
   let _, letrec_label, _ = lookup_label gpad funlabel in
   let letrec_name = Hashtbl.find gpad.letrec_name letrec_label in
   let env_pos = (-depth + numargs) in
-  ( push_local "accu"
-    |> pop_to_stack fpad env_pos
+  ( if use_env gpad funlabel numargs then
+      ( push_local "accu"
+        |> pop_to_stack fpad env_pos
+      )
+      @ push_field_addr "fp" env_pos (* new envptr *)
+    else
+      [ C "omit_envptr";
+        L [ K "i32.const"; N (I32 (-1l)) ] ]
   )
-  @ push_field_addr "fp" env_pos (* new envptr *)
   @ [ L [ K "i32.const"; N (I32 (Int32.of_int (numargs-1))) ];
     ]
   @ push_field "accu" 0
@@ -2707,13 +2722,22 @@ let apply_direct_eh gpad fpad funlabel numargs depth =
   let _, letrec_label, _ = lookup_label gpad funlabel in
   let letrec_name = Hashtbl.find gpad.letrec_name letrec_label in
   let env_pos = (-depth + numargs) in
-  ( push_local "accu"
-    |> pop_to_stack fpad env_pos
+  ( if use_env gpad funlabel numargs then
+      ( push_local "accu"
+        |> pop_to_stack fpad env_pos
+      )
+    else
+      []
   )
   @ push_domain_field domain_field_local_roots
   @ pop_to_local "lroots"
   @ [ L [ K "i32.const"; ID letrec_name ] ]
-  @ push_field_addr "fp" env_pos (* new envptr *)
+  @ ( if use_env gpad funlabel numargs then
+        push_field_addr "fp" env_pos (* new envptr *)
+      else
+        [ C "omit_envptr";
+          L [ K "i32.const"; N (I32 (-1l)) ] ]
+    )
   @ [ L [ K "i32.const"; N (I32 (Int32.of_int (numargs-1))) ];
     ]
   @ push_field "accu" 0
@@ -2941,7 +2965,11 @@ let appterm_direct gpad fpad funlabel numargs oldnumargs depth =
   let sexpl =
     call_reinit_frame gpad fpad numargs oldnumargs depth
     @ pop_to_local "fp"   (* no need to set bp here *)
-    @ (push_local "accu" |> pop_to_field "envptr" 0)
+    @ ( if use_env gpad funlabel numargs then
+          push_local "accu" |> pop_to_field "envptr" 0
+        else
+          [ C "omit_envptr" ]
+      )
     @ (if goto_selfrecurse then
          [ L [ K "br"; ID "selfrecurse" ] ]
        else
@@ -3025,8 +3053,17 @@ let appterm_args gpad fpad funlabel_opt funsrc argsrc oldnumargs depth =
       argsrc
       (List.mapi (fun i local -> (local, i)) arg_locals)
     |> List.flatten in
+  let envptr_instrs_dfl =
+    push_local "accu" |> pop_to_field "envptr" 0 in
   let envptr_instrs =
-    (push_local "accu" |> pop_to_field "envptr" 0) in
+    match funlabel_opt with
+      | Some funlabel ->
+          if use_env gpad funlabel newnumargs then
+            envptr_instrs_dfl
+          else
+            [ C "omit_envptr" ]
+      | None ->
+          envptr_instrs_dfl in
   let call_instrs =
     match funlabel_opt with
       | Some funlabel ->
@@ -3476,6 +3513,7 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
                  local_limit = if export_flag then 0 else fpad.lpad.local_limit;
                    (* avoid local vars in the long main function *)
                  globals_table = gpad.globals_table;
+                 funcprops_table = gpad.funcprops_table;
                };
 
   let subfunc_pairs =
@@ -3547,7 +3585,7 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
   if fpad.need_tmp2_i32 then
     Hashtbl.add fpad.lpad.locals "tmp2_i32" RValue;
   if fpad.need_tmp1_f64 then
-    Hashtbl.add fpad.lpad.locals "tmp1_f64" RValue;
+    Hashtbl.add fpad.lpad.locals "tmp1_f64" RFloat;
 
   let locals =
     Hashtbl.fold (fun name vtype acc -> (name,vtype) :: acc) fpad.lpad.locals []
@@ -3716,7 +3754,7 @@ let bigarray_to_string_list limit ba =
   done;
   List.rev !l
 
-let generate scode exe get_defname globals_table =
+let generate scode exe get_defname globals_table funcprops_table =
   let (funcmapping, subfunctions) = get_funcmapping scode in
 
   let letrec_name = Hashtbl.create 7 in
@@ -3766,6 +3804,7 @@ let generate scode exe get_defname globals_table =
       need_mlookup = false;
       globals_table;
       glbfun_table = Wc_traceglobals.derive_glbfun_table globals_table;
+      funcprops_table;
     } in
 
   let sexpl_code =

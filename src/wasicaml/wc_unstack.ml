@@ -98,6 +98,8 @@ type lpad =  (* local pad *)
 
     enable_returncall : bool;
     (* whether we are allowed to emit tail calls *)
+
+    funcprops_table : (int, Wc_tracefuncs.funcprops) Hashtbl.t;
   }
 
 let real_accu =
@@ -136,6 +138,7 @@ let empty_lpad ~enable_returncall ~local_limit scope letrec_label =
     func_offset = 0;
     enable_returncall;
     letrec_label;
+    funcprops_table = Hashtbl.create 7;
   }
 
 let lpad_with ~scope lpad =
@@ -1210,8 +1213,23 @@ let transl_instr lpad state instr =
            Wcopy instructions to the right positions, and leave a gap
            of one position for env.
          *)
-        let state, instrs_save = save_locals lpad state in
         let direct_opt = extract_directly_callable_function state.accu in
+        let alloc =
+          match direct_opt with
+            | Some (_, _, funlabel, _) ->
+                let p =
+                  Wc_tracefuncs.get_funcprops lpad.funcprops_table funlabel in
+                p.use_alloc ||
+                  ( match p.func_arity with
+                      | None -> true
+                      | Some n -> num <> n  (* i.e. need a GRAB *)
+                  )
+            | None -> true in
+        let state, instrs_save =
+          if alloc then
+            save_locals lpad state
+          else
+            state, [ Wcomment "noalloc" ] in
         let state =
           match direct_opt with
             | Some _ ->
@@ -1220,6 +1238,7 @@ let transl_instr lpad state instr =
             | None -> state in
         let state, instrs_accu = straighten_accu lpad state in
         let instrs_init, actual_depth = init_stack lpad state in
+        let instrs_init = if alloc then instrs_init else [] in
         let delta = 1 in  (* make room for one additional position (env) *)
         let instrs_move =
           enum 0 num
@@ -1237,7 +1256,8 @@ let transl_instr lpad state instr =
             | None ->
                 Wapply { numargs=num; depth } in
         let state = state |> popn_camlstack_disregard_accu num in
-        let state, instrs_adjust = adjust_locals lpad state in
+        let state, instrs_adjust =
+          if alloc then adjust_locals lpad state else state, [] in
         let instrs =
           instrs_save
           @ instrs_accu
@@ -1260,6 +1280,7 @@ let transl_instr lpad state instr =
            that it saves instructions. (This might change when we pass
            args to functions via wasm parameters, and not via the stack.)
          *)
+        (* TODO: exploit use_alloc *)
         let direct_opt = extract_directly_callable_function state.accu in
         let state =
           match direct_opt with
@@ -1545,6 +1566,7 @@ let transl_fblock lpad fblock =
       block.instructions in
 
   let rec extract_arity block =
+    (* CHECK: can we get this from Wc_tracefuncs? *)
     extract_arity_instrs block block.instructions 0
 
   and extract_arity_instrs block instrs k =

@@ -3,6 +3,10 @@
 export WASICAML='%ROOT%'
 export WASICAML_CWD=`pwd`
 
+# other interesting options:
+# --wasm-enforce-bounds-checks
+#    useful get always getting a stack trace and not just a "bus error"
+
 opts="--stack-trace-limit=1000"
 if node --experimental-wasm-bigint -e '' >/dev/null 2>&1; then
     opts="$opts --experimental-wasm-bigint"
