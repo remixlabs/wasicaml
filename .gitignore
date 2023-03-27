@@ -21,4 +21,4 @@ js/package-lock.json
 js/node_modules
 wasi_preamble
 Makefile.config
-
+src/wasicaml/wc_config.ml

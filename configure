@@ -32,5 +32,6 @@ while [ $# -gt 0 ]; do
 done
 
 echo "prefix=$prefix" > Makefile.config
+echo "let prefix = \"$prefix\";;" >src/wasicaml/wc_config.ml
 
 echo "Installing to: $prefix" >&2
