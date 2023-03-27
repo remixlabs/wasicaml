@@ -12,8 +12,7 @@ open Printf
 
 module SMap = Map.Make(String)
 
-let prefix =
-  Sys.getenv "HOME" ^ "/.wasicaml"
+let prefix = Wc_config.prefix
 
 let size_limit_for_warning = 10000
 
@@ -100,6 +99,9 @@ let main() =
 
       "-compact-code", Arg.Symbol(["low"; "medium"; "high"], compact_code),
       "   emit more compact wasm code (high) or faster code (low)";
+
+      "-prefix", Arg.Unit(fun _ -> print_endline prefix; exit 0),
+      "   print the prefix and exit";
     ]
     (fun arg ->
       if !inp <> None then
