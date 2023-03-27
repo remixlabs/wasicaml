@@ -18,7 +18,7 @@ Release 1.1 (2023-03-27):
  - more local variables: it is now tried to keep the top N
    values of the stack in local variables. This gives the
    JIT engine more opportunities to optimize the binary code.
-   However, more save/restore code is now also available,
+   However, more save/restore code is now also required,
    so the code is less compact. For this reason, a new
    -compact-code command-line option was added. (PR#39)
  - switching to `wasi-js` as the npm package to implement
