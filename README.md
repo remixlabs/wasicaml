@@ -70,7 +70,7 @@ cleanly distinguish between build and install phases yet).
 
 You'll need `node` (14 or 16) and `npm`.
 
-The build involves a git checkout of the OCaml sources (version 4.12.0),
+The build involves a git checkout of the OCaml sources (version 4.12.1),
 and you'll get WebAssembly versions of the bytecode compiler. Also,
 we download the WASI SDK, including a copy of `clang`. The latter is
 currently only available for Linux and Mac as precompiled tarballs.
@@ -167,12 +167,13 @@ Anything else is unavailable (e.g. subprocesses, pipes, network, signals, ...).
 
 Also, an important feature is so far missing from both WASI and WebAssembly:
 setjmp/longjmp, or (equivalently) exceptions. There is a proposal to add
-exceptions to WebAssembly, which is currently being implemented by the
-engine vendors, so that the door to standardization is being opened.
+exceptions to WebAssembly, but the work is not yet fully done
+(it is available in `nodejs`, and WasiCaml supports it since release
+1.1 with the option `-enable-exception-handling`).
 
 All in all this means that pure WASI is currently not sufficient to run
 OCaml code. We "added" a few things as host functions:
- - a try/catch mechanism
+ - a try/catch mechanism (unless `enable-exception-handling`)
  - the `system()` function to start external processes
  - a working `rename()` function (as the one in the current `wasi-sdk` is
    broken)
@@ -237,10 +238,11 @@ OCaml function names can be encoded in the symbol names, which is
 results in better stack traces.
 
 There are a couple of restrictions:
- - Tail calls are generally not available. There is some emulation
+ - Tail calls are by default not available. There is some emulation
    for self calls, and when one function of a `let rec` definition
-   calls another function of the same `let rec`. (Note that tail calls
-   are another feature announced for WebAssembly.)
+   calls another function of the same `let rec`. (Note, however,
+   that there is a tail call proposal for WebAssembly, and WasiCaml
+   supports it now with the `-enable-tail-call` command-line switch.)
  - You cannot obtain backtraces from the running OCaml program.
    You can do from Javascript, though.
  - You cannot change the limit of the OCaml stack from inside the
@@ -324,7 +326,7 @@ The subfunction index is encoded in code pointers.
 
 ## Functions
 
-A WebAssembly function takes four parameters:
+A WebAssembly function implementing an OCaml function takes four parameters:
  - `envptr`: a pointer to the stack location where the closure value is stored
  - `extra_args`: the number of further arguments on the stack (i.e. in total
    there are `extra_args+1` arguments)
@@ -333,7 +335,7 @@ A WebAssembly function takes four parameters:
  - `fp`: the address of the first argument
 
 The OCaml arguments are always passed via the stack, and not via the
-WebAssembly parameters. (It is unclear whether this would be
+WebAssembly parameters. (It is unclear whether/when this would be
 an advantage - still need to be figured out.)
 
 There are several deviations from the scheme the bytecode interpreter uses.
@@ -438,10 +440,3 @@ for further processing. We had to go another route. LLVM features an
 integrated assembler, and it turned out it also understands a form
 of textual WebAssembly. The S-expression is converted to this format,
 resulting into an `.s` file.
-
---------------
-
-# Interested in developing compilers for WebAssembly?
-
-[June, 2021] - So far you live in Germany, there is a position:
-https://www.mixtional.de/recruiting/2021-01/index.html
