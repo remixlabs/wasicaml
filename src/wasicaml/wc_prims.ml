@@ -397,3 +397,100 @@ let prims_non_func_result =
     "caml_weak_get_copy";
     "caml_weak_set";
   ] |> mk_table
+
+
+(* non-allocating primitives *)
+(* note that this is not quite the same as the @@noalloc annotation,
+   which refers to fast value passing when there is an unboxed
+   representation
+ *)
+let prims_noalloc =
+  [
+    "caml_array_blit";
+    "caml_array_fill";
+    "caml_array_get_addr";
+    "caml_array_set";
+    "caml_array_set_addr";
+    "caml_array_unsafe_get";
+    "caml_array_unsafe_set";
+    "caml_array_unsafe_set_addr";
+    "caml_ba_blit";
+    "caml_ba_dim_1";
+    "caml_ba_dim_2";
+    "caml_ba_dim_3";
+    "caml_ba_fill";
+    "caml_ba_kind";
+    "caml_ba_layout";
+    "caml_ba_num_dims";
+    "caml_ba_set_1";
+    "caml_ba_set_2";
+    "caml_ba_set_3";
+    "caml_ba_set_generic";
+    "caml_ba_uint8_get16";
+    "caml_ba_uint8_set16";
+    "caml_ba_uint8_set32";
+    "caml_ba_uint8_set64";
+    "caml_blit_bytes";
+    "caml_blit_string";
+    "caml_bswap16";
+    "caml_bytes_compare";
+    "caml_bytes_equal";
+    "caml_bytes_get";
+    "caml_bytes_get16";
+    "caml_bytes_greaterequal";
+    "caml_bytes_greaterthan";
+    "caml_bytes_lessequal";
+    "caml_bytes_lessthan";
+    "caml_bytes_notequal";
+    "caml_bytes_of_string";
+    "caml_bytes_set";
+    "caml_bytes_set16";
+    "caml_bytes_set32";
+    "caml_bytes_set64";
+    "caml_compare";
+    "caml_eq_float";
+    "caml_equal";
+    "caml_fill_bytes";
+    "caml_fill_string";
+    "caml_float_compare";
+    "caml_floatarray_blit";
+    "caml_floatarray_set";
+    "caml_floatarray_unsafe_set";
+    "caml_fresh_oo_id";
+    "caml_get_global_data";
+    "caml_get_public_method";
+    "caml_greaterequal";
+    "caml_greaterthan";
+    "caml_gt_float";
+    "caml_hash";
+    "caml_int32_compare";
+    "caml_int32_to_int";
+    "caml_int64_compare";
+    "caml_int64_to_int";
+    "caml_int_as_pointer";
+    "caml_int_compare";
+    "caml_int_of_float";
+    "caml_lessequal";
+    "caml_lessthan";
+    "caml_ml_bytes_length";
+    "caml_ml_string_length";
+    "caml_nativeint_compare";
+    "caml_nativeint_to_int";
+    "caml_notequal";
+    "caml_obj_set_raw_field";
+    "caml_obj_set_tag";
+    "caml_obj_tag";
+    "caml_set_oo_id";
+    "caml_signbit_float";
+    "caml_string_compare";
+    "caml_string_equal";
+    "caml_string_get";
+    "caml_string_get16";
+    "caml_string_greaterequal";
+    "caml_string_greaterthan";
+    "caml_string_lessequal";
+    "caml_string_lessthan";
+    "caml_string_notequal";
+    "caml_string_of_bytes";
+    "caml_string_set";
+  ] |> mk_table

@@ -55,6 +55,17 @@ let size_table s get_defname =
   |> SMap.bindings
   |> List.sort (fun (l1,s1) (l2,s2) -> s1-s2)
 
+let compact_code =
+  function
+  | "low" ->
+      Wc_emit.local_limit := 10
+  | "medium" ->
+      Wc_emit.local_limit := 5
+  | "high" ->
+      Wc_emit.local_limit := 0
+  | _ ->
+      assert false
+
 let main() =
   let out = ref "a.out" in   (* let's be traditional *)
   let inp = ref None in
@@ -86,6 +97,9 @@ let main() =
 
       "-enable-deadbeef-check", Arg.Set Wc_emit.enable_deadbeef_check,
       "   enable stack initialization check (debug)";
+
+      "-compact-code", Arg.Symbol(["low"; "medium"; "high"], compact_code),
+      "   emit more compact wasm code (high) or faster code (low)";
     ]
     (fun arg ->
       if !inp <> None then
@@ -132,6 +146,10 @@ let main() =
     eprintf "* tracing globals...\n%!";
   let globals_table = Wc_traceglobals.trace_globals s in
 
+  if not !quiet then
+    eprintf "* tracing functions...\n%!";
+  let funcprops_table = Wc_tracefuncs.trace_funcprops s in
+
   let tab = size_table s get_defname |> List.rev in
   let have_large_functions =
     List.exists (fun (_, size) -> size >= size_limit_for_warning) tab in
@@ -149,7 +167,7 @@ let main() =
 
   if not !quiet then
     eprintf "* translating to WASM...\n%!";
-  let sexpl = generate s exec get_defname globals_table in
+  let sexpl = generate s exec get_defname globals_table funcprops_table in
 
   if not !quiet then
     eprintf "* print as .wat...\n%!";

@@ -64,6 +64,11 @@ type structured_code =
     (* label of current function, or 0 for the init block *)
     cfg_try_labels : trap_labels list;
     (* surrounding "try" sections, inner to outer *)
+    (* cfg_is_pop_label : bool; *)
+    (* whether this label is the regular exit of a "try" section, i.e.
+       a pop label. Note that the trap_labels have already been removed from
+       cfg_try_labels at this point.
+     *)
     cfg_main : bool;
     (* this is a main scope *)
   }
@@ -141,4 +146,3 @@ val validate : structured_code -> unit
 
 val string_of_scope : cfg_scope -> string
 val dump_block : block -> int -> unit
-

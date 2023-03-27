@@ -116,13 +116,16 @@ type gpad =  (* global pad *)
     (* knowledge about the globals *)
     mutable glbfun_table : (int,  int * Wc_traceglobals.initvalue array) Hashtbl.t;
     (* for each letrec function: knowledge about its environment *)
+    funcprops_table : (int, Wc_tracefuncs.funcprops) Hashtbl.t;
+    (* knowledge about functions *)
   }
 
 type fpad =  (* function pad *)
-  { lpad : Wc_unstack.lpad;
+  { mutable lpad : Wc_unstack.lpad;
     fpad_letrec_label : letrec_label;
     mutable fpad_scope : Wc_control.cfg_scope;
     mutable maxdepth : int;
+    mutable have_bp : bool;
     mutable need_appterm_common : bool;
     mutable need_startover : bool;   (* back to subfunction selection *)
     mutable need_selfrecurse : bool; (* self-recursion - only when tailcalls are enabled! *)
@@ -161,6 +164,10 @@ let enable_returncall = ref false
 
 let enable_deadbeef_check = ref false
 (* debugging: check that there is no uninitialized memory on the stack *)
+
+let local_limit = ref 5
+(* try not to put more than this number of values into local variables *)
+
 
 let code_pointer_shift = 12
   (* OCaml code pointers:
@@ -220,16 +227,23 @@ let empty_scope =
   { cfg_letrec_label = None;
     cfg_func_label = 0;
     cfg_try_labels = [];
+    (* cfg_is_pop_label = false; *)
     cfg_main = false
   }
 
-let empty_fpad() =
+let empty_fpad letrec_label =
+  let numeric_label =
+    match letrec_label with
+      | Func k -> k
+      | Main k -> k in
   { lpad = Wc_unstack.empty_lpad
              ~enable_returncall:!enable_returncall
-             empty_scope;
-    fpad_letrec_label = Main 0;
+             ~local_limit:!local_limit
+             empty_scope numeric_label;
+    fpad_letrec_label = letrec_label;
     fpad_scope = empty_scope;
     maxdepth = 0;
+    have_bp = false;
     need_appterm_common = false;
     need_startover = false;
     need_selfrecurse = false;
@@ -255,21 +269,21 @@ let new_local fpad repr =
   Wc_unstack.new_local fpad.lpad repr
 
 let req_tmp1_i32 fpad =
-  if fpad.lpad.avoid_locals then (
+  if fpad.lpad.local_limit = 0 then (
     fpad.need_tmp1_i32 <- true;
     "tmp1_i32"
   )
   else new_local fpad RInt
 
 let req_tmp2_i32 fpad =
-  if fpad.lpad.avoid_locals then (
+  if fpad.lpad.local_limit = 0 then (
     fpad.need_tmp2_i32 <- true;
     "tmp2_i32"
   )
   else new_local fpad RInt
 
 let req_tmp1_f64 fpad =
-  if fpad.lpad.avoid_locals then (
+  if fpad.lpad.local_limit = 0 then (
     fpad.need_tmp1_f64 <- true;
     "tmp1_f64"
   )
@@ -324,11 +338,17 @@ let push_global_field var_base field =
 
 let push_field_addr var_base field =
   [ L [ K "local.get"; ID var_base ] ]
-  @ if field <> 0 then
+  @ if field > 0 then
       [ L [ K "i32.const";
             N (I32 (Int32.of_int (4 * field)));
           ];
         L [ K "i32.add" ]
+      ]
+    else if field < 0 then
+      [ L [ K "i32.const";
+            N (I32 (Int32.of_int (-4 * field)));
+          ];
+        L [ K "i32.sub" ]
       ]
     else
       []
@@ -344,7 +364,7 @@ let push_global_field_addr var_base field =
   ]
 
 let push_stack fpad pos =
-  if pos >= 0 then
+  if pos >= 0 || not fpad.have_bp then
     push_field "fp" pos
   else
     push_field "bp" (pos + fpad.maxdepth)
@@ -397,7 +417,7 @@ let pop_to_domain_field field code_value =
     ]
 
 let pop_to_stack fpad pos code_value =
-  if pos >= 0 then
+  if pos >= 0 || not fpad.have_bp then
     pop_to_field "fp" pos code_value
   else
     pop_to_field "bp" (pos + fpad.maxdepth) code_value
@@ -637,25 +657,64 @@ let pick_stack_overflow =
 let ret_stack_overflow =
   ret_predef_exn "stack_overflow"
 
-let stack_init fpad descr =
-  (* put zeros into the uninitialized stack positions *)
-  List.map
-    (fun pos ->
-      pop_to_stack fpad pos (push_const 1l)
-    )
-    descr.stack_uninit
-  |> List.flatten
+let locals_to_save descr =
+  ISet.elements descr.stack_save_locals
+  |> List.map string_of_localPos
+  |> (fun l -> if descr.stack_save_accu then "accu" :: l else l)
+
+let stack_init_and_save_locals fpad descr =
+  let locals = ref (locals_to_save descr) in
+  let instrs1 =
+    List.map
+      (fun pos ->
+        match !locals with
+          | local :: rest ->
+              locals := rest;
+              push_local local |> pop_to_stack fpad pos
+          | [] ->
+              push_const 1l |> pop_to_stack fpad pos
+      )
+      descr.stack_uninit
+    |> List.flatten in
+  let n = ref 0 in
+  let instrs2 =
+    List.map
+      (fun local ->
+        incr n;
+        push_local local |> pop_to_stack fpad (-descr.stack_depth - !n)
+      )
+      !locals
+    |> List.flatten in
+  (instrs1 @ instrs2, !n)
+
+let stack_restore_locals fpad descr =
+  let locals = ref (locals_to_save descr) in
+  let instrs1 =
+    List.map
+      (fun pos ->
+        match !locals with
+          | local :: rest ->
+              locals := rest;
+              push_stack fpad pos @ pop_to_local local
+          | [] ->
+              []
+      )
+      descr.stack_uninit
+    |> List.flatten in
+  let n = ref 0 in
+  let instrs2 =
+    List.map
+      (fun local ->
+        incr n;
+        push_stack fpad (-descr.stack_depth - !n) @ pop_to_local local
+      )
+      !locals
+    |> List.flatten in
+  (instrs1 @ instrs2, !n)
 
 let setup_for_gc fpad descr =
-  let sp_decr =
-    if descr.stack_save_accu then 1 else 0 in
-  let sexpl_stack =
-    stack_init fpad descr in
-  let sexpl_accu =
-    if descr.stack_save_accu then
-      push_local "accu" |> pop_to_stack fpad (-descr.stack_depth-1)
-    else
-      [] in
+  let sexpl_stack, sp_decr =
+    stack_init_and_save_locals fpad descr in
   let sexpl_extern_sp =
     ( [ L [ K "local.get";
             ID "fp";
@@ -681,13 +740,12 @@ let setup_for_gc fpad descr =
       else
         []
     ) in
-  sexpl_stack @ sexpl_accu @ sexpl_extern_sp @ sexpl_check
+  sexpl_stack @ sexpl_extern_sp @ sexpl_check
 
 let restore_after_gc fpad descr =
-  if descr.stack_save_accu then
-    push_stack fpad (-descr.stack_depth-1) @ pop_to_local "accu"
-  else
-    []
+  let sexpl_stack, _ =
+    stack_restore_locals fpad descr in
+  sexpl_stack
 
 let alloc_atom fpad tag =
   [ L [ K "global.get";
@@ -775,15 +833,11 @@ let alloc_slow() =
             L [ K "param"; ID "header"; K "i32" ];
             L [ K "param"; ID "fp"; K "i32" ];
             L [ K "param"; ID "stackdepth"; K "i32" ];
-            L [ K "param"; ID "accu"; K "i32" ];
             L [ K "param"; ID "do_eh"; K "i32" ];
             BR;
             L [ K "result"; C "ptr"; K "i32" ];
             L [ K "local"; ID "lroots"; K "i32" ];
           ];
-          if !enable_multireturn then [
-              L [ K "result"; C "out_accu"; K "i32" ];
-            ] else [];
           [ L [ K "local"; ID "ptr"; K "i32" ];
             L [ K "local"; ID "sp"; K "i32" ]
           ];
@@ -791,13 +845,10 @@ let alloc_slow() =
           ( [ L [ K "local.get"; ID "fp" ];
               L [ K "local.get"; ID "stackdepth" ];
               L [ K "i32.sub" ];
-              L [ K "i32.const"; N (I32 4l) ];  (* for the accu *)
-              L [ K "i32.sub" ];
               L [ K "local.tee"; ID "sp" ];
             ]
             |> pop_to_domain_field domain_field_extern_sp
-          )
-          @ (push_local "accu" |> pop_to_field "sp" 0);
+          );
 
           ( if !enable_deadbeef_check then
               push_domain_field domain_field_extern_sp
@@ -829,10 +880,8 @@ let alloc_slow() =
                         L [ K "if";
                             L ( [ K "then";
                                   L [ K "i32.const"; N (I32 0l) ];
-                                  L [ K "i32.const"; N (I32 1l) ];
-                                ] @ (if !enable_multireturn then [] else
-                                       [ L [ K "global.set"; ID "retval2" ] ]) @
-                                  [ L [ K "return" ]]
+                                  L [ K "return" ]
+                                ]
                               )
                           ]
                       ]
@@ -863,13 +912,6 @@ let alloc_slow() =
           push_const 4l;
           [ L [ K "i32.add" ] ];
 
-          (* return saved accu *)
-          push_field "sp" 0;
-
-          if !enable_multireturn then [] else
-            [ L [ K "global.set"; ID "retval2" ];
-            ];
-
           [ L [ K "return" ]]
 
         ] |> List.flatten
@@ -878,9 +920,6 @@ let alloc_slow() =
 
 let call_alloc_slow() =
   [ L [ K "call"; ID "alloc_slow" ]]
-  @ if !enable_multireturn then [] else
-      [ L [ K "global.get"; ID "retval2" ] ]
-
 
 let alloc_non_atom fpad descr size tag =
   let do_eh = fpad.lpad.scope.cfg_try_labels <> [] in
@@ -889,6 +928,8 @@ let alloc_non_atom fpad descr size tag =
   let young = size <= max_young_wosize in
   let code =
     if young then
+      let instrs_save, extra = stack_init_and_save_locals fpad descr in
+      let instrs_restore, _ = stack_restore_locals fpad descr in
       [ push_const (Int32.of_int (4 * (size+1)));
         push_const (Int32.of_int (make_header size tag));
         [ L [ K "call"; ID "alloc_fast" ];
@@ -901,16 +942,15 @@ let alloc_non_atom fpad descr size tag =
               L ( [ [
                       K "then";
                     ];
-                    stack_init fpad descr;
+                    instrs_save;
                     push_const (Int32.of_int size);
                     push_const (Int32.of_int (make_header size tag));
                     push_local "fp";
-                    push_const (Int32.of_int (4 * descr.stack_depth));
-                    push_local "accu";
+                    push_const (Int32.of_int (4 * (descr.stack_depth + extra)));
                     push_const (if do_eh then 1l else 0l);
                     call_alloc_slow();
-                    pop_to_local "accu";
                     pop_to_local ptr;
+                    instrs_restore;
                     if do_eh then
                       [ L [ K "local.get"; ID ptr ];
                         L [ K "i32.eqz" ];
@@ -930,11 +970,13 @@ let alloc_non_atom fpad descr size tag =
         fpad.need_lroots <- true;
         push_domain_field domain_field_local_roots
         @ pop_to_local "lroots"
+        @ setup_for_gc fpad descr
         @ [ L [ K "i32.const"; ID "caml_alloc_shr" ];
             L [ K "i32.const"; N (I32 (Int32.of_int size)) ];
             L [ K "i32.const"; N (I32 (Int32.of_int tag)) ];
             L [ K "call"; ID "wasicaml_wraptry2" ];
           ]
+        @ restore_after_gc fpad descr
         @ ( push_local "lroots"
             |> pop_to_domain_field domain_field_local_roots
           )
@@ -945,11 +987,13 @@ let alloc_non_atom fpad descr size tag =
               ]
           ]
       ) else
-        [ L [ K "i32.const"; N (I32 (Int32.of_int size)) ];
-          L [ K "i32.const"; N (I32 (Int32.of_int tag)) ];
-          L [ K "call"; ID "caml_alloc_shr" ];
-          L [ K "local.set"; ID ptr ];
-        ] in
+        setup_for_gc fpad descr
+        @ [ L [ K "i32.const"; N (I32 (Int32.of_int size)) ];
+            L [ K "i32.const"; N (I32 (Int32.of_int tag)) ];
+            L [ K "call"; ID "caml_alloc_shr" ];
+            L [ K "local.set"; ID ptr ];
+          ]
+        @ restore_after_gc fpad descr in
   (code, ptr, young)
 
 let alloc fpad descr size tag =
@@ -975,7 +1019,7 @@ let grab_helper gpad =
      NB. we never catch exceptions from alloc_small - these always fall
      through to the caller.
    *)
-  let fpad = empty_fpad() in
+  let fpad = empty_fpad (Main 0) in
   let descr = empty_descr in
   assert(descr.stack_save_accu = false);
 
@@ -1718,6 +1762,8 @@ let push fpad store =
         push_const (Int32.of_int x)
     | RealStack pos ->
         push_stack fpad pos
+    | LocalPos pos ->
+        push_local (Wc_instruct.string_of_localPos pos)
     | Atom tag ->
         alloc_atom fpad tag
     | TracedGlobal(Glb glb_offset, path, _) ->
@@ -1763,6 +1809,9 @@ let pop_to fpad store repr descr_opt code_value =
     | RealStack pos ->
         (code_value @ tovalue_alloc fpad repr descr_opt)
         |> pop_to_stack fpad pos
+    | LocalPos pos ->
+        (code_value @ tovalue_alloc fpad repr descr_opt)
+        @ pop_to_local (Wc_instruct.string_of_localPos pos)
     | _ ->
         assert false
 
@@ -1777,6 +1826,9 @@ let copy fpad src dest descr_opt =
     | RealStack pos ->
         push_alloc_as fpad src RValue descr_opt
         |>  pop_to_stack fpad pos
+    | LocalPos pos ->
+        push_alloc_as fpad src RValue descr_opt
+        @ pop_to_local (Wc_instruct.string_of_localPos pos)
     | _ ->
         assert false
 
@@ -2412,19 +2464,16 @@ let wraptry n =
   else
     sprintf "wasicaml_wraptry%d" n
 
-let c_call gpad fpad descr src_list name =
+let c_call gpad fpad descr_opt src_list name =
   let do_eh = fpad.lpad.scope.cfg_try_labels <> [] in
   if do_eh then
     fpad.need_lroots <- true;
-  let descr = { descr with stack_save_accu = false } in (* it is overwritten *)
-  let sexpl_setup = setup_for_gc fpad descr in
-  let sexpl_restore = restore_after_gc fpad descr in
-  (*
-  let sexpl_debug_args =
-    List.map
-      (fun src -> push_const 21l @ push_as fpad src RValue @ [ L [ K "call"; ID "debug2" ]])
-      src_list |> List.flatten in
-   *)
+  let sexpl_setup, sexpl_restore =
+    match descr_opt with
+      | Some descr ->
+          (setup_for_gc fpad descr, restore_after_gc fpad descr)
+      | None ->
+          ([], []) in
   let sexpl_save_lroots =
     push_domain_field domain_field_local_roots
     @ pop_to_local "lroots" in
@@ -2472,7 +2521,6 @@ let c_call_vector gpad fpad descr numargs depth name =
   let do_eh = fpad.lpad.scope.cfg_try_labels <> [] in
   if do_eh then
     fpad.need_lroots <- true;
-  let descr = { descr with stack_save_accu = false } in (* it is overwritten *)
   let sexpl_setup = setup_for_gc fpad descr in
   let sexpl_restore = restore_after_gc fpad descr in
   let sexpl_save_lroots =
@@ -2638,17 +2686,44 @@ let return() =
     L [ K "return" ];
   ]
 
+let use_env gpad funlabel numargs =
+  let funcprops = Wc_tracefuncs.get_funcprops gpad.funcprops_table funlabel in
+  funcprops.use_env ||
+    ( match funcprops.func_arity with
+        | None -> true
+        | Some n -> n <> numargs
+    )
+
+let use_codeptr gpad funlabel numargs =
+  (not !enable_returncall) ||
+    ( let funcprops =
+        Wc_tracefuncs.get_funcprops gpad.funcprops_table funlabel in
+      ( match funcprops.func_arity with
+          | None -> true
+          | Some n -> n <> numargs (* GRAB *)
+      )
+    )
+
 let apply_direct_no_eh gpad fpad funlabel numargs depth =
   let _, letrec_label, _ = lookup_label gpad funlabel in
   let letrec_name = Hashtbl.find gpad.letrec_name letrec_label in
   let env_pos = (-depth + numargs) in
-  ( push_local "accu"
-    |> pop_to_stack fpad env_pos
+  ( if use_env gpad funlabel numargs then
+      ( push_local "accu"
+        |> pop_to_stack fpad env_pos
+      )
+      @ push_field_addr "fp" env_pos (* new envptr *)
+    else
+      [ C "omit_envptr";
+        L [ K "i32.const"; N (I32 (-1l)) ] ]
   )
-  @ push_field_addr "fp" env_pos (* new envptr *)
   @ [ L [ K "i32.const"; N (I32 (Int32.of_int (numargs-1))) ];
     ]
-  @ push_field "accu" 0
+  @ ( if use_codeptr gpad funlabel numargs then
+        push_field "accu" 0
+      else
+        [ L [ K "i32.const"; N (I32 0l) ] ]
+    )
   @ push_local "fp"
   @ [L [ K "i32.const"; N (I32 (Int32.of_int (4 * depth))) ];
      L [ K "i32.sub" ];
@@ -2667,16 +2742,29 @@ let apply_direct_eh gpad fpad funlabel numargs depth =
   let _, letrec_label, _ = lookup_label gpad funlabel in
   let letrec_name = Hashtbl.find gpad.letrec_name letrec_label in
   let env_pos = (-depth + numargs) in
-  ( push_local "accu"
-    |> pop_to_stack fpad env_pos
+  ( if use_env gpad funlabel numargs then
+      ( push_local "accu"
+        |> pop_to_stack fpad env_pos
+      )
+    else
+      []
   )
   @ push_domain_field domain_field_local_roots
   @ pop_to_local "lroots"
   @ [ L [ K "i32.const"; ID letrec_name ] ]
-  @ push_field_addr "fp" env_pos (* new envptr *)
+  @ ( if use_env gpad funlabel numargs then
+        push_field_addr "fp" env_pos (* new envptr *)
+      else
+        [ C "omit_envptr";
+          L [ K "i32.const"; N (I32 (-1l)) ] ]
+    )
   @ [ L [ K "i32.const"; N (I32 (Int32.of_int (numargs-1))) ];
     ]
-  @ push_field "accu" 0
+  @ ( if use_codeptr gpad funlabel numargs then
+        push_field "accu" 0
+      else
+        [ L [ K "i32.const"; N (I32 0l) ] ]
+    )
   @ push_local "fp"
   @ [L [ K "i32.const"; N (I32 (Int32.of_int (4 * depth))) ];
      L [ K "i32.sub" ];
@@ -2839,7 +2927,7 @@ let call_reinit_frame gpad fpad numargs oldnumargs depth =
     @ [ L [ K "call"; ID "reinit_frame" ] ]
   )
 
-let appterm_push_params numargs =
+let appterm_push_params gpad funlabel_opt numargs =
   [ L [ K "local.get"; ID "envptr" ];      (* first arg of call *)
   ]
   @ [ L [ K "local.get"; ID "extra_args" ] (* second arg of call *)
@@ -2851,7 +2939,15 @@ let appterm_push_params numargs =
      else
        []
     )
-  @ push_field "accu" 0                (* third arg of call: code pointer *)
+  @ (match funlabel_opt with
+       | Some funlabel ->
+           if use_codeptr gpad funlabel numargs then
+             push_field "accu" 0
+           else
+             [ L [ K "i32.const"; N (I32 0l) ] ]
+       | None ->
+           push_field "accu" 0         (* third arg of call: code pointer *)
+    )
   @ [ L [ K "local.get"; ID "fp" ]     (* fourth arg of call *)
     ]
 
@@ -2860,7 +2956,7 @@ let appterm_with_returncall gpad fpad numargs oldnumargs depth =
     call_reinit_frame gpad fpad numargs oldnumargs depth
     @ pop_to_local "fp"   (* no need to set bp here *)
     @ (push_local "accu" |> pop_to_field "envptr" 0)
-    @ appterm_push_params numargs
+    @ appterm_push_params gpad None numargs
     @ push_field "accu" 0
     @ [ L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
         L [ K "i32.shr_u" ];             (* which function to call *)
@@ -2901,11 +2997,15 @@ let appterm_direct gpad fpad funlabel numargs oldnumargs depth =
   let sexpl =
     call_reinit_frame gpad fpad numargs oldnumargs depth
     @ pop_to_local "fp"   (* no need to set bp here *)
-    @ (push_local "accu" |> pop_to_field "envptr" 0)
+    @ ( if use_env gpad funlabel numargs then
+          push_local "accu" |> pop_to_field "envptr" 0
+        else
+          [ C "omit_envptr" ]
+      )
     @ (if goto_selfrecurse then
          [ L [ K "br"; ID "selfrecurse" ] ]
        else
-         appterm_push_params numargs
+         appterm_push_params gpad (Some funlabel) numargs
          @ [ L [ K "return_call";
                  ID letrec_name
                ]
@@ -2930,24 +3030,43 @@ let appterm_args gpad fpad funlabel_opt funsrc argsrc oldnumargs depth =
      unavailable *)
   assert(!enable_returncall);
   let newnumargs = List.length argsrc in
+  let fp_delta = oldnumargs - newnumargs in
   (* save argsrc in local variables *)
   let arg_locals =
-    List.map (fun src -> new_local fpad (repr_of_store src)) argsrc in
+    List.mapi
+      (fun i src ->
+        match src with
+          | RealStack pos ->
+              if fp_delta <> 0 || pos <> i then
+                let repr = repr_of_store src in
+                Local(repr, new_local fpad repr)
+              else
+                src
+          | RealAccu _ -> (* because accu gets destroyed *)
+              let repr = repr_of_store src in
+              Local(repr, new_local fpad repr)
+          | _ -> src
+      )
+      argsrc in
   let arg_instrs1 =
     List.map2
-      (fun src localname ->
-        let dest = Local(repr_of_store src, localname) in
-        copy fpad src dest None
+      (fun src local ->
+        if src = local then
+          []
+        else
+          copy fpad src local None
       )
       argsrc
       arg_locals
     |> List.flatten in
   (* set "accu" to the function pointer: *)
   let accu_instrs =
-    copy fpad funsrc (RealAccu { no_function = false }) None in
+    match funsrc with
+      | RealAccu _ ->
+          []
+      | _ ->
+          copy fpad funsrc (RealAccu { no_function = false }) None in
   (* fp = fp + old_num_args - new_num_args *)
-  let fp_delta =
-    oldnumargs - newnumargs in
   let fp_instrs =
     if fp_delta = 0 then
       []
@@ -2959,16 +3078,24 @@ let appterm_args gpad fpad funlabel_opt funsrc argsrc oldnumargs depth =
       ] in
   let arg_instrs2 =
     List.map2
-      (fun src (localname, i) ->
-        let src = Local(repr_of_store src, localname) in
+      (fun src (src, i) ->
         let dest = RealStack i in
         copy fpad src dest None
       )
       argsrc
-      (List.mapi (fun i localname -> (localname, i)) arg_locals)
+      (List.mapi (fun i local -> (local, i)) arg_locals)
     |> List.flatten in
+  let envptr_instrs_dfl =
+    push_local "accu" |> pop_to_field "envptr" 0 in
   let envptr_instrs =
-    (push_local "accu" |> pop_to_field "envptr" 0) in
+    match funlabel_opt with
+      | Some funlabel ->
+          if use_env gpad funlabel newnumargs then
+            envptr_instrs_dfl
+          else
+            [ C "omit_envptr" ]
+      | None ->
+          envptr_instrs_dfl in
   let call_instrs =
     match funlabel_opt with
       | Some funlabel ->
@@ -2981,13 +3108,13 @@ let appterm_args gpad fpad funlabel_opt funsrc argsrc oldnumargs depth =
             fpad.need_selfrecurse <- true;
             [ L [ K "br"; ID "selfrecurse" ] ]
           ) else
-            appterm_push_params newnumargs
+            appterm_push_params gpad funlabel_opt newnumargs
             @ [ L [ K "return_call";
                     ID letrec_name
                   ]
               ]
       | None ->
-          appterm_push_params newnumargs
+          appterm_push_params gpad funlabel_opt newnumargs
           @ push_field "accu" 0
           @ [ L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
               L [ K "i32.shr_u" ];             (* which function to call *)
@@ -3012,9 +3139,12 @@ let rec emit_instr gpad fpad instr =
   match instr with
     | Wcomment s ->
         []
+    | Wadjust _ ->
+        []
     | Wblock arg ->
-        let old_scope = fpad.lpad.scope in
-        fpad.lpad.scope <- arg.scope;
+        let old_lpad = fpad.lpad in
+        let new_lpad = Wc_unstack.lpad_with ~scope:arg.scope old_lpad in
+        fpad.lpad <- new_lpad;
         let instrs =
           match arg.label with
             | Label lab ->
@@ -3034,7 +3164,7 @@ let rec emit_instr gpad fpad instr =
                       @ emit_instrs gpad fpad arg.body
                     )
                 ] in
-        fpad.lpad.scope <- old_scope;
+        fpad.lpad <- old_lpad;
         instrs
     | Wcond { cond; ontrue; onfalse } ->
         emit_instr gpad fpad (if !cond then ontrue else onfalse)
@@ -3091,10 +3221,6 @@ let rec emit_instr gpad fpad instr =
         @ push_local ptr
         @ pop_to_local "accu"
     | Wccall arg ->
-        (* TODO: maintain a list of noalloc primitives *)
-        (* TODO: maintain a list of unit primitives (set accu=Const 0 instead),
-           or more generally, primitives that never return functions
-         *)
         c_call gpad fpad arg.descr arg.src arg.name
     | Wccall_vector arg ->
         c_call_vector gpad fpad arg.descr arg.numargs arg.depth arg.name
@@ -3162,18 +3288,20 @@ let rec emit_instr gpad fpad instr =
           gpad fpad (Some arg.funlabel) arg.funsrc arg.argsrc arg.oldnumargs
           arg.depth
     | Wreturn arg ->
-        let no_function =
+        let no_function, is_accu =
         match arg.src with
-          | RealAccu { no_function } -> no_function
-          | _ -> repr_of_store arg.src <> RValue in
+          | RealAccu { no_function } -> no_function, true
+          | _ -> repr_of_store arg.src <> RValue, false in
         if no_function then
           push_as fpad arg.src RValue
           @ [ L [ K "return" ]]
         else (
           (* return value could be another closure *)
           fpad.need_return <- true;
-          push_as fpad arg.src RValue
-          @ pop_to_local "accu"
+          ( if is_accu then [] else
+              push_as fpad arg.src RValue
+              @ pop_to_local "accu"
+          )
           @ push_field_addr "fp" arg.arity
           @ pop_to_local "fp"
           @ [ L [ K "br"; ID "return" ]]
@@ -3188,7 +3316,7 @@ let rec emit_instr gpad fpad instr =
           eprintf "[DEBUG] function: %s\n%!" letrec_name;
           assert false;
         );
-        grab fpad arg.numargs
+        grab fpad (arg.arity-1)
     | Wclosurerec arg ->
         closurerec gpad fpad arg.descr arg.src arg.dest
     | Wraise arg ->
@@ -3231,29 +3359,17 @@ and emit_instrs gpad fpad instrs =
   |> List.rev
 
 let rec extract_grab instrs =
-  (* Extract the first Wgrab, optionally wrapped in a cascade of Wblock *)
+  (* Wc_unstack puts the Wgrab always in front *)
   match instrs with
     | Wgrab _ as grab :: rest ->
         (rest, Some grab)
-    | Wcomment _ as i :: rest ->
-        let rest_after_extract, grab_opt = extract_grab rest in
-        (i :: rest_after_extract, grab_opt)
-    | Wblock arg :: rest ->
-        ( match arg.label with
-            | Label _ ->
-                let body_after_extract, grab_opt = extract_grab arg.body in
-                (Wblock { arg with body = body_after_extract } :: rest,
-                 grab_opt
-                )
-            | Loop _ ->
-                (instrs, None)
-        )
     | _ ->
         (instrs, None)
 
 let emit_fblock_instrs gpad fpad instrs =
   fpad.disallow_grab <- false;
-  fpad.lpad.scope <- fpad.fpad_scope;
+  let lpad = Wc_unstack.lpad_with ~scope:fpad.fpad_scope fpad.lpad in
+  fpad.lpad <- lpad;
   let rest, grab_opt = extract_grab instrs in
   match grab_opt with
     | Some grab ->
@@ -3280,6 +3396,7 @@ let emit_fblock gpad fpad fblock =
   (* make maxdepth a bit larger than stricly necessary to completely avoid
      bp[k] with k<0 *)
   fpad.maxdepth <- if maxdepth > 0 then maxdepth + 2 else 0;
+  fpad.have_bp <- maxdepth > 0;
   let instrs =
     Wc_unstack.transl_fblock fpad.lpad fblock
     |> emit_fblock_instrs gpad fpad in
@@ -3415,15 +3532,21 @@ let init_lpad_for_subfunc gpad fpad func_label =
     ( try Hashtbl.find gpad.glbfun_table func_label
       with Not_found -> 0, [| |]
     ) in
-  fpad.lpad.environment <- environment;
-  fpad.lpad.func_offset <- func_offset
+  fpad.lpad <- { fpad.lpad with
+                 environment;
+                 func_offset
+               }
 
 let generate_function scode gpad letrec_label func_name subfunc_labels export_flag =
-  let fpad = { (empty_fpad()) with fpad_letrec_label = letrec_label } in
+  let fpad = empty_fpad letrec_label in
   Hashtbl.add fpad.lpad.locals "accu" RValue;
   Hashtbl.add fpad.lpad.locals "bp" RValue;
-  fpad.lpad.avoid_locals <- export_flag; (* avoid local vars in the long main function *)
-  fpad.lpad.globals_table <- gpad.globals_table;
+  fpad.lpad <- { fpad.lpad with
+                 local_limit = if export_flag then 0 else fpad.lpad.local_limit;
+                   (* avoid local vars in the long main function *)
+                 globals_table = gpad.globals_table;
+                 funcprops_table = gpad.funcprops_table;
+               };
 
   let subfunc_pairs =
     List.map
@@ -3494,10 +3617,12 @@ let generate_function scode gpad letrec_label func_name subfunc_labels export_fl
   if fpad.need_tmp2_i32 then
     Hashtbl.add fpad.lpad.locals "tmp2_i32" RValue;
   if fpad.need_tmp1_f64 then
-    Hashtbl.add fpad.lpad.locals "tmp1_f64" RValue;
+    Hashtbl.add fpad.lpad.locals "tmp1_f64" RFloat;
 
   let locals =
-    Hashtbl.fold (fun name vtype acc -> (name,vtype) :: acc) fpad.lpad.locals [] in
+    Hashtbl.fold (fun name vtype acc -> (name,vtype) :: acc) fpad.lpad.locals []
+    @ (Hashtbl.fold (fun pos _ acc -> (string_of_localPos pos,RValue) :: acc) fpad.lpad.localPos [])
+  in
 
   let letrec =
     [ L ( [ K "func";
@@ -3661,7 +3786,7 @@ let bigarray_to_string_list limit ba =
   done;
   List.rev !l
 
-let generate scode exe get_defname globals_table =
+let generate scode exe get_defname globals_table funcprops_table =
   let (funcmapping, subfunctions) = get_funcmapping scode in
 
   let letrec_name = Hashtbl.create 7 in
@@ -3711,6 +3836,7 @@ let generate scode exe get_defname globals_table =
       need_mlookup = false;
       globals_table;
       glbfun_table = Wc_traceglobals.derive_glbfun_table globals_table;
+      funcprops_table;
     } in
 
   let sexpl_code =

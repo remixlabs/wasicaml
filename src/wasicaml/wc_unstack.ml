@@ -10,7 +10,8 @@ open Wc_util
 type state =
   { camlstack : store list;
     (* where the contents are stored that are supposed to be on the
-       OCaml stack - in top to bottom order.
+       OCaml stack - in top to bottom order. This also includes the
+       args of the function at the very end.
 
        If an OCaml stack value is stored in the real stack, it is only
        allowed to store it at its original position or at a lower (newer)
@@ -21,9 +22,14 @@ type state =
        there must be no other value stored at the original position (so that we
        can always copy the value to its original position without first
        having to move some other value away).
+
+       List.length camlstack = camldepth + arity
+
+       The first element of camlstack is for stack position -camldepth.
+       The last element of camlstack is for stack position arity-1.
      *)
     camldepth : int;
-    (* = List.length camlstack *)
+    (* the length of the stack except function arguments *)
     accu : store;
     (* where the accu is stored *)
     realaccu : ISet.t;
@@ -31,8 +37,12 @@ type state =
        If additionally accu=RealAccu, the "accu" variable also keeps the
        logical accu value.
      *)
-    arity : int;
-    (* number of args pf the current function - first set after Kgrab *)
+    localthold : int;
+    (* threshold for local variables. Any stack position < localthr is
+       in a LocalPos instead of RealStack.
+     *)
+    arity : int option;
+    (* number of args pf the current function *)
   }
 
 (* IDEA: there is sometimes code setting the accu, but then the accu
@@ -45,7 +55,8 @@ type state =
  *)
 
 type lpad =  (* local pad *)
-  { mutable scope : Wc_control.cfg_scope;
+  { letrec_label : int;
+    scope : Wc_control.cfg_scope;
     (* The scope of the current block *)
 
     locals : (string, repr) Hashtbl.t;
@@ -53,10 +64,14 @@ type lpad =  (* local pad *)
        is set to true when the local is actually used.
      *)
 
-    mutable avoid_locals : bool;
-    (* try not to allocate locals in this function *)
+    localPos : (int, unit) Hashtbl.t;
 
-    mutable loops : ISet.t;
+    local_limit : int;
+    (* how many stack positions should be kept in local variables. This is
+       just a preference - the actual number can be higher or lower
+     *)
+
+    loops : ISet.t ref;
     (* which labels are loop labels *)
 
     indegree : (int, int) Hashtbl.t;
@@ -68,21 +83,23 @@ type lpad =  (* local pad *)
     state_table : (int, state) Hashtbl.t;
     (* the start state by label *)
 
-    mutable globals_table : (int, Wc_traceglobals.initvalue) Hashtbl.t;
+    globals_table : (int, Wc_traceglobals.initvalue) Hashtbl.t;
     (* knowledge about the globals *)
 
-    mutable environment : Wc_traceglobals.initvalue array;
+    environment : Wc_traceglobals.initvalue array;
     (* knowledge about the environment of this function - can be the empty
        array if nothing is known
      *)
 
-    mutable func_offset : int;
+    func_offset : int;
     (* knowledge about the environment: this function is at position
        func_offset in the environment (only when environment <> [])
      *)
 
     enable_returncall : bool;
     (* whether we are allowed to emit tail calls *)
+
+    funcprops_table : (int, Wc_tracefuncs.funcprops) Hashtbl.t;
   }
 
 let real_accu =
@@ -96,21 +113,82 @@ let empty_state =
     camldepth = 0;
     accu = Invalid;
     realaccu = ISet.empty;
-    arity = 1;
+    arity = None;
+    localthold = 0;
   }
 
-let empty_lpad ~enable_returncall scope =
+let empty_lpad ~enable_returncall ~local_limit scope letrec_label =
+  let local_limit =
+    (* inside a try label do not prefer local variables over stack positions,
+       as we need to be able to jump to the catchlabel at any time
+     *)
+    if Wc_control.(scope.cfg_try_labels) = [] then
+      local_limit
+    else
+      0 in
   { scope;
     locals = Hashtbl.create 7;
-    avoid_locals = false;
-    loops = ISet.empty;
+    localPos = Hashtbl.create 7;
+    local_limit;
+    loops = ref ISet.empty;
     indegree = Hashtbl.create 7;
     state_table = Hashtbl.create 7;
     globals_table = Hashtbl.create 1;
     environment = [| |];
     func_offset = 0;
     enable_returncall;
+    letrec_label;
+    funcprops_table = Hashtbl.create 7;
   }
+
+let lpad_with ~scope lpad =
+  let local_limit =
+    if Wc_control.(scope.cfg_try_labels) = [] then
+      lpad.local_limit
+    else
+      0 in
+  { lpad with scope; local_limit }
+
+let decl_store lpad store =
+  match store with
+    | LocalPos pos ->
+        Hashtbl.replace lpad.localPos pos ()
+    | _ ->
+        ()
+
+let real_store state store =
+  match store with
+    | RealStack pos when pos < state.localthold ->
+        LocalPos pos
+    | _ ->
+        store
+
+let real_store_d lpad state store =
+  (* ... with declaration of LocalPos *)
+  match store with
+    | RealStack pos when pos < state.localthold ->
+        let store' = LocalPos pos in
+        decl_store lpad store';
+        store'
+    | _ ->
+        store
+
+let string_of_state state =
+  let camlstack =
+    List.map (real_store state) state.camlstack
+    |> List.map string_of_store
+    |> String.concat ", " in
+  let realaccu =
+    ISet.elements state.realaccu
+    |> List.map string_of_int
+    |> String.concat ", " in
+  sprintf "{camldepth=%d; arity=%s; localthold=%d; camlstack=[%s]; accu=%s; realaccu={%s}"
+          state.camldepth
+          (match state.arity with None -> "n/a" | Some n -> string_of_int n)
+          state.localthold
+          camlstack
+          (string_of_store state.accu)
+          realaccu
 
 let new_local lpad repr =
   let k = Hashtbl.length lpad.locals in
@@ -118,19 +196,35 @@ let new_local lpad repr =
   Hashtbl.add lpad.locals s repr;
   s
 
-let stack_descr state =
+let stack_save_accu_if_used state =
+  state.realaccu <> ISet.empty ||
+    ( match state.accu with RealAccu _ -> true | _ -> false)
+
+let stack_save_accu_if_used_here l =
+  List.exists
+    (function
+     | RealAccu _ -> true
+     | _ -> false
+    )
+    l
+
+let stack_descr state stack_save_accu =
+  let stack_save_locals =
+    ref ISet.empty in
   let cd = state.camldepth in
   let rd = ref 0 in
   let stack = Array.make cd false in
   List.iter
     (fun st ->
-      match st with
+      match real_store state st with
         | RealStack pos ->
             assert(pos >= (-cd));
             if pos < 0 then (
               stack.(pos + cd) <- true;
               rd := max !rd (-pos)
             )
+        | LocalPos pos ->
+            stack_save_locals := ISet.add pos !stack_save_locals
         | _ ->
             ()
     )
@@ -141,71 +235,49 @@ let stack_descr state =
     if not used && i >= cd - !rd then
       uninit := (-cd+i) :: !uninit;
   done;
-  let stack_save_accu =
-    state.realaccu <> ISet.empty ||
-      ( match state.accu with RealAccu _ -> true | _ -> false) in
   { stack_uninit = !uninit;
     stack_depth = !rd;
-    stack_save_accu
+    stack_save_accu;
+    stack_save_locals = !stack_save_locals
   }
 
 let set_camlstack pos store state =
   let cd = state.camldepth in
   if pos >= (-cd) && pos <= (-1) then
+    let cstore =
+      match store with
+        | LocalPos pos -> RealStack pos
+        | _ -> store in
     let camlstack =
       List.mapi
         (fun i old_store ->
-          if (-cd+i) = pos then store else old_store
+          if (-cd+i) = pos then cstore else old_store
         )
         state.camlstack in
     camlstack
   else
+    (* Cannot set pos >= 0 - these are the function args *)
     state.camlstack
-
-let pop_camlstack state =
-  let cd = state.camldepth in
-  let cpos = (-cd) in
-  match state.camlstack with
-    | RealStack pos :: tl ->
-        { state with
-          camlstack = tl;
-          camldepth = cd - 1;
-        }
-    | (RealAccu _):: tl ->
-        { state with
-          camlstack = tl;
-          camldepth = cd - 1;
-          realaccu = ISet.remove cpos state.realaccu;
-        }
-    | (Const _ | Local _ | Atom _ | TracedGlobal _ | Invalid) :: tl ->
-        { state with camlstack = tl; camldepth = cd - 1 }
-    | [] ->
-        assert false
-
-let rec popn_camlstack number state =
-  if number = 0 then
-    state
-  else
-    popn_camlstack (number-1) (pop_camlstack state)
 
 let push_camlstack store state =
   let cd = state.camldepth in
-  let cpos = (-cd-1) in
   match store with
-    | RealStack pos ->
-        { state with
-          camlstack = store :: state.camlstack;
-          camldepth = cd + 1;
-        }
     | RealAccu _ ->
+        let cpos = (-cd-1) in
         { state with
           camlstack = store :: state.camlstack;
           camldepth = cd + 1;
           realaccu = ISet.add cpos state.realaccu;
         }
-    | (Const _ | Local _ | Atom _ | TracedGlobal _) ->
+    | (RealStack _  | Const _ | Local _ | Atom _ | TracedGlobal _) ->
         { state with
           camlstack = store :: state.camlstack;
+          camldepth = cd + 1;
+        }
+    | LocalPos pos ->
+        let st = RealStack pos in
+        { state with
+          camlstack = st :: state.camlstack;
           camldepth = cd + 1;
         }
     | Invalid ->
@@ -218,17 +290,20 @@ let flush_accu lpad state =
     ISet.fold
       (fun pos instr_acc ->
         let instr =
-          Wcopy { src=real_accu; dest=RealStack pos } in
+          let src = real_accu in
+          let dest = RealStack pos |> real_store_d lpad state in
+          Wcopy { src; dest } in
         instr :: instr_acc
       )
       state.realaccu
       [] in
   let instrs =
     List.rev instrs_rev in
+  let cd = state.camldepth in
   let camlstack =
     List.mapi
       (fun i old ->
-        let pos = (-state.camldepth+i) in
+        let pos = (-cd+i) in
         if ISet.mem pos state.realaccu then (
           RealStack pos
         ) else
@@ -253,7 +328,8 @@ let straighten_accu lpad state =
     | RealAccu _ ->
         (state, instrs_flush)
     | store ->
-        let instr = Wcopy { src=store; dest=real_accu } in
+        let src = store |> real_store_d lpad state in
+        let instr = Wcopy { src; dest=real_accu } in
         let state = { state with accu=real_accu } in
         (state, instrs_flush @ [instr])
 
@@ -261,41 +337,77 @@ let straighten_accu_when_on_stack lpad state =
   (* Load the accu if it is stored in the real stack. This is needed before
      renaming the accu into another stack position, in order to enforece
      the "no swapping of stack positions" rule.
+
+     Also doing this for LocalPos, because these variables can be saved
+     at any time to the corresponding stack positions.
    *)
   match state.accu with
-    | (RealStack _) ->
+    | (RealStack _ | LocalPos _) ->
         straighten_accu lpad state
     | _ ->
         (state, [])
 
 let straighten_accu_for_branch lpad state =
   match state.accu with
-    | RealStack _ | Const _ | Atom _ | TracedGlobal _ ->
+    | RealStack _ | LocalPos _ | Const _ | Atom _ | TracedGlobal _ ->
         straighten_accu lpad state
     | Local _ | RealAccu _ | Invalid ->
         (state, [])
 
-let pop_real_stack lpad state num =
-  (* Ensure that values stored at the num bottom positions of the stack
-     are saved to their real stores, in preparation of popping these
-     positions. This can only be the accu.
-   *)
-  let cd = state.camldepth in
-  match state.accu with
-    | (RealStack pos) when pos >= (-cd) && pos <= (-cd+num-1) ->
-        straighten_accu lpad state
-        (* NB. this doesn't pop from camlstack *)
-    | _ ->
-        (state, [])
+let popn_camlstack_disregard_accu number state =
+  let pop state =
+    let cd = state.camldepth in
+    match state.camlstack with
+      | (RealAccu _):: tl ->
+          let cpos = (-cd) in
+          { state with
+            camlstack = tl;
+            camldepth = cd - 1;
+            realaccu = ISet.remove cpos state.realaccu;
+            localthold = max state.localthold (-cd+1);
+          }
+      | (RealStack _  | LocalPos _ |
+         Const _ | Local _ | Atom _ | TracedGlobal _ | Invalid) :: tl ->
+          { state with
+            camlstack = tl;
+            camldepth = cd - 1;
+            localthold = max state.localthold (-cd+1);
+          }
+      | [] ->
+          assert false in
+  let rec recurse n state =
+    if n = 0 then
+      state
+    else
+      recurse (n-1) (pop state) in
+  recurse number state
+
+let popn_camlstack lpad number state =
+  let prep() =
+    (* Ensure that values stored at the num top positions of the stack
+       are saved to their real stores, in preparation of popping these
+       positions. This can only be the accu.
+     *)
+    let cd = state.camldepth in
+    match state.accu with
+      | (RealStack pos | LocalPos pos) when pos >= (-cd) && pos <= (-cd+number-1) ->
+          straighten_accu lpad state
+          (* NB. this doesn't pop from camlstack *)
+      | _ ->
+          (state, []) in
+  let state, instrs = prep() in
+  let state = popn_camlstack_disregard_accu number state in
+  (state, instrs)
 
 let flush_real_stack_only_accu_at lpad state pos =
   match state.accu with
-    | (RealStack p) when p = pos ->
+    | (RealStack p | LocalPos p) when p = pos ->
         straighten_accu lpad state
      | _ ->
         (state, [])
 
-let patch camlstack depth patches =
+let patch state positions =
+  (* Fix up camlstack and set the positions to RealStack *)
   let rec recurse camlstack pos patches =
     match patches with
       | [] -> camlstack
@@ -309,13 +421,18 @@ let patch camlstack depth patches =
             match camlstack with
               | hd :: tl -> hd :: recurse tl (pos+1) patches
               | [] -> assert false in
-  recurse camlstack (-depth) (ISet.elements patches)
-    (* NB. exploiting that ISet.elements returns the elements in ascending
-       order *)
+  let cd = state.camldepth in
+  let camlstack =
+    recurse state.camlstack (-cd) (ISet.elements positions) in
+  (* NB. exploiting that ISet.elements returns the elements in ascending
+     order *)
+  { state with camlstack }
 
 let flush_real_stack_at lpad state pos =
   (* Ensure that any value at the stack position pos is saved to
      its original position
+
+     This includes LocalPos.
    *)
   let cd = state.camldepth in
   let state, instrs1 =
@@ -336,13 +453,14 @@ let flush_real_stack_at lpad state pos =
   let instrs2 =
     positions
     |> ISet.elements
-    |> List.map (fun q -> Wcopy { src=RealStack pos; dest=RealStack q }) in
-  let camlstack =
-    patch state.camlstack cd positions in
+    |> List.map
+         (fun q ->
+           let src = RealStack pos |> real_store_d lpad state in
+           let dest = RealStack q |> real_store_d lpad state in
+           Wcopy { src; dest }
+         ) in
   let state =
-    { state with
-      camlstack;
-    } in
+    patch state positions in
   (state, instrs1 @ instrs2)
 
 (*
@@ -385,11 +503,11 @@ let flush_real_stack_intval_at lpad state pos =
 
 let straighten_stack_at lpad state pos =
   (* ensure that the caml stack for pos is set to the real stack *)
+  let k = pos + state.camldepth in
+  let store = List.nth state.camlstack k in
   if pos >= 0 then
-    (state, [ Wcomment (sprintf "****** STRANGE CASE: straighten_stack_at pos=%d *****" pos) ])
+    (state, [ Wcomment (sprintf "****** STRANGE CASE: straighten_stack_at pos=%d %s *****" pos (string_of_store store)) ])
   else
-    let k = pos + state.camldepth in
-    let store = List.nth state.camlstack k in
     match store with
       | RealAccu _ ->
           assert(ISet.mem pos state.realaccu);
@@ -399,7 +517,9 @@ let straighten_stack_at lpad state pos =
           (state, [])
       | _ ->
           assert(not (List.mem (RealStack pos) state.camlstack));
-          let instrs = [ Wcopy { src=store; dest=RealStack pos } ] in
+          let src = store |> real_store_d lpad state in
+          let dest = RealStack pos |> real_store_d lpad state in
+          let instrs = [ Wcopy { src; dest } ] in
           let state =
             { state with
               camlstack = set_camlstack pos (RealStack pos) state;
@@ -437,8 +557,8 @@ let straighten_stack lpad state =
     |> List.concat_map
          (fun (i,store) ->
            match store with
-             | RealStack p when p <> -cd+i ->
-                 [-cd+i]
+             | RealStack p when p = -cd+i || i >= cd ->
+                 []
              | _ ->
                  [-cd+i]
          ) in
@@ -451,10 +571,8 @@ let straighten_all lpad state =
   let state, instrs2 = straighten_stack lpad state in
   (state, instrs1 @ instrs2)
 
-let spill_for_apply lpad state =
-  (* TODO: once there are RValue locals, these need to be moved to the
-     stack; and we need an "unspill" counterpart *)
-  let sdescr = stack_descr state in
+let init_stack lpad state =
+  let sdescr = stack_descr state false in
   let instrs =
     List.map
       (fun pos ->
@@ -463,6 +581,7 @@ let spill_for_apply lpad state =
       sdescr.stack_uninit in
   (instrs, sdescr.stack_depth)
 
+  (*
 let localize_accu lpad state repr =
   match state.accu with
     | RealStack _ | RealAccu _ ->
@@ -487,11 +606,12 @@ let localize_accu lpad state repr =
         (state, instrs)
     | _ ->
         (state, [])
+   *)
 
 let unary_operation ?(no_function=false) lpad state op_repr op_code =
-  let src1 = state.accu in
+  let src1 = state.accu |> real_store_d lpad state in
   let op_repr =
-    if lpad.avoid_locals then RValue else op_repr in
+    if lpad.local_limit = 0 then RValue else op_repr in
   match op_repr with
     | RValue ->
         (* result goes into accu *)
@@ -507,23 +627,23 @@ let unary_operation ?(no_function=false) lpad state op_repr op_code =
         (state, instrs_op)
 
 let unary_effect lpad state op_code =
-  let src1 = state.accu in
+  let src1 = state.accu |> real_store_d lpad state in
   let state = { state with accu = Const 0 } in
   let instrs_op = [ Wunaryeffect { op=op_code; src1 }] in
   (state, instrs_op)
 
 let binary_operation ?(no_function=false) lpad state op_repr op_code =
-  let src1 = state.accu in
-  let src2 = List.hd state.camlstack in
+  let src1 = state.accu |> real_store_d lpad state in
+  let src2 = List.hd state.camlstack |> real_store_d lpad state in
   let op_repr =
-    if lpad.avoid_locals then RValue else op_repr in
+    if lpad.local_limit = 0 then RValue else op_repr in
   match op_repr with
     | RValue ->
         (* result goes into accu *)
         let state, instrs_flush = flush_accu lpad state in
         let state =
           { state with accu = real_accu }
-          |> pop_camlstack in
+          |> popn_camlstack_disregard_accu 1 in
         let instrs_op = [ Wbinary { op=op_code; src1; src2; dest=real_accu }] in
         (state, instrs_flush @ instrs_op)
     | _ ->
@@ -531,22 +651,26 @@ let binary_operation ?(no_function=false) lpad state op_repr op_code =
         let dest = Local(op_repr, dest_name) in
         let state =
           { state with accu = dest }
-          |> pop_camlstack in
+          |> popn_camlstack_disregard_accu 1 in
         let instrs_op = [ Wbinary { op=op_code; src1; src2; dest }] in
         (state, instrs_op)
 
 let binary_effect lpad state op_code =
-  let src1 = state.accu in
-  let src2 = List.hd state.camlstack in
-  let state = { state with accu = Const 0 } |> pop_camlstack in
+  let src1 = state.accu |> real_store_d lpad state in
+  let src2 = List.hd state.camlstack |> real_store_d lpad state in
+  let state =
+    { state with accu = Const 0 }
+    |> popn_camlstack_disregard_accu 1 in
   let instrs_op = [ Wbinaryeffect { op=op_code; src1; src2 }] in
   (state, instrs_op)
 
 let ternary_effect lpad state op_code =
-  let src1 = state.accu in
-  let src2 = List.hd state.camlstack in
-  let src3 = List.hd (List.tl state.camlstack) in
-  let state = { state with accu = Const 0 } |> pop_camlstack |> pop_camlstack in
+  let src1 = state.accu |> real_store_d lpad state in
+  let src2 = List.hd state.camlstack |> real_store_d lpad state in
+  let src3 = List.hd (List.tl state.camlstack) |> real_store_d lpad state in
+  let state =
+    { state with accu = Const 0 }
+    |> popn_camlstack_disregard_accu 2 in
   let instrs_op = [ Wternaryeffect { op=op_code; src1; src2; src3 }] in
   (state, instrs_op)
 
@@ -556,19 +680,31 @@ let global_offset ident =
   int_of_string name
 
 let make_label lpad label =
-  if ISet.mem label lpad.loops then
+  if ISet.mem label !(lpad.loops) then
     Loop label
   else
     Label label
 
 let validate state debug_prefix =
+  ( match state.arity with
+      | None -> ()
+      | Some n ->
+          if List.length state.camlstack <> state.camldepth + n then (
+            eprintf "[DEBUG] Failed assertion, %s. state=%s\n" debug_prefix (string_of_state state);
+            assert false
+          )
+  );
   let d = state.camldepth in
   List.iteri
     (fun i st ->
       match st with
-        | RealStack pos -> assert(pos = (-d+i))
+        | RealStack pos ->
+            if pos <> (-d+i) then (
+              eprintf "[DEBUG] Failed assertion, %s. i=%d, state=%s\n" debug_prefix i (string_of_state state);
+              assert false
+            )
         | _ ->
-            eprintf "[DEBUG] Failed assertion, %s. st=%s\n" debug_prefix (string_of_store st);
+            eprintf "[DEBUG] Failed assertion, %s. i=%d, state=%s\n" debug_prefix i (string_of_state state);
             assert false
     )
     state.camlstack;
@@ -594,7 +730,128 @@ let norm_accu state =
     | _ ->
         state
 
+let get_live_positions state =
+  List.fold_left
+    (fun acc st ->
+      match st with
+        | RealStack pos | LocalPos pos -> ISet.add pos acc
+        | _ -> acc
+    )
+    ISet.empty (state.accu :: state.camlstack)
+
+let adjust_locals lpad state =
+  let old_localthold = state.localthold in
+  let new_localthold = min (-state.camldepth + lpad.local_limit) 0 in
+  let live_positions = get_live_positions state in
+  let accu =
+    match state.accu with
+      | RealStack pos when pos < new_localthold ->
+          LocalPos pos
+      | LocalPos pos when pos >= new_localthold ->
+          RealStack pos
+      | accu ->
+          accu in
+  let state =
+    { state with
+      localthold = new_localthold;
+      accu
+    } in
+  let instrs =
+    if new_localthold < old_localthold then
+      Wc_util.enum new_localthold (old_localthold - new_localthold)
+      |> List.filter (fun pos -> pos >= 0 || ISet.mem pos live_positions)
+      |> List.map (fun pos -> ignore(decl_store lpad (LocalPos pos)); pos)
+      |> List.map (fun pos -> Wcopy { src=LocalPos pos; dest=RealStack pos })
+    else
+      Wc_util.enum old_localthold (new_localthold - old_localthold)
+      |> List.filter (fun pos -> pos >= 0 || ISet.mem pos live_positions)
+      |> List.map (fun pos -> ignore(decl_store lpad (LocalPos pos)); pos)
+      |> List.map (fun pos -> Wcopy { src=RealStack pos; dest=LocalPos pos }) in
+  let wadjust_final =
+    Wadjust { depth=state.camldepth;
+              old_localthold=new_localthold;
+              new_localthold } in
+  let instrs =
+    if instrs = [] then
+      [ wadjust_final ]
+    else
+      [ Wadjust { depth=state.camldepth; old_localthold; new_localthold } ]
+      @ instrs
+      @ [ Wcomment (sprintf "state: %s\n" (string_of_state state)) ]
+      @ [ wadjust_final ] in
+  (state, instrs)
+
+let save_locals lpad state =
+  (* all locals are copied to their corresponding stack positions *)
+  adjust_locals { lpad with local_limit = 0 } state
+
+let save_locals_and_straighten_all lpad state =
+  (* like save_locals followed by straighten_all, only that fewer instructions
+     are generated. The code is not really faster but just a little bit more
+     compact.
+   *)
+  let old_localthold = state.localthold in
+  let new_localthold = -state.camldepth in
+  let state, instrs_str = straighten_all lpad state in
+  (* Now, we change all Wcopy instructions writing to LocalPos to Wcopy
+     instructions writing to RealStack:
+   *)
+  let covered_positions = ref ISet.empty in
+  let instrs_str_fixedup =
+    List.map
+      (function
+       | Wcopy { src; dest=LocalPos pos } when pos < 0 ->
+           let src =
+             match src with
+               | LocalPos p when ISet.mem p !covered_positions ->
+                   RealStack p
+               | _ -> src in
+           covered_positions := ISet.add pos !covered_positions;
+           Wcopy { src; dest=RealStack pos }
+       | instr ->
+           instr
+      )
+      instrs_str in
+  let live_positions =
+    get_live_positions state in
+  let missing_positions =
+    ISet.diff live_positions !covered_positions in
+  let instrs_save =
+    Wc_util.enum new_localthold (old_localthold - new_localthold)
+    |> List.filter (fun pos -> pos >= 0 || ISet.mem pos missing_positions)
+    |> List.map (fun pos -> ignore(decl_store lpad (LocalPos pos)); pos)
+    |> List.map (fun pos -> Wcopy { src=LocalPos pos; dest=RealStack pos }) in
+  let accu =
+    match state.accu with
+      | RealStack pos when pos < new_localthold ->
+          LocalPos pos
+      | LocalPos pos when pos >= new_localthold ->
+          RealStack pos
+      | accu ->
+          accu in
+  let state =
+    { state with
+      localthold = new_localthold;
+      accu
+    } in
+  let wadjust_final =
+    Wadjust { depth=state.camldepth;
+              old_localthold=new_localthold;
+              new_localthold } in
+  let instrs =
+    [ Wcomment "save_locals_and_straighten_all";
+      Wadjust { depth=state.camldepth;
+                old_localthold;
+                new_localthold } ]
+    @ instrs_str_fixedup
+    @ instrs_save
+    @ [ Wcomment (sprintf "state: %s\n" (string_of_state state)) ]
+    @ [ wadjust_final ] in
+  (state, instrs)
+
 let branch lpad state label =
+  let expected_localthold = min (-state.camldepth + lpad.local_limit) 0 in
+  assert(state.localthold = expected_localthold);
   let state = norm_accu state in
   let instr_br = Wbranch { label=make_label lpad label } in
   try
@@ -604,14 +861,18 @@ let branch lpad state label =
     let (state, instrs2) = straighten_stack lpad state in
     validate state (sprintf "state, branch to %d" label);
     assert(state.camldepth = dest_state.camldepth);
+    (* eprintf "label=%d localthold=%d dest_localthold=%d\n%!" label state.localthold dest_state.localthold; *)
+    assert(state.localthold = dest_state.localthold);
     (* state and dest_state can at most differ in accu *)
     let instrs =
       if state.accu = dest_state.accu || dest_state.accu = Invalid then
         instrs1 @ instrs2 @ [ instr_br ]
       else
+        let src = state.accu |> real_store_d lpad state in
+        let dest = dest_state.accu |> real_store_d lpad state in
         instrs1
         @ instrs2
-        @ [ Wcopy { src=state.accu; dest=dest_state.accu };
+        @ [ Wcopy { src; dest };
             instr_br
           ] in
     (state, instrs)
@@ -646,23 +907,41 @@ let transl_instr lpad state instr =
     | Kconst _ ->
         assert false
     | Kacc sp ->
+        ( match state.arity with
+            | Some n ->
+                if sp < 0 || sp >= state.camldepth + n then (
+                  eprintf "[DEBUG] Assertion failed in letrec%d, sp=%d\n" lpad.letrec_label sp;
+                  eprintf "[DEBUG] state=%s\n%!" (string_of_state state);
+                  assert false;
+                )
+            | None ->
+                assert false
+        );
         let state =
-          if sp < state.camldepth then
-            { state with accu = List.nth state.camlstack sp }
-          else
-            { state with accu = RealStack (-state.camldepth + sp) } in
+          match state.arity with
+            | Some _ ->
+                { state with
+                  accu = List.nth state.camlstack sp |> real_store_d lpad state
+                }
+            | None ->
+                assert false in
         (state, [])
     | Kpush ->
         let state = push_camlstack state.accu state in
-        (state, [ Wcomment (sprintf "(depth=%d)" state.camldepth) ])
+        let instrs =
+          match state.accu with
+            | RealStack pos when pos < state.localthold && lpad.local_limit > 0 ->
+                [ Wcopy { src=state.accu; dest=LocalPos pos |> real_store_d lpad state } ]
+            | _ ->
+                [] in
+        (state, instrs @ [ Wcomment (sprintf "(depth=%d)" state.camldepth) ])
     | Kpush_retaddr lab ->
         let state = push_camlstack (Const 0) state in
         let state = push_camlstack (Const 0) state in
         let state = push_camlstack (Const 0) state in
         (state, [])
     | Kpop num ->
-        let state, instrs = pop_real_stack lpad state num in
-        let state = popn_camlstack num state in
+        let state, instrs = popn_camlstack lpad num state in
         (state, instrs @ [ Wcomment (sprintf "(depth=%d)" state.camldepth) ])
     | Kassign sp ->
         let cd = state.camldepth in
@@ -672,8 +951,10 @@ let transl_instr lpad state instr =
           { state with
             camlstack = set_camlstack (-cd+sp) (RealStack (-cd+sp)) state
           } in
+        let src = state.accu |> real_store_d lpad state in
+        let dest = RealStack (-cd+sp) |> real_store_d lpad state in
         let instrs_copy =
-          [ Wcopy { src=state.accu; dest=RealStack (-cd+sp) } ] in
+          [ Wcopy { src; dest } ] in
         (state, instrs_flush @ instrs_copy)
     | Kenvacc field ->
         let state, instrs_flush = flush_accu lpad state in
@@ -713,12 +994,13 @@ let transl_instr lpad state instr =
         unary_operation lpad state RIntVal Pboolnot
     | Koffsetint offset ->
         (* localize_accu is beneficial for "for" loops *)
-        let (state, instrs1) =
+        (* let (state, instrs1) =
           if lpad.avoid_locals then (state, []) else
             localize_accu lpad state RIntVal in
+         *)
         let (state, instrs2) =
           unary_operation lpad state RIntVal (Poffsetint offset) in
-        (state, instrs1 @ instrs2)
+        (state, (* instrs1 @ *) instrs2)
     | Koffsetref offset ->
         unary_effect lpad state (Poffsetref offset)
     | Kisint ->
@@ -799,14 +1081,16 @@ let transl_instr lpad state instr =
         (* do the allocation right here and don't postpone it - we are not
            yet prepared for doing allocations on demand later
          *)
-        let src1 = state.accu in
+        let state, instrs_adjust = adjust_locals lpad state in
+        let src1 = state.accu |> real_store_d lpad state in
         let state, instrs_flush = flush_accu lpad state in
         let temp_name = new_local lpad RFloat in
         let temp = Local(RFloat, temp_name) in
-        let descr = stack_descr state in
+        let descr = stack_descr state false in
         let accu = real_accu_no_func in
         let instrs =
-          instrs_flush
+          instrs_adjust
+          @ instrs_flush
           @ [ Wunary { op=Pgetfloatfield field; src1; dest=temp; };
               Walloc { src=temp; dest=accu; descr }
             ] in
@@ -816,67 +1100,98 @@ let transl_instr lpad state instr =
         let state = { state with accu = Atom tag } in
         (state, [])
     | Kmakeblock(size, tag) ->
+        let state, instrs_adjust = adjust_locals lpad state in
         let state, instrs_flush = flush_accu lpad state in
-        let src1 = state.accu in
-        let src = src1 :: list_prefix (size-1) state.camlstack in
-        let descr = stack_descr state in
+        let src =
+          (state.accu :: list_prefix (size-1) state.camlstack)
+          |> List.map (real_store_d lpad state) in
+        let stack_save_accu = stack_save_accu_if_used_here src in
+        let descr = stack_descr state stack_save_accu in
         let accu = real_accu_no_func in
-        let instrs =
-          instrs_flush
-          @ [ Wmakeblock { tag; src; descr } ] in
         let state =
           { state with accu}
-          |> popn_camlstack (size-1) in
+          |> popn_camlstack_disregard_accu (size-1) in
+        let instrs =
+          instrs_adjust
+          @ instrs_flush
+          @ [ Wmakeblock { tag; src; descr } ] in
         (state, instrs)
     | Kmakefloatblock size ->
         assert(size > 0);
+        let state, instrs_adjust = adjust_locals lpad state in
         let state, instrs_flush = flush_accu lpad state in
-        let src1 = state.accu in
-        let src = src1 :: list_prefix (size-1) state.camlstack in
-        let descr = stack_descr state in
-        let instrs =
-          instrs_flush
-          @ [ Wmakefloatblock { src; descr } ] in
+        let src =
+          (state.accu :: list_prefix (size-1) state.camlstack)
+          |> List.map (real_store_d lpad state) in
+        let stack_save_accu = stack_save_accu_if_used_here src in
+        let descr = stack_descr state stack_save_accu in
         let accu = real_accu_no_func in
         let state =
           { state with accu }
-          |> popn_camlstack (size-1) in
+          |> popn_camlstack_disregard_accu (size-1) in
+        let instrs =
+          instrs_adjust
+          @ instrs_flush
+          @ [ Wmakefloatblock { src; descr } ] in
         (state, instrs)
     | Kccall (name, num) when num <= 5 ->
+        let noalloc = Hashtbl.mem Wc_prims.prims_noalloc name in
+        let state, instrs_adjust = adjust_locals lpad state in
         let state, instrs_flush = flush_accu lpad state in
-        let src1 = state.accu in
-        let src = src1 :: list_prefix (num-1) state.camlstack in
-        let descr = stack_descr state in
-        let instrs =
-          instrs_flush
-          @ [ Wccall { name; src; descr } ] in
+        let src =
+          (state.accu :: list_prefix (num-1) state.camlstack)
+          |> List.map (real_store_d lpad state) in
+        let descr =
+          if noalloc then
+            None
+          else
+            Some (stack_descr state false) in
         let no_function = Hashtbl.mem Wc_prims.prims_non_func_result name in
         let state =
           { state with accu = RealAccu { no_function }}
-          |> popn_camlstack (num-1) in
+          |> popn_camlstack_disregard_accu (num-1) in
+        let instrs =
+          instrs_adjust
+          @ instrs_flush
+          @ [ Wccall { name; src; descr } ] in
         (state, instrs)
     | Kccall (name, num) ->
-        let state, instrs_str = straighten_all lpad state in
-        let descr = stack_descr state in
+        let state, instrs_savestr = save_locals_and_straighten_all lpad state in
+        let descr = stack_descr state false in
         let depth = state.camldepth+1 in
-        let instrs =
-          instrs_str
-          @ [ Wcopy { src=real_accu; dest=RealStack(-depth) };
-              Wccall_vector { name; numargs=num; depth; descr }] in
         let no_function = Hashtbl.mem Wc_prims.prims_non_func_result name in
         let state =
           { state with accu = RealAccu { no_function }}
-          |> popn_camlstack (num-1) in
+          |> popn_camlstack_disregard_accu (num-1) in
+        let state, instrs_adjust = adjust_locals lpad state in
+        let instrs =
+          instrs_savestr
+          @ [ Wcopy { src=real_accu; dest=RealStack(-depth) };
+              Wccall_vector { name; numargs=num; depth; descr }]
+          @ instrs_adjust in
         (state, instrs)
     | Kbranch label ->
-        branch lpad state label
+        let state, instrs_adjust = adjust_locals lpad state in
+        let state, instrs_br = branch lpad state label in
+        (state, instrs_adjust @ instrs_br)
     | Kbranchif label ->
-        let (br_state, instrs) = branch lpad state label in
-        (state, [ Wif { src=state.accu; neg=false; body=instrs }])
+        let state, instrs_adjust = adjust_locals lpad state in
+        let (state_br, instrs_br) = branch lpad state label in
+        let src = state.accu |> real_store_d lpad state in
+        let instrs =
+          instrs_adjust
+          @ [ Wif { src; neg=false; body=instrs_br }] in
+        (state, instrs)
     | Kbranchifnot label ->
-        let (br_state, instrs) = branch lpad state label in
-        (state, [ Wif { src=state.accu; neg=true; body=instrs }])
+        let state, instrs_adjust = adjust_locals lpad state in
+        let (state_br, instrs_br) = branch lpad state label in
+        let src = state.accu |> real_store_d lpad state in
+        let instrs =
+          instrs_adjust
+          @ [ Wif { src; neg=true; body=instrs_br }] in
+        (state, instrs)
     | Kswitch (labels_int, labels_blk) ->
+        let state, instrs_adjust = adjust_locals lpad state in
         let state = norm_accu state in
         let state, instrs_str = straighten_all lpad state in
         validate state (sprintf "state, Kswitch");
@@ -884,8 +1199,12 @@ let transl_instr lpad state instr =
         Array.iter (update_state_table lpad state) labels_blk;
         let labels_int = Array.map (make_label lpad) labels_int in
         let labels_blk = Array.map (make_label lpad) labels_blk in
-        let src = state.accu in
-        (state, instrs_str @ [ Wswitch{labels_int; labels_blk; src} ])
+        let src = state.accu |> real_store_d lpad state in
+        let instrs =
+          instrs_adjust
+          @ instrs_str
+          @ [ Wswitch{labels_int; labels_blk; src} ] in
+        (state, instrs)
     | Kapply num when num <= 3 ->
         (* In the num <= 3 case, there is no reserved stack position for
            saving env yet. Because of this, we cannot use "straighten"
@@ -895,6 +1214,22 @@ let transl_instr lpad state instr =
            of one position for env.
          *)
         let direct_opt = extract_directly_callable_function state.accu in
+        let alloc =
+          match direct_opt with
+            | Some (_, _, funlabel, _) ->
+                let p =
+                  Wc_tracefuncs.get_funcprops lpad.funcprops_table funlabel in
+                p.use_alloc ||
+                  ( match p.func_arity with
+                      | None -> true
+                      | Some n -> num <> n  (* i.e. need a GRAB *)
+                  )
+            | None -> true in
+        let state, instrs_save =
+          if alloc then
+            save_locals lpad state
+          else
+            state, [ Wcomment "noalloc" ] in
         let state =
           match direct_opt with
             | Some _ ->
@@ -902,14 +1237,16 @@ let transl_instr lpad state instr =
                 { state with accu = real_accu }
             | None -> state in
         let state, instrs_accu = straighten_accu lpad state in
-        let instrs_spill, actual_depth = spill_for_apply lpad state in
+        let instrs_init, actual_depth = init_stack lpad state in
+        let instrs_init = if alloc then instrs_init else [] in
         let delta = 1 in  (* make room for one additional position (env) *)
         let instrs_move =
           enum 0 num
           |> List.map
                (fun k ->
-                 let src = List.nth state.camlstack k in
-                 Wcopy { src; dest=RealStack(-actual_depth - num + k - delta) }
+                 let src = List.nth state.camlstack k |> real_store_d lpad state in
+                 let dest = RealStack(-actual_depth - num + k - delta) in
+                 Wcopy { src; dest }
                ) in
         let depth = actual_depth+num+delta in
         let instr_apply =
@@ -918,16 +1255,20 @@ let transl_instr lpad state instr =
                 Wapply_direct { global; path; funlabel; numargs=num; depth }
             | None ->
                 Wapply { numargs=num; depth } in
+        let state = state |> popn_camlstack_disregard_accu num in
+        let state, instrs_adjust =
+          if alloc then adjust_locals lpad state else state, [] in
         let instrs =
-          instrs_accu
-          @ instrs_spill
+          instrs_save
+          @ instrs_accu
+          @ instrs_init
           @ instrs_move
           @ [ (* Wcopy { src=Const 0; dest=RealStack(-actual_depth-1) };
                  -- the position for env - it is initialized by Wapply anyway
                *)
               instr_apply
-            ] in
-        let state = state |> popn_camlstack num in
+            ]
+          @ instrs_adjust in
         (state, instrs)
     | Kapply num ->
         (* In the num > 3 case, there was already a Kpush_retaddr that
@@ -939,6 +1280,7 @@ let transl_instr lpad state instr =
            that it saves instructions. (This might change when we pass
            args to functions via wasm parameters, and not via the stack.)
          *)
+        (* TODO: exploit use_alloc *)
         let direct_opt = extract_directly_callable_function state.accu in
         let state =
           match direct_opt with
@@ -946,7 +1288,7 @@ let transl_instr lpad state instr =
                 (* because Wapply_direct loads the function into accu: *)
                 { state with accu = real_accu }
             | None -> state in
-        let state, instrs_str = straighten_all lpad state in
+        let state, instrs_savestr = save_locals_and_straighten_all lpad state in
         let depth = state.camldepth in
         let instr_apply =
           match direct_opt with
@@ -954,12 +1296,14 @@ let transl_instr lpad state instr =
                 Wapply_direct { global; path; funlabel; numargs=num; depth }
             | None ->
                 Wapply { numargs=num; depth } in
+        let state = state |> popn_camlstack_disregard_accu (num+3) in
+        let state, instrs_adjust = adjust_locals lpad state in
         let instrs =
-          instrs_str
-          @ [ instr_apply ] in
-        let state = state |> popn_camlstack (num+3) in
+          instrs_savestr
+          @ [ instr_apply ]
+          @ instrs_adjust in
         (state, instrs)
-    | Kappterm(num, slots) when num <= 10 && lpad.enable_returncall ->
+    | Kappterm(num, slots) when lpad.enable_returncall ->
         (* Here we pick the args of the function call up where they are
            (register, accu, stack) - in contrast to Wappterm which assumes
            that the args are already on the stack. We only have to ensure
@@ -978,18 +1322,23 @@ let transl_instr lpad state instr =
           |> List.map (fun k -> k - state.camldepth) in
         let state, instrs_stack =
           straighten_stack_multi lpad state alloc_positions in
+        let funsrc =
+          state.accu |> real_store_d lpad state in
+        let argsrc =
+          list_prefix num state.camlstack
+          |> List.map (real_store_d lpad state) in
         let instr_appterm =
           match direct_opt with
             | Some (global, path, funlabel, _) ->
                 Wappterm_direct_args { global; path; funlabel;
-                                       funsrc=state.accu;
-                                       argsrc=list_prefix num state.camlstack;
+                                       funsrc;
+                                       argsrc;
                                        oldnumargs=(slots - state.camldepth);
                                        depth=state.camldepth
                                      }
             | None ->
-                Wappterm_args { funsrc=state.accu;
-                                argsrc=list_prefix num state.camlstack;
+                Wappterm_args { funsrc;
+                                argsrc;
                                 oldnumargs=(slots - state.camldepth);
                                 depth=state.camldepth
                               } in
@@ -997,6 +1346,7 @@ let transl_instr lpad state instr =
           instrs_stack @ [ instr_appterm ] in
         (state, instrs)
     | Kappterm(num, slots) ->
+        let state, instrs_save = save_locals lpad state in
         let direct_opt =
           extract_directly_callable_function state.accu
           |> (function
@@ -1026,42 +1376,68 @@ let transl_instr lpad state instr =
                            depth=state.camldepth
                          } in
         let instrs =
-          instrs_accu
+          instrs_save
+          @ instrs_accu
           @ instrs_stack
           @ [ instr_appterm ] in
         (state, instrs)
     | Kreturn slots ->
-        assert(state.camldepth + state.arity = slots);
-        (state, [ Wreturn { src=state.accu; arity=state.arity } ])
+        ( match state.arity with
+            | Some n ->
+                if state.camldepth + n <> slots then (
+                  eprintf "[DEBUG] Assertion failed in letrec%d: Kreturn, arity=%d slots=%d\n" lpad.letrec_label n slots;
+                  assert false;
+                );
+                let src = state.accu |> real_store_d lpad state in
+                (state, [ Wreturn { src; arity=n } ])
+            | None ->
+                assert false
+        )
     | Kgrab num ->
-        ({state with arity = num+1}, [ Wgrab { numargs=num }])
+        ( match state.arity with
+            | Some n ->
+                if n <> num+1 then (
+                  eprintf "[DEBUG] Assertion failed in letrec%d: Kgrab, arity=%d num=%d\n" lpad.letrec_label n num;
+                  assert false;
+                );
+                (state, [ Wcomment (sprintf "omitted Kgrab %d" num) ])
+            | None ->
+                assert false;
+        )
     | Kclosure(lab, num) ->
+        let state, instrs_adjust = adjust_locals lpad state in
         let state, instrs_flush = flush_accu lpad state in
         let src =
           if num = 0 then
             []
           else
-            state.accu :: list_prefix (num-1) state.camlstack in
-        let descr = stack_descr state in
+            (state.accu :: list_prefix (num-1) state.camlstack)
+            |> List.map (real_store_d lpad state) in
+        let stack_save_accu = stack_save_accu_if_used_here src in
+        let descr = stack_descr state stack_save_accu in
         let accu = real_accu in
-        let instrs =
-          instrs_flush
-          @ [ Wclosurerec { src; dest=[ accu, lab ]; descr }] in
         let state =
           { state with accu }
-          |> popn_camlstack (max (num-1) 0) in
+          |> popn_camlstack_disregard_accu (max (num-1) 0) in
+        let instrs =
+          instrs_adjust
+          @ instrs_flush
+          @ [ Wclosurerec { src; dest=[ accu, lab ]; descr }] in
         (state, instrs)
     | Kclosurerec(funcs, num) ->
+        let state, instrs_save = save_locals lpad state in
         let state, instrs_flush = flush_accu lpad state in
         (* flush_accu because we allow the accu to be used *)
-        let descr = stack_descr state in
         let num_stack = max (num-1) 0 in
         let src =
           if num = 0 then
             []
           else
-            state.accu :: list_prefix num_stack state.camlstack in
-        let state = state |> popn_camlstack num_stack in
+            (state.accu :: list_prefix num_stack state.camlstack)
+            |> List.map (real_store_d lpad state) in
+        let stack_save_accu = stack_save_accu_if_used_here src in
+        let descr = stack_descr state stack_save_accu in
+        let state = state |> popn_camlstack_disregard_accu num_stack in
         let start_dest = -state.camldepth-1 in
         let dest =
           List.mapi
@@ -1074,10 +1450,17 @@ let transl_instr lpad state instr =
             (fun state (store,_) -> push_camlstack store state)
             state
             dest in
-        let state = { state with accu = Const 0 } in
+        let state =
+          { state with
+            accu = Const 0;
+            localthold = -state.camldepth;
+          } in
+        let state, instrs_adjust = adjust_locals lpad state in (* CHECK, could be a bad idea *)
         let instrs =
-          instrs_flush
-          @ [ Wclosurerec { src; dest; descr } ] in
+          instrs_save
+          @ instrs_flush
+          @ [ Wclosurerec { src; dest; descr } ]
+          @ instrs_adjust in
         (state, instrs)
     | Koffsetclosure offset ->
         let state, instrs_flush = flush_accu lpad state in
@@ -1107,10 +1490,18 @@ let transl_instr lpad state instr =
     | Kpushtrap _ ->
         assert false   (* replaced by Trap, see below *)
     | Kpoptrap ->
-        let state = popn_camlstack 4 state in
-        (state, [])
+        (* when the trap jumps to the pop label, the whole camlstack is
+           stored in the real stack, and no value is in a local variable.
+           We should load values into variables:
+         *)
+        let trap_state = { state with localthold = -state.camldepth } in
+        let state, instrs_restore = adjust_locals lpad trap_state in
+        let state, instrs_pop = popn_camlstack lpad 4 state in
+        (state, instrs_restore @ instrs_pop)
     | Kraise kind ->
-        (state, [ Wraise { src=state.accu; kind }])
+        (* Convention: no local variables on "catch" *)
+        let state, instrs_save = save_locals lpad state in
+        (state, instrs_save @ [ Wraise { src=state.accu; kind }])
     | Kstop ->
         (state, [ Wstop ])
     | Kcheck_signals | Kevent _ ->
@@ -1174,12 +1565,58 @@ let transl_fblock lpad fblock =
       )
       block.instructions in
 
+  let rec extract_arity block =
+    (* CHECK: can we get this from Wc_tracefuncs? *)
+    extract_arity_instrs block block.instructions 0
+
+  and extract_arity_instrs block instrs k =
+    if k >= Array.length instrs then
+      raise Not_found;
+    match instrs.(k) with
+      | Label _ | Simple (Klabel _) ->
+          extract_arity_instrs block instrs (k+1)
+      | Simple (Kgrab num) ->
+          num+1
+      | Simple _ ->
+          raise Not_found
+      | Trap _ ->
+          raise Not_found
+      | Block inner ->
+          extract_arity inner
+      | NextMain _ ->
+          raise Not_found in
+
+  let arity =
+    try
+      Some(extract_arity fblock.block)
+    with
+      | Not_found ->
+          (* There's no Kgrab when:
+              - the function only takes 1 arg
+              - the function is for a "try" body
+           *)
+          if fblock.scope.cfg_try_labels = [] then
+            Some 1
+          else
+            None (* "try" body *) in
+
+  let init_state =
+    let camlstack =
+      match arity with
+        | None -> []
+        | Some n -> enum 0 n |> List.map (fun k -> RealStack k) in
+    { empty_state with
+      arity;
+      camlstack;
+    } in
+
   let get_state label =
     try  Hashtbl.find state_table label
-    with Not_found -> empty_state in
+    with Not_found -> init_state in
 
   let rec transl_block block loops =
-    let state = empty_state in
+    let lpad = lpad_with ~scope:block.block_scope lpad in
+    let state = init_state in
     (* eprintf "BLOCK\n%!";*)
     let upd_loops =
       match block.loop_label with
@@ -1194,9 +1631,13 @@ let transl_fblock lpad fblock =
                 let state = get_state label in
                 let comment = Wcomment (sprintf "Label %d (depth=%d)" label state.camldepth) in
                 let cscope = Wcomment (string_of_scope block.block_scope) in
-                (state, comment ::cscope ::  acc)
+                let wadjust =
+                  Wadjust { depth=state.camldepth;
+                            old_localthold=state.localthold;
+                            new_localthold=state.localthold } in
+                (state, wadjust :: comment ::cscope ::  acc)
             | Simple i ->
-                lpad.loops <- upd_loops;
+                lpad.loops := upd_loops;
                 let next_state, instrs = transl_instr lpad state i in
                 (*
                 eprintf "%s predepth=%d postdepth=%d\n%!"
@@ -1208,7 +1649,9 @@ let transl_fblock lpad fblock =
                   Wcomment ("***" ^ Wc_util.string_of_kinstruction i) in
                 (next_state, List.rev_append (comment :: instrs) acc)
             | Trap { labels={trylabel; catchlabel}; poplabel } ->
-                let state, instrs_str = straighten_all lpad state in
+                (* Convention: no local variables on "catch" *)
+                let state, instrs_savestr1 =
+                  save_locals_and_straighten_all lpad state in
                 let accu = real_accu in
                 let state_catch = { state with accu } in
                 (* The bytecode interpreter needs 4 stack position for
@@ -1217,11 +1660,12 @@ let transl_fblock lpad fblock =
                 let state = push_camlstack (Const 0) state in
                 let state = push_camlstack (Const 0) state in
                 let state = push_camlstack (Const 0) state in
-                let state, instrs_str2 = straighten_all lpad state in
+                let state, instrs_savestr2 =
+                  save_locals_and_straighten_all lpad state in
                 let instrs =
                   [ Wcomment (sprintf "***Trap(try=%d,catch=%d)" trylabel catchlabel) ]
-                  @ instrs_str
-                  @ instrs_str2
+                  @ instrs_savestr1
+                  @ instrs_savestr2
                   @ [ Wbranch { label=Label trylabel } ] in
                 update_state_table lpad state trylabel;
                 update_state_table lpad state_catch catchlabel;
@@ -1239,7 +1683,13 @@ let transl_fblock lpad fblock =
         )
         (state, [])
         block.instructions in
-    let instrs = List.rev instrs_rev in
+    let wadjust_after =
+      Wadjust { depth=state.camldepth;
+                old_localthold=state.localthold;
+                new_localthold=state.localthold } in
+    let instrs =
+      List.rev (wadjust_after :: instrs_rev) in
+    (* |> Wc_instruct.woptimize *)
     let scope = block.block_scope in
     match block.loop_label, block.break_label with
       | Some _, Some _ -> assert false
@@ -1250,8 +1700,15 @@ let transl_fblock lpad fblock =
       | None, None ->
           instrs in
   count_indegree fblock.block;
+  let comment = Wcomment (sprintf "FBLOCK %s" (Wc_control.string_of_scope fblock.scope)) in
   try
-    transl_block fblock.block ISet.empty
+    let instrs = comment :: transl_block fblock.block ISet.empty in
+    ( match arity with
+        | Some n when n > 1 ->
+            Wgrab { arity=n } :: instrs
+        | _ ->
+            instrs
+    )
   with
     | any ->
         eprintf "[DEBUG] Failing block %s:\n" (Wc_control.string_of_scope fblock.scope);

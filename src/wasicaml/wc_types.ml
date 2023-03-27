@@ -4,6 +4,7 @@
 
 module IMap = Map.Make(Int)
 module ISet = Set.Make(Int)
+module SSet = Set.Make(String)
 
 module O = Opcodes
 module I = Instruct

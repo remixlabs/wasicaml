@@ -32,6 +32,7 @@ type structured_code =
   { cfg_letrec_label : int option;
     cfg_func_label : int;
     cfg_try_labels : trap_labels list;
+    (* cfg_is_pop_label : bool; *)
     cfg_main : bool;
   }
 
@@ -209,6 +210,7 @@ let create_cfg code labels =
       cfg_func_label = 0;
       cfg_try_labels = [];
       cfg_main = true;
+      (* cfg_is_pop_label = false; *)
     } in
   Queue.add (init_scope, None, 0) todo;
   let add where scope popfrom start =
@@ -252,6 +254,7 @@ let create_cfg code labels =
               cfg_func_label = flab;
               cfg_try_labels = [];
               cfg_main = false;
+              (* cfg_is_pop_label = false; *)
             } in
           add (start + !n - 1) scope None flab
         )
@@ -303,8 +306,14 @@ let create_cfg code labels =
                     Some (Trap_pop labels)
             else
               None in
+    let cfg_scope_save =
+      (* if is_poptrap then
+        { cfg_scope with cfg_is_pop_label = true }
+      else
+       *)
+      cfg_scope in
     let cfg_node =
-      { cfg_scope;
+      { cfg_scope = cfg_scope_save;
         cfg_node_label = start;
         cfg_trap;
         cfg_loops = [];  (* later *)
@@ -341,7 +350,9 @@ let create_cfg code labels =
       (fun lab ->
         let scope, popfrom =
           if code.(lab) = Kpoptrap then
-            { cfg_scope with cfg_try_labels = List.tl cfg_scope.cfg_try_labels },
+            { cfg_scope with
+              cfg_try_labels = List.tl cfg_scope.cfg_try_labels;
+            },
             Some (List.hd cfg_scope.cfg_try_labels)
           else
             cfg_scope, None in
