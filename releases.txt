@@ -1,0 +1,30 @@
+Release 1.1 (2023-03-27):
+
+ - bases on OCaml-4.12.1 and WASI-SDK 19
+ - support for using the tail call extension of WebAssembly
+   (-enable-tail-call), PR#36.
+ - support for using the exception handing extension of WebAssembly
+   (-enable-exception-handling)
+ - reworked the way exceptions are propagated. If the exception is
+   raised in OCaml code, it is passed up by returning the special
+   value 0 to the caller (which has to check for it). If the
+   exception is raised in C code, it is using the special
+   "wasicaml_try" / "wasicaml_throw" host functions that are expected
+   to be available (unless you -enable-exception-handling, in which
+   case native WebAssembly exceptions are used in this case).
+   The upside of this change is a simplified code generation.
+   The downside is that the backtraces contain less information.
+   (PR#40)
+ - more local variables: it is now tried to keep the top N
+   values of the stack in local variables. This gives the
+   JIT engine more opportunities to optimize the binary code.
+   However, more save/restore code is now also available,
+   so the code is less compact. For this reason, a new
+   -compact-code command-line option was added. (PR#39)
+ - switching to `wasi-js` as the npm package to implement
+   WASI in nodejs.
+
+
+Release 1.0:
+
+ - bases on OCaml-4.12.0 and WASI-SDK 17
