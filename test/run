@@ -54,6 +54,9 @@ while [ $# -gt 0 ]; do
         -eh)
             args="$args -enable-exception-handling"
             shift ;;
+        -compact-code)
+            args="$args -compact-code $2"
+            shift 2 ;;
 	-ocamlopt)
 	    with_ocamlopt=1
 	    shift ;;
