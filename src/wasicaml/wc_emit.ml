@@ -338,11 +338,17 @@ let push_global_field var_base field =
 
 let push_field_addr var_base field =
   [ L [ K "local.get"; ID var_base ] ]
-  @ if field <> 0 then
+  @ if field > 0 then
       [ L [ K "i32.const";
             N (I32 (Int32.of_int (4 * field)));
           ];
         L [ K "i32.add" ]
+      ]
+    else if field < 0 then
+      [ L [ K "i32.const";
+            N (I32 (Int32.of_int (-4 * field)));
+          ];
+        L [ K "i32.sub" ]
       ]
     else
       []
@@ -2688,6 +2694,16 @@ let use_env gpad funlabel numargs =
         | Some n -> n <> numargs
     )
 
+let use_codeptr gpad funlabel numargs =
+  (not !enable_returncall) ||
+    ( let funcprops =
+        Wc_tracefuncs.get_funcprops gpad.funcprops_table funlabel in
+      ( match funcprops.func_arity with
+          | None -> true
+          | Some n -> n <> numargs (* GRAB *)
+      )
+    )
+
 let apply_direct_no_eh gpad fpad funlabel numargs depth =
   let _, letrec_label, _ = lookup_label gpad funlabel in
   let letrec_name = Hashtbl.find gpad.letrec_name letrec_label in
@@ -2703,7 +2719,11 @@ let apply_direct_no_eh gpad fpad funlabel numargs depth =
   )
   @ [ L [ K "i32.const"; N (I32 (Int32.of_int (numargs-1))) ];
     ]
-  @ push_field "accu" 0
+  @ ( if use_codeptr gpad funlabel numargs then
+        push_field "accu" 0
+      else
+        [ L [ K "i32.const"; N (I32 0l) ] ]
+    )
   @ push_local "fp"
   @ [L [ K "i32.const"; N (I32 (Int32.of_int (4 * depth))) ];
      L [ K "i32.sub" ];
@@ -2740,7 +2760,11 @@ let apply_direct_eh gpad fpad funlabel numargs depth =
     )
   @ [ L [ K "i32.const"; N (I32 (Int32.of_int (numargs-1))) ];
     ]
-  @ push_field "accu" 0
+  @ ( if use_codeptr gpad funlabel numargs then
+        push_field "accu" 0
+      else
+        [ L [ K "i32.const"; N (I32 0l) ] ]
+    )
   @ push_local "fp"
   @ [L [ K "i32.const"; N (I32 (Int32.of_int (4 * depth))) ];
      L [ K "i32.sub" ];
@@ -2903,7 +2927,7 @@ let call_reinit_frame gpad fpad numargs oldnumargs depth =
     @ [ L [ K "call"; ID "reinit_frame" ] ]
   )
 
-let appterm_push_params numargs =
+let appterm_push_params gpad funlabel_opt numargs =
   [ L [ K "local.get"; ID "envptr" ];      (* first arg of call *)
   ]
   @ [ L [ K "local.get"; ID "extra_args" ] (* second arg of call *)
@@ -2915,7 +2939,15 @@ let appterm_push_params numargs =
      else
        []
     )
-  @ push_field "accu" 0                (* third arg of call: code pointer *)
+  @ (match funlabel_opt with
+       | Some funlabel ->
+           if use_codeptr gpad funlabel numargs then
+             push_field "accu" 0
+           else
+             [ L [ K "i32.const"; N (I32 0l) ] ]
+       | None ->
+           push_field "accu" 0         (* third arg of call: code pointer *)
+    )
   @ [ L [ K "local.get"; ID "fp" ]     (* fourth arg of call *)
     ]
 
@@ -2924,7 +2956,7 @@ let appterm_with_returncall gpad fpad numargs oldnumargs depth =
     call_reinit_frame gpad fpad numargs oldnumargs depth
     @ pop_to_local "fp"   (* no need to set bp here *)
     @ (push_local "accu" |> pop_to_field "envptr" 0)
-    @ appterm_push_params numargs
+    @ appterm_push_params gpad None numargs
     @ push_field "accu" 0
     @ [ L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
         L [ K "i32.shr_u" ];             (* which function to call *)
@@ -2973,7 +3005,7 @@ let appterm_direct gpad fpad funlabel numargs oldnumargs depth =
     @ (if goto_selfrecurse then
          [ L [ K "br"; ID "selfrecurse" ] ]
        else
-         appterm_push_params numargs
+         appterm_push_params gpad (Some funlabel) numargs
          @ [ L [ K "return_call";
                  ID letrec_name
                ]
@@ -3076,13 +3108,13 @@ let appterm_args gpad fpad funlabel_opt funsrc argsrc oldnumargs depth =
             fpad.need_selfrecurse <- true;
             [ L [ K "br"; ID "selfrecurse" ] ]
           ) else
-            appterm_push_params newnumargs
+            appterm_push_params gpad funlabel_opt newnumargs
             @ [ L [ K "return_call";
                     ID letrec_name
                   ]
               ]
       | None ->
-          appterm_push_params newnumargs
+          appterm_push_params gpad funlabel_opt newnumargs
           @ push_field "accu" 0
           @ [ L [ K "i32.const"; N (I32 (Int32.of_int code_pointer_shift)) ];
               L [ K "i32.shr_u" ];             (* which function to call *)
