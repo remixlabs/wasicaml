@@ -67,6 +67,7 @@ void wasicaml_main(char **argv) {
     value *fp = Caml_state->_extern_sp;
     wasicaml_init();
     letrec_main((value *) -1, extra_args, codeptr, fp);
+    Caml_state->_extern_sp = fp;
 }
 
 int main(int argc, char **argv) {
