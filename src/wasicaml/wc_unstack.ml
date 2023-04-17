@@ -581,6 +581,53 @@ let init_stack lpad state =
       sdescr.stack_uninit in
   (instrs, sdescr.stack_depth)
 
+let materialize_globals lpad state =
+  (* This function needs to be done before effects are applied that might
+     have an impact on TracedGlobals. This function resolves any
+     TracedGlobals.
+   *)
+  let instrs_stack =
+    List.mapi
+      (fun i st ->
+        match st with
+          | TracedGlobal(glb, path, _) ->
+              let pos = -state.camldepth + i in
+              let dest = RealStack pos |> real_store_d lpad state in
+              [ Wcopy { src=st; dest } ]
+          | _ ->
+              []
+      )
+      state.camlstack
+    |> List.flatten in
+  let state, instrs_accu =
+    match state.accu with
+      | TracedGlobal(glb, path, _) ->
+          let state, instrs_flush = flush_accu lpad state in
+          let instrs_copy = [ Wcopy { src=state.accu; dest=real_accu } ] in
+          (state, instrs_flush @ instrs_copy)
+      | _ ->
+          state, [] in
+  let instrs = instrs_stack @ instrs_accu in
+  let camlstack =
+    List.mapi
+      (fun i st ->
+        match st with
+          | TracedGlobal _ ->
+              let pos = -state.camldepth + i in
+              RealStack pos
+          | _ ->
+              st
+      )
+      state.camlstack in
+  let accu =
+    match state.accu with
+      | TracedGlobal _ ->
+          real_accu
+      | st ->
+          st in
+  let state = { state with camlstack; accu } in
+  (state, instrs)
+
   (*
 let localize_accu lpad state repr =
   match state.accu with
@@ -971,7 +1018,7 @@ let transl_instr lpad state instr =
         ) else
             let accu = real_accu in
             let state = { state with accu } in
-            let instrs_op = [ Wenv { field } ] in
+            let instrs_op = [ Wenv { field; dest = real_accu } ] in
             (state, instrs_flush @ instrs_op)
     | Kgetglobal ident ->
         let offset = global_offset ident in
@@ -985,7 +1032,8 @@ let transl_instr lpad state instr =
             | exception Not_found ->
                 let accu = real_accu in
                 let state = { state with accu } in
-                let instrs_op = [ Wgetglobal { src=Global offset } ] in
+                let instrs_op =
+                  [ Wgetglobal { src=Global offset; dest=real_accu } ] in
                 (state, instrs_flush @ instrs_op)
         )
     | Knegint ->
@@ -1002,12 +1050,17 @@ let transl_instr lpad state instr =
           unary_operation lpad state RIntVal (Poffsetint offset) in
         (state, (* instrs1 @ *) instrs2)
     | Koffsetref offset ->
-        unary_effect lpad state (Poffsetref offset)
+        let (state, instrs_mat) = materialize_globals lpad state in
+        let (state, instrs_eff) = unary_effect lpad state (Poffsetref offset) in
+        (state, instrs_mat @ instrs_eff)
     | Kisint ->
         unary_operation lpad state RInt Pisint
     | Ksetglobal ident ->
+        let (state, instrs_mat) = materialize_globals lpad state in
         let offset = global_offset ident in
-        unary_effect lpad state (Psetglobal (Global offset))
+        let (state, instrs_eff) =
+          unary_effect lpad state (Psetglobal (Global offset)) in
+        (state, instrs_mat @ instrs_eff)
     | Kgetfield field ->
         ( match state.accu with
             | TracedGlobal(glb, path, initvalue) ->
@@ -1058,7 +1111,9 @@ let transl_instr lpad state instr =
     | Kisout ->
         binary_operation lpad state RInt (Puintcomp Clt)
     | Ksetfield field ->
-        binary_effect lpad state (Psetfield field)
+        let (state, instrs_mat) = materialize_globals lpad state in
+        let (state, instrs_eff) = binary_effect lpad state (Psetfield field) in
+        (state, instrs_mat @ instrs_eff)
     | Ksetfloatfield field ->
         binary_effect lpad state (Psetfloatfield field)
     | Kgetvectitem ->
@@ -1136,6 +1191,7 @@ let transl_instr lpad state instr =
         (state, instrs)
     | Kccall (name, num) when num <= 5 ->
         let noalloc = Hashtbl.mem Wc_prims.prims_noalloc name in
+        let state, instrs_mat = materialize_globals lpad state in
         let state, instrs_adjust = adjust_locals lpad state in
         let state, instrs_flush = flush_accu lpad state in
         let src =
@@ -1151,11 +1207,13 @@ let transl_instr lpad state instr =
           { state with accu = RealAccu { no_function }}
           |> popn_camlstack_disregard_accu (num-1) in
         let instrs =
-          instrs_adjust
+          instrs_mat
+          @ instrs_adjust
           @ instrs_flush
           @ [ Wccall { name; src; descr } ] in
         (state, instrs)
     | Kccall (name, num) ->
+        let state, instrs_mat = materialize_globals lpad state in
         let state, instrs_savestr = save_locals_and_straighten_all lpad state in
         let descr = stack_descr state false in
         let depth = state.camldepth+1 in
@@ -1165,32 +1223,39 @@ let transl_instr lpad state instr =
           |> popn_camlstack_disregard_accu (num-1) in
         let state, instrs_adjust = adjust_locals lpad state in
         let instrs =
-          instrs_savestr
+          instrs_mat
+          @ instrs_savestr
           @ [ Wcopy { src=real_accu; dest=RealStack(-depth) };
               Wccall_vector { name; numargs=num; depth; descr }]
           @ instrs_adjust in
         (state, instrs)
     | Kbranch label ->
+        let state, instrs_mat = materialize_globals lpad state in
         let state, instrs_adjust = adjust_locals lpad state in
         let state, instrs_br = branch lpad state label in
-        (state, instrs_adjust @ instrs_br)
+        (state, instrs_mat @ instrs_adjust @ instrs_br)
     | Kbranchif label ->
+        let state, instrs_mat = materialize_globals lpad state in
         let state, instrs_adjust = adjust_locals lpad state in
         let (state_br, instrs_br) = branch lpad state label in
         let src = state.accu |> real_store_d lpad state in
         let instrs =
-          instrs_adjust
+          instrs_mat
+          @ instrs_adjust
           @ [ Wif { src; neg=false; body=instrs_br }] in
         (state, instrs)
     | Kbranchifnot label ->
+        let state, instrs_mat = materialize_globals lpad state in
         let state, instrs_adjust = adjust_locals lpad state in
         let (state_br, instrs_br) = branch lpad state label in
         let src = state.accu |> real_store_d lpad state in
         let instrs =
-          instrs_adjust
+          instrs_mat
+          @ instrs_adjust
           @ [ Wif { src; neg=true; body=instrs_br }] in
         (state, instrs)
     | Kswitch (labels_int, labels_blk) ->
+        let state, instrs_mat = materialize_globals lpad state in
         let state, instrs_adjust = adjust_locals lpad state in
         let state = norm_accu state in
         let state, instrs_str = straighten_all lpad state in
@@ -1201,7 +1266,8 @@ let transl_instr lpad state instr =
         let labels_blk = Array.map (make_label lpad) labels_blk in
         let src = state.accu |> real_store_d lpad state in
         let instrs =
-          instrs_adjust
+          instrs_mat
+          @ instrs_adjust
           @ instrs_str
           @ [ Wswitch{labels_int; labels_blk; src} ] in
         (state, instrs)
@@ -1225,6 +1291,7 @@ let transl_instr lpad state instr =
                       | Some n -> num <> n  (* i.e. need a GRAB *)
                   )
             | None -> true in
+        let state, instrs_mat = materialize_globals lpad state in
         let state, instrs_save =
           if alloc then
             save_locals lpad state
@@ -1259,7 +1326,8 @@ let transl_instr lpad state instr =
         let state, instrs_adjust =
           if alloc then adjust_locals lpad state else state, [] in
         let instrs =
-          instrs_save
+          instrs_mat
+          @ instrs_save
           @ instrs_accu
           @ instrs_init
           @ instrs_move
@@ -1288,6 +1356,7 @@ let transl_instr lpad state instr =
                 (* because Wapply_direct loads the function into accu: *)
                 { state with accu = real_accu }
             | None -> state in
+        let state, instrs_mat = materialize_globals lpad state in
         let state, instrs_savestr = save_locals_and_straighten_all lpad state in
         let depth = state.camldepth in
         let instr_apply =
@@ -1299,7 +1368,8 @@ let transl_instr lpad state instr =
         let state = state |> popn_camlstack_disregard_accu (num+3) in
         let state, instrs_adjust = adjust_locals lpad state in
         let instrs =
-          instrs_savestr
+          instrs_mat
+          @ instrs_savestr
           @ [ instr_apply ]
           @ instrs_adjust in
         (state, instrs)
