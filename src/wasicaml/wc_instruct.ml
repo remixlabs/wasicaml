@@ -49,7 +49,7 @@ type store =
   | Local of repr * string
     (* stored in a local variable with the given name.
        There cannot be heap-allocated values in local variables, i.e.
-       repr=RValue is forbidden.
+       repr=RValue is forbidden (except temp values when a GC is impossible)
      *)
   | Atom of int
     (* an atom with this tag *)
@@ -152,9 +152,9 @@ type winstruction =
   | Wcond of { cond:bool ref; ontrue:winstruction; onfalse:winstruction }
   | Wcopy of { src:store; dest:store }   (* only non-allocating copies *)
   | Walloc of { src:store; dest:store; descr:stack_descriptor }
-  | Wenv of { field:int }         (* dest is always RealAccu *)
+  | Wenv of { field:int; dest:store }
   | Wcopyenv of { offset:int }    (* dest is always RealAccu *)
-  | Wgetglobal of { src:global }  (* dest is always RealAccu *)
+  | Wgetglobal of { src:global; dest:store }
   | Wunary of { op:unop; src1:store; dest:store }
   | Wunaryeffect of { op:uneffect; src1:store }
   | Wbinary of { op:binop; src1:store; src2:store; dest:store }
@@ -302,11 +302,12 @@ let rec string_of_winstruction =
       sprintf "Walloc(%s = %s)"
               (string_of_store arg.dest) (string_of_store arg.src)
   | Wenv arg ->
-      sprintf "Wenv(accu = env[%d])" arg.field
+      sprintf "Wenv(%s = env[%d])"
+              (string_of_store arg.dest) arg.field
   | Wcopyenv arg ->
       sprintf "Wcopyenv(accu = env+%d)" arg.offset
-  | Wgetglobal { src = Global k } ->
-      sprintf "Wgetglobal(accu = global%d)" k
+  | Wgetglobal { src = Global k; dest } ->
+      sprintf "Wgetglobal(%s = global%d)" (string_of_store dest) k
   | Wunary arg ->
       sprintf "Wunary(%s = f(%s))"
               (string_of_store arg.dest) (string_of_store arg.src1)

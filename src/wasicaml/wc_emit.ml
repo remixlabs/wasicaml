@@ -3173,9 +3173,9 @@ let rec emit_instr gpad fpad instr =
     | Walloc arg ->
         copy fpad arg.src arg.dest (Some arg.descr)
     | Wenv arg ->
-        push_env
-        @ load_offset (4 * arg.field)
-        @ pop_to_local "accu"
+        ( push_env
+          @ load_offset (4 * arg.field)
+        ) |> pop_to fpad arg.dest RValue None
     | Wcopyenv arg ->
         push_env
         @ add_offset (4 * arg.offset)
@@ -3198,7 +3198,7 @@ let rec emit_instr gpad fpad instr =
         ]
          *)
         push_global offset
-        @ pop_to_local "accu"
+        |> pop_to fpad arg.dest RValue None
     | Wunary arg ->
         emit_unary gpad fpad arg.op arg.src1 arg.dest
     | Wunaryeffect arg ->
