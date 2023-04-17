@@ -259,10 +259,26 @@ let string_label =
   | Label k -> sprintf "label%d" k
   | Loop k -> sprintf "loop%d" k
 
+let is_immutable glb path =
+  (* We can only conclude that we know a function by name when:
+      - the function is from a global struct (Glb)
+      - the function is directly from the environment (no additional block)
+
+     Otherwise, this could just be a function in a mutable record, e.g.
+     ref (fun _ -> ...).
+   *)
+  match glb with
+    | Glb _ ->
+        List.length path <= 1
+    | Env 0 ->
+        List.length path <= 1
+    | Env _ ->
+        path = []
 
 let extract_directly_callable_function st =
   match st with
-    | TracedGlobal(glb, path, FuncInEnv {func_offset; env}) ->
+    | TracedGlobal(glb, path, FuncInEnv {func_offset; env})
+          when is_immutable glb path ->
         (* eprintf "EXTRACT: %s\n%!" (string_of_store st); *)
         let func = env.(func_offset) in
         ( match func with
