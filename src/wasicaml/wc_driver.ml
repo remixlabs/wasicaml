@@ -70,7 +70,6 @@ let main() =
   let inp = ref None in
   let cclib = ref [] in
   let cstack = ref (1024 * 1024) in
-  let eh = ref false in
   let quiet = ref false in
   Arg.parse
     [ "-o", Arg.Set_string out,
@@ -89,10 +88,13 @@ let main() =
       "   enable Wasm feature: multi-value returns";
 
       "-enable-tail-call", Arg.Set Wc_emit.enable_returncall,
-      "   enable Wasm feature: tail calls (EXPERIMENTAL)";
+      "   enable Wasm feature: tail calls";
 
-      "-enable-exception-handling", Arg.Set eh,
-      "   enable Wasm feature: exception handling (EXPERIMENTAL)";
+      "-enable-exception-handling", Arg.Set Wc_emit.enable_exceptions,
+      "   enable Wasm feature: exception handling";
+
+      "-no-quick-exceptions", Arg.Clear Wc_emit.quick_exceptions,
+      "   disable that a NULL return value indicates an exception";
 
       "-enable-deadbeef-check", Arg.Set Wc_emit.enable_deadbeef_check,
       "   enable stack initialization check (debug)";
@@ -187,10 +189,16 @@ let main() =
   if not !quiet then
     eprintf "* assemble...\n%!";
   let ccopts =
-    ( if !Wc_emit.enable_returncall then
-        [ "-mtail-call" ]
-      else
-        []
+    ( ( if !Wc_emit.enable_returncall then
+          [ "-mtail-call" ]
+        else
+          []
+      )
+      @ ( if !Wc_emit.enable_exceptions then
+            [ "-mexception-handling" ]
+          else
+            []
+        )
     )
     |> String.concat " " in
   let cmd =
@@ -208,7 +216,7 @@ let main() =
   let cmd =
     sprintf "%s/bin/wasi_cc %s -Wl,-z,stack-size=%d %s -o %s %s/lib/initruntime.o %s -L %s/lib/ocaml %s -lcamlrun"
             prefix
-            (if !eh then "-mexception-handling" else "")
+            (if !Wc_emit.enable_exceptions then "-mexception-handling" else "")
             !cstack ccopts !out prefix (inp ^ ".o") prefix
             (List.map Filename.quote !cclib |> String.concat " ") in
   if not !quiet then
