@@ -162,6 +162,12 @@ let enable_multireturn = ref false
 let enable_returncall = ref false
 (* whether Wasm code can use the return_call instruction (tail calls) *)
 
+let enable_exceptions = ref false
+(* whether we can use try/catch instructions *)
+
+let quick_exceptions = ref true
+(* allow to indicate an exception by returning NULL *)
+
 let enable_deadbeef_check = ref false
 (* debugging: check that there is no uninitialized memory on the stack *)
 
@@ -561,50 +567,64 @@ let follow_path path =
 
 let throw fpad =
   (* the exception value must be in domain_field_exn_bucket *)
-  if fpad.lpad.scope.cfg_main && fpad.lpad.scope.cfg_try_labels = [] then
-    (* in outermost scope there is no caller - prefer to throw
-       a real exception
-     *)
-    [ L [ K "call"; ID "wasicaml_wrapthrow" ];
-      L [ K "unreachable" ]
-    ]
-  else
-    match fpad.lpad.scope.cfg_try_labels with
-      | [] ->
+  match fpad.lpad.scope.cfg_try_labels with
+    | { catchlabel } :: _ ->
+        (* the exception is caught by the surrounding block *)
+        (* it is expected that the accu contains the exception value *)
+        push_domain_field domain_field_exn_bucket
+        @ pop_to_local "accu"
+        @ [ L [ K "br"; ID (sprintf "label%d" catchlabel) ] ]
+    | [] ->
+        if (fpad.lpad.scope.cfg_main && fpad.lpad.scope.cfg_try_labels = []) ||
+             not !quick_exceptions
+        then
+          (* in outermost scope there is no caller - prefer to throw
+             a real exception
+           *)
+          if !enable_exceptions then
+            [ L [ K "throw"; ID "ocaml_exception" ]]
+          else
+            [ L [ K "call"; ID "wasicaml_wrapthrow" ];
+              L [ K "unreachable" ]
+            ]
+        else
           (* a normal function, but outside a "try" block *)
           [ L [ K "i32.const"; N (I32 0l) ];
             L [ K "return" ]
           ]
-      | { catchlabel } :: _ ->
-          (* it is expected that the accu contains the exception value *)
-          push_domain_field domain_field_exn_bucket
-          @ pop_to_local "accu"
-          @ [ L [ K "br"; ID (sprintf "label%d" catchlabel) ] ]
 
 let raise_predef_exn fpad which drops =
   (* which: e.g. "div_by_zero", "stack_overflow" *)
   ( Wc_util.enum 0 drops |> List.map (fun _ -> L [ K "drop" ]) )
-  @ (if fpad.lpad.scope.cfg_main && fpad.lpad.scope.cfg_try_labels = [] then
-       [ L [ K "call"; ID ("pick_" ^ which) ];
-         L [ K "drop" ];
-         L [ K "call"; ID "wasicaml_wrapthrow" ];
-         L [ K "unreachable" ]
-       ]
-     else
-       match fpad.lpad.scope.cfg_try_labels with
-         | [] ->
-             if !enable_returncall then
-               [ L [ K "return_call"; ID ("ret_" ^ which) ] ]
-             else
-               [ L [ K "call"; ID ("ret_" ^ which) ];
-                 L [ K "return" ];
-                 L [ K "unreachable" ]   (* because of a bug in LLVM assembler *)
+  @ ( match fpad.lpad.scope.cfg_try_labels with
+        | { catchlabel } :: _ ->
+            (* the next handler is in a surrounding block *)
+            [ L [ K "call"; ID ("pick_" ^ which) ];
+              L [ K "local.set"; ID "accu" ];
+              L [ K "br"; ID (sprintf "label%d" catchlabel) ]
+            ]
+        | [] ->
+            if (fpad.lpad.scope.cfg_main && fpad.lpad.scope.cfg_try_labels = []) ||
+                 not !quick_exceptions
+            then
+              [ L [ K "call"; ID ("pick_" ^ which) ];
+                L [ K "drop" ]
+              ]
+              @ (if !enable_exceptions then
+                   [ L [ K "throw"; ID "ocaml_exception" ]]
+                 else
+                   [ L [ K "call"; ID "wasicaml_wrapthrow" ];
+                     L [ K "unreachable" ]
+                   ]
+                )
+            else
+              if !enable_returncall then
+                [ L [ K "return_call"; ID ("ret_" ^ which) ] ]
+              else
+                [ L [ K "call"; ID ("ret_" ^ which) ];
+                  L [ K "return" ];
+                  L [ K "unreachable" ]   (* because of a bug in LLVM assembler *)
                ]
-         | { catchlabel } :: _ ->
-             [ L [ K "call"; ID ("pick_" ^ which) ];
-               L [ K "local.set"; ID "accu" ];
-               L [ K "br"; ID (sprintf "label%d" catchlabel) ]
-             ]
     )
 
 let raise_div_by_zero fpad drops =
@@ -833,7 +853,6 @@ let alloc_slow() =
             L [ K "param"; ID "header"; K "i32" ];
             L [ K "param"; ID "fp"; K "i32" ];
             L [ K "param"; ID "stackdepth"; K "i32" ];
-            L [ K "param"; ID "do_eh"; K "i32" ];
             BR;
             L [ K "result"; C "ptr"; K "i32" ];
             L [ K "local"; ID "lroots"; K "i32" ];
@@ -860,41 +879,22 @@ let alloc_slow() =
           );
 
           (* caml_alloc_small_dispatch(wosize, CAML_FROM_C, 1, NULL) *)
-
-          [ L [ K "local.get"; ID "do_eh" ];
+          push_domain_field domain_field_local_roots;
+          pop_to_local "lroots";
+          [ L [ K "i32.const"; ID "wrap_alloc_small_dispatch" ]];
+          push_local "wosize";
+          push_const (Int32.of_int caml_from_c);
+          push_const 1l;
+          push_const 0l;
+          [ L [ K "call"; ID "wasicaml_wraptry4" ] ];
+          push_local "lroots"
+          |> pop_to_domain_field domain_field_local_roots;
+          [ L [ K "i32.eqz" ];
             L [ K "if";
-
-                L ( [ [ K "then" ];
-                      (* as requested by the caller, catch exceptions *)
-                      push_domain_field domain_field_local_roots;
-                      pop_to_local "lroots";
-                      [ L [ K "i32.const"; ID "wrap_alloc_small_dispatch" ]];
-                      push_local "wosize";
-                      push_const (Int32.of_int caml_from_c);
-                      push_const 1l;
-                      push_const 0l;
-                      [ L [ K "call"; ID "wasicaml_wraptry4" ] ];
-                      push_local "lroots"
-                      |> pop_to_domain_field domain_field_local_roots;
-                      [ L [ K "i32.eqz" ];
-                        L [ K "if";
-                            L ( [ K "then";
-                                  L [ K "i32.const"; N (I32 0l) ];
-                                  L [ K "return" ]
-                                ]
-                              )
-                          ]
-                      ]
-                    ] |> List.flatten
-                  );
-                L ( [ [ K "else" ];
-                      (* do not catch exceptions - these fall through *)
-                      push_local "wosize";
-                      push_const (Int32.of_int caml_from_c);
-                      push_const 1l;
-                      push_const 0l;
-                      [ L [ K "call"; ID "caml_alloc_small_dispatch" ] ];
-                    ] |> List.flatten
+                L ( [ K "then";
+                      L [ K "i32.const"; N (I32 0l) ];
+                      L [ K "return" ]
+                    ]
                   )
               ]
           ];
@@ -922,7 +922,6 @@ let call_alloc_slow() =
   [ L [ K "call"; ID "alloc_slow" ]]
 
 let alloc_non_atom fpad descr size tag =
-  let do_eh = fpad.lpad.scope.cfg_try_labels <> [] in
   fpad.need_xalloc <- true;
   let ptr = "xalloc" (* new_local fpad RValue *) in
   let young = size <= max_young_wosize in
@@ -947,53 +946,41 @@ let alloc_non_atom fpad descr size tag =
                     push_const (Int32.of_int (make_header size tag));
                     push_local "fp";
                     push_const (Int32.of_int (4 * (descr.stack_depth + extra)));
-                    push_const (if do_eh then 1l else 0l);
                     call_alloc_slow();
                     pop_to_local ptr;
                     instrs_restore;
-                    if do_eh then
-                      [ L [ K "local.get"; ID ptr ];
-                        L [ K "i32.eqz" ];
-                        L [ K "if";
-                            L ([K "then" ] @ throw fpad)
-                          ]
-                      ]
-                    else
-                      []
+                    [ L [ K "local.get"; ID ptr ];
+                      L [ K "i32.eqz" ];
+                      L [ K "if";
+                          L ([K "then" ] @ throw fpad)
+                        ]
+                    ]
                   ] |> List.flatten
                 )
             ];
         ];
       ] |> List.flatten
-    else
-      if do_eh then (
-        fpad.need_lroots <- true;
-        push_domain_field domain_field_local_roots
-        @ pop_to_local "lroots"
-        @ setup_for_gc fpad descr
-        @ [ L [ K "i32.const"; ID "caml_alloc_shr" ];
-            L [ K "i32.const"; N (I32 (Int32.of_int size)) ];
-            L [ K "i32.const"; N (I32 (Int32.of_int tag)) ];
-            L [ K "call"; ID "wasicaml_wraptry2" ];
-          ]
-        @ restore_after_gc fpad descr
-        @ ( push_local "lroots"
-            |> pop_to_domain_field domain_field_local_roots
-          )
-        @ [ L [ K "local.tee"; ID ptr ];
-            L [ K "i32.eqz" ];
-            L [ K "if";
-                L ([K "then"] @ throw fpad)
-              ]
-          ]
-      ) else
-        setup_for_gc fpad descr
-        @ [ L [ K "i32.const"; N (I32 (Int32.of_int size)) ];
-            L [ K "i32.const"; N (I32 (Int32.of_int tag)) ];
-            L [ K "call"; ID "caml_alloc_shr" ];
-            L [ K "local.set"; ID ptr ];
-          ]
-        @ restore_after_gc fpad descr in
+    else (
+      fpad.need_lroots <- true;
+      push_domain_field domain_field_local_roots
+      @ pop_to_local "lroots"
+      @ setup_for_gc fpad descr
+      @ [ L [ K "i32.const"; ID "caml_alloc_shr" ];
+          L [ K "i32.const"; N (I32 (Int32.of_int size)) ];
+          L [ K "i32.const"; N (I32 (Int32.of_int tag)) ];
+          L [ K "call"; ID "wasicaml_wraptry2" ];
+        ]
+      @ restore_after_gc fpad descr
+      @ ( push_local "lroots"
+          |> pop_to_domain_field domain_field_local_roots
+        )
+      @ [ L [ K "local.tee"; ID ptr ];
+          L [ K "i32.eqz" ];
+          L [ K "if";
+              L ([K "then"] @ throw fpad)
+            ]
+        ]
+    ) in
   (code, ptr, young)
 
 let alloc fpad descr size tag =
@@ -2465,9 +2452,10 @@ let wraptry n =
     sprintf "wasicaml_wraptry%d" n
 
 let c_call gpad fpad descr_opt src_list name =
-  let do_eh = fpad.lpad.scope.cfg_try_labels <> [] in
-  if do_eh then
-    fpad.need_lroots <- true;
+  (* NB. even if enable_exceptions, catch the exceptions coming from C
+     because wraptry needs to restore the stack pointer to the C shadow stack
+   *)
+  fpad.need_lroots <- true;
   let sexpl_setup, sexpl_restore =
     match descr_opt with
       | Some descr ->
@@ -2485,18 +2473,13 @@ let c_call gpad fpad descr_opt src_list name =
       (fun src -> push_as fpad src RValue)
       src_list in
   let sexpl_call =
-    if do_eh then
-      [ L [ K "i32.const"; ID name ] ]
-      @ sexpl_args
-      @ [ L [ K "call";
-              ID (wraptry (List.length src_list))
-            ]
-        ]
-      @ pop_to_local "accu"
-    else
-      sexpl_args
-      @ [ L [ K "call"; ID name ]]
-      @ pop_to_local "accu" in
+    [ L [ K "i32.const"; ID name ] ]
+    @ sexpl_args
+    @ [ L [ K "call";
+            ID (wraptry (List.length src_list))
+          ]
+      ]
+    @ pop_to_local "accu" in
   let sexpl_exncheck =
     [ L [ K "local.get"; ID "accu" ];
       L [ K "i32.eqz" ];
@@ -2510,17 +2493,12 @@ let c_call gpad fpad descr_opt src_list name =
   Hashtbl.replace gpad.primitives name ty;
   (* debug2 20 0 *)
   (* @ sexpl_debug_args *)
-  if do_eh then
-    sexpl_setup @ sexpl_save_lroots @ sexpl_call
-    @ sexpl_restore_lroots @ sexpl_restore @ sexpl_exncheck
-  else
-    sexpl_setup @ sexpl_call @ sexpl_restore @ sexpl_exncheck
+  sexpl_setup @ sexpl_save_lroots @ sexpl_call
+  @ sexpl_restore_lroots @ sexpl_restore @ sexpl_exncheck
   (* @ debug2 20 1 *)
 
 let c_call_vector gpad fpad descr numargs depth name =
-  let do_eh = fpad.lpad.scope.cfg_try_labels <> [] in
-  if do_eh then
-    fpad.need_lroots <- true;
+  fpad.need_lroots <- true;
   let sexpl_setup = setup_for_gc fpad descr in
   let sexpl_restore = restore_after_gc fpad descr in
   let sexpl_save_lroots =
@@ -2530,17 +2508,11 @@ let c_call_vector gpad fpad descr numargs depth name =
     push_local "lroots"
     |> pop_to_domain_field domain_field_local_roots in
   let sexpl_call =
-    if do_eh then
-      [ L [ K "i32.const"; ID name ] ]
-      @ push_field_addr "fp" (-depth)
-      @ push_const (Int32.of_int numargs)
-      @ [ L [ K "call"; ID "wasicaml_wraptry2" ]]
-      @ pop_to_local "accu"
-    else
-      push_field_addr "fp" (-depth)
-      @ push_const (Int32.of_int numargs)
-      @ [ L [ K "call"; ID name ]]
-      @ pop_to_local "accu" in
+    [ L [ K "i32.const"; ID name ] ]
+    @ push_field_addr "fp" (-depth)
+    @ push_const (Int32.of_int numargs)
+    @ [ L [ K "call"; ID "wasicaml_wraptry2" ]]
+    @ pop_to_local "accu" in
   let sexpl_exncheck =
     [ L [ K "local.get"; ID "accu" ];
       L [ K "i32.eqz" ];
@@ -2554,11 +2526,8 @@ let c_call_vector gpad fpad descr numargs depth name =
       L [ K "result"; K "i32" ] ] in
   Hashtbl.replace gpad.primitives name ty;
   (* debug2 20 0 *)
-  if do_eh then
-    sexpl_setup @ sexpl_save_lroots @ sexpl_call
-    @ sexpl_restore_lroots @ sexpl_restore @ sexpl_exncheck
-  else
-    sexpl_setup @ sexpl_call @ sexpl_restore @ sexpl_exncheck
+  sexpl_setup @ sexpl_save_lroots @ sexpl_call
+  @ sexpl_restore_lroots @ sexpl_restore @ sexpl_exncheck
 
 let string_label =
   function
@@ -2730,12 +2699,16 @@ let apply_direct_no_eh gpad fpad funlabel numargs depth =
      L [ K "call";
           ID letrec_name
         ];
-      L [ K "local.tee"; ID "accu" ];
-      L [ K "i32.eqz" ];  (* check for exceptions *)
-      L [ K "if";
-          L ([ K "then"] @ throw fpad)
-        ];
     ]
+  @ if not !quick_exceptions then
+      [ L [ K "local.set"; ID "accu" ]]
+    else
+      [ L [ K "local.tee"; ID "accu" ];
+        L [ K "i32.eqz" ];  (* check for exceptions *)
+        L [ K "if";
+            L ([ K "then"] @ throw fpad)
+          ];
+      ]
 
 let apply_direct_eh gpad fpad funlabel numargs depth =
   fpad.need_lroots <- true;
@@ -2774,11 +2747,11 @@ let apply_direct_eh gpad fpad funlabel numargs depth =
   @ ( push_local "lroots"
       |> pop_to_domain_field domain_field_local_roots
     )
-  @ [L [ K "local.tee"; ID "accu" ];
-     L [ K "i32.eqz" ];  (* check for exceptions *)
-     L [ K "if";
-         L ([ K "then"] @ throw fpad)
-       ];
+  @ [ L [ K "local.tee"; ID "accu" ];
+      L [ K "i32.eqz" ];  (* check for exceptions *)
+      L [ K "if";
+          L ([ K "then"] @ throw fpad)
+        ];
     ]
 
 let apply_direct gpad fpad funlabel numargs depth =
@@ -2826,12 +2799,17 @@ let apply_no_eh fpad numargs depth =
           L [ K "param"; K "i32" ];
           L [ K "result"; K "i32" ];
         ];
-      L [ K "local.tee"; ID "accu" ];
-      L [ K "i32.eqz" ];  (* check for exceptions *)
-      L [ K "if";
-          L ([ K "then"] @ throw fpad)
-        ];
     ]
+  @ (if !quick_exceptions then
+       [ L [ K "local.tee"; ID "accu" ];
+         L [ K "i32.eqz" ];  (* check for exceptions *)
+         L [ K "if";
+             L ([ K "then"] @ throw fpad)
+           ];
+       ]
+     else
+       [ L [ K "local.set"; ID "accu" ]]
+    )
 
 let apply_eh fpad numargs depth =
   fpad.need_lroots <- true;
@@ -2871,12 +2849,12 @@ let apply_eh fpad numargs depth =
   @ ( push_local "lroots"
       |> pop_to_domain_field domain_field_local_roots
     )
-  @ [ L [ K "local.tee"; ID "accu" ];
-      L [ K "i32.eqz" ];  (* check for exceptions *)
-      L [ K "if";
-          L ([ K "then"] @ throw fpad)
-        ];
-    ]
+  @  [ L [ K "local.tee"; ID "accu" ];
+       L [ K "i32.eqz" ];  (* check for exceptions *)
+       L [ K "if";
+           L ([ K "then"] @ throw fpad)
+         ];
+     ]
 
 let apply fpad numargs depth =
   if fpad.lpad.scope.cfg_try_labels = [] then
@@ -3913,11 +3891,25 @@ let generate scode exe get_defname globals_table funcprops_table =
           )
       )
       (globals()) in
+  let sexpl_tags =
+    if !enable_exceptions then
+      [ L [ K "import";
+            S "wasicaml";
+            S "ocaml_exception";
+            L ( [ K "tag";
+                  ID "ocaml_exception"
+                ]
+              )
+          ]
+      ]
+    else
+      [] in
 
   sexpl_memory
   @ sexpl_functions
   @ sexpl_table
   @ sexpl_globals
+  @ sexpl_tags
   @ wasicaml_init
   @ wasicaml_get_data
   @ wasicaml_get_data_size Wc_reader.(Array1.dim exe.data)

@@ -54,6 +54,9 @@ while [ $# -gt 0 ]; do
         -eh)
             args="$args -enable-exception-handling"
             shift ;;
+	-no-quick)
+	    args="$args -no-quick-exceptions"
+	    shift ;;
         -compact-code)
             args="$args -compact-code $2"
             shift 2 ;;

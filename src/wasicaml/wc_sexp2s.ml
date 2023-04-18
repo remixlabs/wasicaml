@@ -51,6 +51,19 @@ let extract_func_type l =
           (llvm_type, other) in
   scan [] [] l
 
+let extract_tag_type l =
+  let rec scan params l =
+    match l with
+      | (L [K "param"; K ty]) :: l' ->
+          scan (ty :: params) l'
+      | (L [K "result"; K ty]) :: l' ->
+          scan params l'  (* ignore this *)
+      | other ->
+          let llvm_type =
+            sprintf "%s" (String.concat ", " (List.rev params)) in
+          (llvm_type, other) in
+  scan [] l
+
 let abbrev_empty_type s =
   if s = "() -> ()" then
     ""
@@ -61,6 +74,12 @@ let llvm_type_of_func_type typeuse =
   let (llvm_type, rest) = extract_func_type typeuse in
   if rest <> [] then
     failwith ("llvm_type_of_func_type: " ^ string_of_sexp (L rest));
+  llvm_type
+
+let llvm_type_of_tag_type typeuse =
+  let (llvm_type, rest) = extract_tag_type typeuse in
+  if rest <> [] then
+    failwith ("llvm_type_of_tag_type: " ^ string_of_sexp (L rest));
   llvm_type
 
 let extract_label l =
@@ -408,6 +427,10 @@ let write_file f filename sexpl =
                 | (K "global") :: (ID glb_name) :: w_type ->
                     global glb_name w_type;
                     import glb_name mod_name obj_name
+                | (K "tag") :: (ID tag_name) :: w_type ->
+                    let tag_type = llvm_type_of_tag_type w_type in
+                    fprintf f "\t.tagtype %s %s\n" tag_name tag_type;
+                    import tag_name mod_name obj_name
                 | _ ->
                     failwith ("write_file: bad import: " ^
                                 string_of_sexp (L imp_sexpl))
