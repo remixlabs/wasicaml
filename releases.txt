@@ -1,3 +1,7 @@
+Upcoming:
+
+ - fix: also install the file wasicaml.h
+
 Release 1.1 (2023-03-27):
 
  - bases on OCaml-4.12.1 and WASI-SDK 19
