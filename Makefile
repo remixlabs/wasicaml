@@ -68,6 +68,7 @@ configure: configure-ocaml
 configure-ocaml:
 	root=`pwd`; \
 	cp include/wasicaml.h ocaml/runtime/caml/; \
+	cp include/wasicaml.h ocaml/yacc/; \
 	cd ocaml; \
 	./configure \
 		CC="$(prefix)/bin/wasi_cc" \
