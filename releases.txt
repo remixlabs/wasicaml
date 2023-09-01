@@ -1,6 +1,7 @@
 Upcoming:
 
  - fix: also install the file wasicaml.h
+ - fix: find wasicaml-installed commands by PATH
 
 Release 1.1 (2023-03-27):
 
