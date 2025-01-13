@@ -14,6 +14,7 @@ const wasiBindings = bindings.default
 const fs = require('fs');
 const util = require("util");
 const process = require("process")
+const path = require("path")
 const { execSync } = require("child_process");
 
 if (process.stdin._handle)
@@ -187,6 +188,16 @@ function bufferFindElements(buf, start, elements) {
     }
 }
 
+function findFileInPath(name) {
+    let pathvar = process.env["PATH"];
+    if (!pathvar) return name;
+    for (let elem of pathvar.split(path.delimiter)) {
+        let p = path.join(elem, name);
+        if (fs.existsSync(p)) return p;
+    };
+    return name;
+}
+
 (async () => {
     // argv[0]: node
     // argv[1]: the path of this script
@@ -196,7 +207,9 @@ function bufferFindElements(buf, start, elements) {
     // This makes the warnings go to stderr:
     console.log = console.error;
     try {
-        const wasm_code_filename = process.argv[2];
+        let wasm_code_filename = process.argv[2];
+        if (!wasm_code_filename.includes(path.sep))
+            wasm_code_filename = findFileInPath(wasm_code_filename);
         const args = process.argv.slice(3);
         const wasm_code_buf = fs.readFileSync(wasm_code_filename);
         const wasm_code_u8 = new Uint8Array(wasm_code_buf);
