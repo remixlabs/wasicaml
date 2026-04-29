@@ -2,7 +2,7 @@
 
 set -e
 
-major="19"
+major="32"
 minor="0"
 
 case "$(uname)" in
@@ -20,7 +20,9 @@ esac
 
 base="wasi-sdk-${major}.${minor}"
 file="${base}-${variant}.tar.gz"
-url="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${major}/$file"
+arch=$(uname -m)
+url="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-$major/$base-$arch-macos.tar.gz"
+echo $url
 
 if [ ! -f "$file" ]; then
     curl -o "$file" -L "$url"
