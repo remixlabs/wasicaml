@@ -2,8 +2,10 @@
 
 set -e
 
-major="19"
+major="25"
 minor="0"
+
+arch="$(uname -m)"
 
 case "$(uname)" in
      Darwin)
@@ -18,8 +20,8 @@ case "$(uname)" in
          ;;
 esac
 
-base="wasi-sdk-${major}.${minor}"
-file="${base}-${variant}.tar.gz"
+base="wasi-sdk-${major}.${minor}-${arch}-${variant}"
+file="${base}.tar.gz"
 url="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${major}/$file"
 
 if [ ! -f "$file" ]; then
