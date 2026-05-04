@@ -2596,17 +2596,16 @@ let grab fpad num =
                 L [ K "local.get"; ID "fp" ];
               ]
               @ call_restart_helper()
-              @ pop_to_fp fpad
-              @ [ L [ K "local.set"; ID "extra_args" ];
-
-                  (* codeptr &= ~1 - I think this is not needed *)
-                  (*
-                  L [ K "local.get"; ID "codeptr" ];
-                  L [ K "i32.const"; N (I32 0xffff_fffel) ];
-                  L [ K "i32.and" ];
-                  L [ K "local.set"; ID "codeptr" ];
-                   *)
+              @ [ L [ K "local.set"; ID "fp" ];
+                  L [ K "local.set"; ID "extra_args" ];
                 ]
+              @ (* pop_to_fp fpad *)
+                ( if fpad.maxdepth = 0 then
+                    []
+                  else
+                    [ L [ K "local.get"; ID "fp" ] ]
+                    @ set_bp_1 fpad
+                )
             )
         ];
 
