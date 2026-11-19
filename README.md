@@ -70,7 +70,7 @@ cleanly distinguish between build and install phases yet).
 
 You'll need `node` (14 or 16) and `npm`.
 
-The build involves a git checkout of the OCaml sources (version 4.12.1),
+The build involves a git checkout of the OCaml sources (version 4.14.5),
 and you'll get WebAssembly versions of the bytecode compiler. Also,
 we download the WASI SDK, including a copy of `clang`. The latter is
 currently only available for Linux and Mac as precompiled tarballs.
