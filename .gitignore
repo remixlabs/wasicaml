@@ -22,3 +22,4 @@ js/node_modules
 wasi_preamble
 Makefile.config
 src/wasicaml/wc_config.ml
+src/wasicaml/ocaml_config.ml

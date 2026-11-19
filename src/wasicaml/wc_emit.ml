@@ -9,6 +9,9 @@ open Wc_number
 open Wc_sexp
 open Wc_instruct
 
+open Ocaml_config
+(* Note that the domain fields are 8-aligned, even on 32 bit systems *)
+
 (* OCaml functions are translated to Wasm functions with parameters:
    param 1: envptr
    param 2: extra_args
@@ -187,33 +190,6 @@ let code_pointer_shift = 12
 let code_pointer_subfunc_mask = 0xffcl
 let code_pointer_letrec_mask = 0xffff_f000l
 let code_pointer_restart_mask = 2l
-
-(* TODO: grab the following values from C: *)
-(* Note that the domain fields are 8-aligned, even on 32 bit systems *)
-let max_young_wosize = 256
-let domain_field_young_ptr = 0
-let domain_field_young_limit = 1
-let domain_field_stack_low = 17
-let domain_field_stack_high = 18
-let domain_field_stack_threshold = 19
-let domain_field_extern_sp = 20
-let domain_field_trapsp = 21
-let domain_field_trap_barrier = 22
-let domain_field_external_raise = 23
-let domain_field_exn_bucket = 24
-let domain_field_local_roots = 36
-
-let global_field_zero_divide = 5       (* ZERO_DIVIDE_EXN *)
-let global_field_stack_overflow = 8    (* STACK_OVERFLOW_EXN *)
-
-let double_size = 2
-let double_tag = 253
-let double_array_tag = 254
-
-let closure_tag = 247
-let infix_tag = 249
-
-let caml_from_c = 0
 
 let make_header size tag =
   (* color=white *)
