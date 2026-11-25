@@ -1,7 +1,14 @@
-Upcoming:
+Release 1.2 (2026-11-25):
 
+ - bases on OCaml-4.14.5 and WASI-SDK 34
  - fix: also install the file wasicaml.h
  - fix: find wasicaml-installed commands by PATH
+ - fix: init OCaml runtime
+ - fix: callbacks from C to OCaml catch exceptions properly
+ - fix: translation when global stores turn out to be mutable
+ - fix: when splitting large main functions this is not done at
+   certain bad points anymore
+ - add option: -no-quick-exceptions
 
 Release 1.1 (2023-03-27):
 
