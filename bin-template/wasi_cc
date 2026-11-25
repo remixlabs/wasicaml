@@ -48,7 +48,7 @@ if [ $noexe -eq 0 ]; then
     if [ $eh -gt 0 ]; then
         initobjs="$root/lib/initwasi_eh.o $root/lib/initwasi_eh_helpers.o"
     fi
-    init="$initobjs -Wl,--stack-first -lwasi-emulated-process-clocks"
+    init="$initobjs -Wl,--stack-first -Wl,--initial-heap=67108864 -Wl,-z,stack-size=1048576 -lwasi-emulated-process-clocks"
     case "$out" in
         *.wasm)
             genwrapper=0
@@ -56,10 +56,11 @@ if [ $noexe -eq 0 ]; then
     esac
 fi
 
-"$root"/lib/wasi-sdk/bin/clang --sysroot="$root"/lib/wasi-sdk/share/wasi-sysroot $init -D_WASI_EMULATED_PROCESS_CLOCKS -Wno-unused-command-line-argument "$@"
+"$root"/lib/wasi-sdk/bin/clang --target=wasm32-wasip1 --sysroot="$root"/lib/wasi-sdk/share/wasi-sysroot $init -D_WASI_EMULATED_PROCESS_CLOCKS -Wno-unused-command-line-argument "$@"
 
 if [ $genwrapper -gt 0 -a -f "$out" ]; then
     wasm=`mktemp tmp.XXXXXX`
+    #cp "$out" "$out.wasm"
     mv "$out" "$wasm"
     len=`cat "$wasm" | wc -c`
     cat %PREFIX%/bin/wasi_preamble > "$out"

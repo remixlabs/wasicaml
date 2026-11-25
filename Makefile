@@ -23,6 +23,8 @@ default: setup configure build install build2 install2
 
 setup: setup-git setup-downloads setup-bin setup-js
 
+setup-dev: setup-downloads setup-bin setup-js
+
 setup-downloads:
 	./install_wasi-sdk
 	if [ -n "$(WASI_LIBC_BRANCH)" ]; then $(MAKE) build-wasi-libc; fi

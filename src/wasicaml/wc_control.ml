@@ -413,6 +413,8 @@ let split_main_function cfg =
               Array.iter exclude qlist;
           | I.Kpushtrap lab ->
               set_depth (!d-4) lab
+          | I.Kpush_retaddr lab ->
+              exclude lab
           | _ ->
               ()
       done;
