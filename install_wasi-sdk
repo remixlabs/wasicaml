@@ -2,7 +2,7 @@
 
 set -e
 
-major="25"
+major="34"
 minor="0"
 
 arch="$(uname -m)"

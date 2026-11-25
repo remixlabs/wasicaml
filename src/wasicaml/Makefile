@@ -1,6 +1,6 @@
 -include ../../Makefile.config
 
-ML = wc_types.ml wc_util.ml wc_config.ml \
+ML = ocaml_config.ml wc_types.ml wc_util.ml wc_config.ml \
      wc_reader.mli wc_reader.ml \
      wc_traceinstr.ml \
      wc_control.mli wc_control.ml \
@@ -21,9 +21,12 @@ wc.cma: $(ML)
 	$(OCAMLC) -a -o wc.cma -g -I +compiler-libs $(ML)
 
 clean:
-	rm -f *.cmi *.cmo *.cma wasicaml
+	rm -f *.cmi *.cmo *.cma wasicaml ocaml_config.ml
 
 wasicaml: wc_driver.ml wc.cma
 	$(OCAMLC) -o wasicaml -g -I +compiler-libs $(LIBS) wc.cma wc_driver.ml
 	@# bug: WASI chmod seems not to be working
 	chmod a+x wasicaml
+
+ocaml_config.ml:
+	OCAMLC=$(OCAMLC) ./get_ocaml_config.sh

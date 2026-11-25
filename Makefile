@@ -66,6 +66,7 @@ setup-js:
 	cd js && npm install
 
 configure: configure-ocaml
+	rm -f src/wasicaml/ocaml_config.ml
 
 configure-ocaml:
 	root=`pwd`; \
