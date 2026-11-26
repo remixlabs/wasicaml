@@ -1,13 +1,6 @@
 version: 2.1
 
 commands:
-  image-env:
-    # In the images the environment variables are configured in ~/.bash_env.
-    # CircleCI uses, however, a different location, which is in $BASH_ENV.
-    # Just copy this over to enable the image variables.
-    steps:
-      - run: cat ~/.bash_env >> $BASH_ENV
-
   install-rcm:
     steps:
       - run:
