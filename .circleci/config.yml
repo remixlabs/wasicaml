@@ -18,6 +18,24 @@ jobs:
     - run: ci/ensure-gcloud-creds
     - run: ci/upload_web
 
+  build_mac:
+    macos:
+      xcode: "26.6"
+    environment:
+      - ARCH: darwin
+      - GCLOUD_VERSION: 309.0.0
+    steps:
+    - checkout
+    - run: ./ci/install-gcloud
+    - run: echo 'export PATH=$HOME/ci:$PATH' >> $BASH_ENV
+    - run: ./configure
+    - run: make
+    - run: ulimit -s 16384 && make test
+    - run: ulimit -s 16384 && make test-tail-calls
+    - run: ulimit -s 16384 && make test-exc-handling
+    - run: ci/ensure-gcloud-creds
+    - run: ci/upload_web
+
 workflows:
   build:
     jobs:
