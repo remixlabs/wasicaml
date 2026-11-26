@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail && cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-source ci/script_lib
-
 tar czf wasicaml-${build_number}-$ARCH.tar.gz -C ~/ .wasicaml
 assets=wasicaml-${build_number}-$ARCH.tar.gz
 
-set -x
-gcloud config set account deploy-agent@rmx-prod.iam.gserviceaccount.com
-gsutil -m -h "Cache-Control:private, max-age=0, no-transform" \
-       cp -r -z html,js,css,tgz \
-       $assets \
-       gs://rmx-static/wasicaml/${build_number}/
+for asset in $assets; do
+    rcm gcs cp --disable-cache "$asset" gs://rmx-static/wasicaml/${build_number}/"$asset"
+done
+
+echo "Upload successful"
