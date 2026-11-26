@@ -22,7 +22,6 @@ jobs:
       - GCLOUD_VERSION: 309.0.0
     steps:
       - checkout
-      - image-env
       - install-rcm
       - run: echo 'export PATH=$HOME/ci:$PATH' >> $BASH_ENV
       - run: ./configure
@@ -40,7 +39,6 @@ jobs:
       - GCLOUD_VERSION: 309.0.0
     steps:
       - checkout
-      - image-env
       - install-rcm
       - run: echo 'export PATH=$HOME/ci:$PATH' >> $BASH_ENV
       - run: ./configure
