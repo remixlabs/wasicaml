@@ -1,4 +1,18 @@
 version: 2.1
+
+commands:
+  install-rcm:
+    steps:
+      - run:
+          name: Install rcm
+          command: |
+            mkdir -p ~/rcm/bin
+            curl -o ~/rcm/bin/rcm https://storage.googleapis.com/rmx-static/rcm/rcm
+            chmod +x ~/rcm/bin/rcm
+            bash -x ~/rcm/bin/rcm setup
+            echo 'export PATH=$HOME/rcm/bin:"$PATH"' >> $BASH_ENV
+      - run: rcm version
+
 jobs:
   build:
     docker:
@@ -7,19 +21,37 @@ jobs:
       - ARCH: linux
       - GCLOUD_VERSION: 309.0.0
     steps:
-    - checkout
-    - run: ./ci/install-gcloud
-    - run: echo 'export PATH=$HOME/ci:$PATH' >> $BASH_ENV
-    - run: ./configure
-    - run: make
-    - run: ulimit -s 16384 && make test
-    - run: ulimit -s 16384 && make test-tail-calls
-    - run: ulimit -s 16384 && make test-exc-handling
-    - run: ci/ensure-gcloud-creds
-    - run: ci/upload_web
+      - checkout
+      - install-rcm
+      - run: echo 'export PATH=$HOME/ci:$PATH' >> $BASH_ENV
+      - run: ./configure
+      - run: make
+      - run: ulimit -s 16384 && make test
+      - run: ulimit -s 16384 && make test-tail-calls
+      - run: ulimit -s 16384 && make test-exc-handling
+      - run: ci/upload_web
+
+  build_mac:
+    macos:
+      xcode: "26.6"
+    environment:
+      - ARCH: darwin
+      - GCLOUD_VERSION: 309.0.0
+    steps:
+      - checkout
+      - install-rcm
+      - run: echo 'export PATH=$HOME/ci:$PATH' >> $BASH_ENV
+      - run: ./configure
+      - run: make
+      - run: ulimit -s 16384 && make test
+      - run: ulimit -s 16384 && make test-tail-calls
+      - run: ulimit -s 16384 && make test-exc-handling
+      - run: ci/upload_web
 
 workflows:
   build:
     jobs:
       - build:
-          context: rmx-prod-uploads
+          context: rcm-editor
+      - build_mac:
+          context: rcm-editor
