@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail && cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-tar czf wasicaml-${build_number}-$ARCH.tar.gz -C ~/ .wasicaml
-assets=wasicaml-${build_number}-$ARCH.tar.gz
+tar czf wasicaml-${CIRCLE_BUILD_NUM}-$ARCH.tar.gz -C ~/ .wasicaml
+assets=wasicaml-${CIRCLE_BUILD_NUM}-$ARCH.tar.gz
 
 for asset in $assets; do
-    rcm gcs cp --disable-cache "$asset" gs://rmx-static/wasicaml/${build_number}/"$asset"
+    rcm gcs cp --disable-cache "$asset" gs://rmx-static/wasicaml/${CIRCLE_BUILD_NUM}/"$asset"
 done
 
 echo "Upload successful"
