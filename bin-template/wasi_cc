@@ -3,6 +3,9 @@
 set -e
 
 root='%ROOT%'
+if [ -n "$WASICAML_ROOT" ]; then
+    root="$WASICAML_ROOT"
+fi
 
 init=""
 

@@ -21,7 +21,7 @@ TOP := $(realpath .)
 
 default: setup configure build install build2 install2
 
-setup: setup-git setup-downloads setup-bin setup-js
+setup: setup-git setup-downloads install-downloads setup-bin setup-js install-js
 
 setup-dev: setup-downloads setup-bin setup-js
 
@@ -53,14 +53,16 @@ setup-git:
 	git submodule update --init --progress
 
 TOOLS=wasi_cc wasi_ld wasi_ar wasi_ranlib wasi_nm wasi_strip wasi_objdump wasi_run
+LINKS=clang ld ar ranlib rm strip objdump
 
 setup-bin: lib/initwasi.o wasi_preamble
 	mkdir -p $(prefix)/bin
 	for f in $(TOOLS); do \
-	    sed -e 's:%ROOT%:'`pwd`: -e 's:%PREFIX%:$(prefix):' bin-template/$$f >$(prefix)/bin/$$f; \
+	    sed -e 's:%ROOT%:$(prefix):' -e 's:%PREFIX%:$(prefix):' bin-template/$$f >$(prefix)/bin/$$f; \
             chmod a+x $(prefix)/bin/$$f; \
 	done
 	cp wasi_preamble $(prefix)/bin
+	cp lib/initwasi.o $(prefix)/lib/
 
 setup-js:
 	cd js && npm install
@@ -130,21 +132,18 @@ build-ocaml:
 build2: build-wasicaml
 	cd src/wasicaml && make
 
-install: install-downloads install-bin install-js install-ocaml install-lib
+install: install-bin install-ocaml install-lib
 
 install-downloads:
 	mkdir -p $(prefix)/lib/wasicaml
 	rm -rf $(prefix)/lib/wasi-sdk
 	rm -rf $(prefix)/lib/wasi-sdk-*
-	cp -a lib/wasi-sdk $(prefix)/lib/
-	cp -a lib/wasi-sdk-* $(prefix)/lib/
+	wasi_sdk="$$(readlink lib/wasi-sdk)" && \
+	cp -a "lib/$${wasi_sdk}" $(prefix)/lib/ && \
+	ln -sf "$${wasi_sdk}" $(prefix)/lib/wasi-sdk
 
+# already done in setup-bin!
 install-bin:
-	mkdir -p $(prefix)/bin
-	for f in $(TOOLS); do \
-	    sed -e 's:%ROOT%:'$(prefix): -e 's:%PREFIX%:$(prefix):' bin-template/$$f >$(prefix)/bin/$$f; \
-            chmod a+x $(prefix)/bin/$$f; \
-	done
 
 install-js:
 	mkdir -p $(prefix)

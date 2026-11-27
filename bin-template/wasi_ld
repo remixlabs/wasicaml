@@ -1,3 +1,8 @@
 #! /bin/sh
 
-exec '%ROOT%'/lib/wasi-sdk/bin/wasm-ld "$@"
+root='%ROOT%'
+if [ -n "$WASICAML_ROOT" ]; then
+    root="$WASICAML_ROOT"
+fi
+
+exec "$root"/lib/wasi-sdk/bin/wasm-ld "$@"
