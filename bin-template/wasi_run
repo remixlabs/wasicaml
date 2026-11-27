@@ -1,6 +1,9 @@
 #! /bin/sh
 
-export WASICAML='%ROOT%'
+if [ -z "$WASICAML_ROOT" ]; then
+    WASICAML_ROOT='%ROOT%'
+fi
+export WASICAML_ROOT
 export WASICAML_CWD=`pwd`
 
 # other interesting options:
@@ -18,4 +21,4 @@ if node --experimental-wasm-eh -e '' >/dev/null 2>&1; then
     opts="$opts --experimental-wasm-eh"
 fi
 
-exec node --stack-size=$(( $(ulimit -s) - 256)) --no-warnings $opts -- "$WASICAML/js/main.js" "$@"
+exec node --stack-size=$(( $(ulimit -s) - 256)) --no-warnings $opts -- "$WASICAML_ROOT/js/main.js" "$@"

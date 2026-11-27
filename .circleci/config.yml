@@ -19,7 +19,7 @@ jobs:
       - image: cimg/node:lts
     environment:
       - ARCH: linux
-      - GCLOUD_VERSION: 309.0.0
+      - BUILD_TAG: << pipeline.number >>
     steps:
       - checkout
       - install-rcm
@@ -36,7 +36,7 @@ jobs:
       xcode: "26.6"
     environment:
       - ARCH: darwin
-      - GCLOUD_VERSION: 309.0.0
+      - BUILD_TAG: << pipeline.number >>
     steps:
       - checkout
       - install-rcm
